@@ -46,16 +46,31 @@ void RegisterOracleScannerVersion(ExtensionLoader &loader) {
 }
 
 static void OracleIoDeadlineVersion(DataChunk &, ExpressionState &, Vector &result) {
-    result.SetVectorType(VectorType::CONSTANT_VECTOR);
-    ConstantVector::SetNull(result, false);
-    ConstantVector::GetData<uint64_t>(result)[0] = 1;
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	ConstantVector::GetData<uint64_t>(result)[0] = 1;
+}
+
+// A companion extension that shares this scanner's per-connection IO deadline
+// (oracle_io_deadline.hpp) asks for this number before relying on it. It names
+// the version of that contract, not of the extension.
+CreateScalarFunctionInfo OracleIoDeadlineVersionFunctionInfo() {
+	CreateScalarFunctionInfo info(
+	    ScalarFunction("oracle_scanner_io_deadline_version", {}, LogicalType::UBIGINT, OracleIoDeadlineVersion));
+	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	FunctionDescription description;
+	description.description =
+	    "Returns the version of the IO deadline contract this build offers to companion extensions.";
+	description.examples = {"oracle_scanner_io_deadline_version()"};
+	description.categories = {"oracle", "metadata"};
+	info.descriptions.push_back(std::move(description));
+	return info;
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Native Oracle TNS/TTC connectivity for DuckDB");
 	RegisterOracleScannerVersion(loader);
-    loader.RegisterFunction(ScalarFunction("oracle_scanner_io_deadline_version", {}, LogicalType::UBIGINT,
-                                           OracleIoDeadlineVersion));
+	loader.RegisterFunction(OracleIoDeadlineVersionFunctionInfo());
 	RegisterOracleSecrets(loader);
 	RegisterOracleQuery(loader);
 	RegisterOracleAttachedCatalog(loader);

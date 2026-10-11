@@ -1774,6 +1774,10 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
                                            CHECK(result.RowCount() == 1 &&
                                                  !result.GetValue(0, 0).ToString().empty());
                                        }};
+    cases["oracle_scanner_io_deadline_version"] = {nullptr, {}, [](FakeScript &, MaterializedQueryResult &result) {
+                                                       CHECK(result.RowCount() == 1 &&
+                                                             result.GetValue(0, 0).ToString() == "1");
+                                                   }};
     cases["oracle_execute_admin"] = {
         [](FakeScript &) {}, {},
         [](FakeScript &script, MaterializedQueryResult &result) {
@@ -1783,7 +1787,7 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
     cases["oracle_transaction_status"] = {
         [](FakeScript &script) {
             script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
-        }, {"ATTACH 'demo' AS tx (TYPE oracle_scanner);"},
+        }, {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
         [](FakeScript &, MaterializedQueryResult &result) {
             CHECK(result.GetValue(0, 0).ToString() == "not_attempted");
         }};
@@ -1803,7 +1807,7 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
             script.columns = {Column("VALUE", 2)};
             script.rows = {{Number("1")}};
         },
-        {"ATTACH 'demo' AS tx (TYPE oracle_scanner);"},
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
         [](FakeScript &script, MaterializedQueryResult &result) {
             CHECK(script.queries.back() == "SELECT 1 FROM dual");
             CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "1");
@@ -1813,11 +1817,40 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
             script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
             script.affected_rows = 1;
         },
-        {"ATTACH 'demo' AS tx (TYPE oracle_scanner);"},
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
         [](FakeScript &script, MaterializedQueryResult &result) {
             CHECK(script.counted_executes.size() == 1);
             CHECK(script.counted_execute_binds[0].size() == 1);
             CHECK(result.GetValue(0, 0).GetValue<int64_t>() == 1);
+        }};
+    cases["oracle_execute_many_transaction"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            script.affected_rows = 1;
+        },
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
+        [](FakeScript &script, MaterializedQueryResult &result) {
+            // Exact counts are the default: one scalar execution per row.
+            CHECK(script.counted_executes.size() == 1 &&
+                  script.counted_executes[0] == "DELETE FROM QUACK_DEMO_LOG WHERE LOG_ID = :id");
+            CHECK(script.counted_execute_binds[0].size() == 1);
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "1" &&
+                  result.GetValue(1, 0).ToString() == "1" && result.GetValue(2, 0).GetValue<bool>());
+        }};
+    cases["oracle_call_named_transaction"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            script.call_echo_outputs = true;
+            script.call_output_values["P_TEXT"] = Text("Quack.");
+        },
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::PROCEDURE && call.qualified_name == "QUACK_DEMO_MOTTO");
+            CHECK(call.arguments.size() == 1 && call.arguments[0].name == "P_TEXT" &&
+                  call.arguments[0].direction == BindDirection::BIND_OUT);
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "P_TEXT" &&
+                  result.GetValue(1, 0).ToString() == "Quack.");
         }};
     cases["oracle_execute"] = {[](FakeScript &script) { script.affected_rows = 1; },
                                {},
@@ -2058,9 +2091,7 @@ void TestFunctionExamplesRun() {
     {
         TestDatabase database;
         auto listed = database.Query("SELECT function_name, function_type, examples FROM duckdb_functions() "
-                                     // Internal backend capability probe is not a user SQL example API.
-                                     "WHERE starts_with(function_name, 'oracle_') "
-                                     "AND function_name <> 'oracle_scanner_io_deadline_version' ORDER BY function_name");
+                                     "WHERE starts_with(function_name, 'oracle_') ORDER BY function_name");
         CHECK(!listed->HasError());
         for (duckdb::idx_t row = 0; row < listed->RowCount(); row++) {
             const auto list = duckdb::ListValue::GetChildren(listed->GetValue(2, row));
@@ -2071,7 +2102,7 @@ void TestFunctionExamplesRun() {
     auto cases = FunctionExampleCases();
     // The same set on both sides: a function added without an executable
     // example, or a case left for a function that is gone, fails here.
-    CHECK(examples.size() == cases.size() && examples.size() == 24);
+    CHECK(examples.size() == cases.size() && examples.size() == 27);
     for (const auto &example : examples) {
         const auto found = cases.find(example.first);
         if (found == cases.end()) {
@@ -2089,7 +2120,8 @@ void TestFunctionExamplesRun() {
         for (const auto &statement : found->second.prerequisites) {
             database.Run(statement);
         }
-        const auto is_scalar = example.first == "oracle_scanner_version";
+        const auto is_scalar =
+            example.first == "oracle_scanner_version" || example.first == "oracle_scanner_io_deadline_version";
         // Parsing first, the way each kind of example is meant to be used: a
         // scalar example is an expression, a table example one whole statement.
         if (is_scalar) {
@@ -2138,7 +2170,7 @@ void TestFunctionExamplesRun() {
 // bare RegisterFunction overloads set. Loading the extension twice would not
 // show it — DuckDB may skip the second load — and registering the same
 // signature again fails under either mode, so the infos the extension
-// registers are inspected directly, all twenty of them.
+// registers are inspected directly, all twenty-seven of them.
 void TestDocumentedRegistrationsAlterOnConflict() {
     std::vector<std::string> names;
     const auto check = [&](const duckdb::CreateFunctionInfo &info, const std::string &name) {
@@ -2149,12 +2181,14 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     };
     const auto version = duckdb::OracleScannerVersionFunctionInfo();
     check(version, version.functions.name);
+    const auto io_deadline = duckdb::OracleIoDeadlineVersionFunctionInfo();
+    check(io_deadline, io_deadline.functions.name);
     for (const auto &info : duckdb::OracleQueryFunctionInfos()) {
         check(info, info.functions.name);
     }
     const auto parallel = duckdb::OracleParallelScanFunctionInfo();
     check(parallel, parallel.functions.name);
-    CHECK(names.size() == 24);
+    CHECK(names.size() == 27);
 
     // And what that mode means on a database that already has the functions:
     // an extra overload under an existing name is added to it, where

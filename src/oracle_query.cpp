@@ -548,6 +548,12 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     const auto secret_name = input.inputs[0].GetValue<std::string>();
     const auto sql = input.inputs[1].GetValue<std::string>();
     std::string password;
+    // The secret is validated before the SQL, as it was before the transactional
+    // form shared this bind: a misconfigured secret is reported for what it is.
+    oracle_scanner::ConnectionConfig config;
+    if (!transactional) {
+        config = ConnectionFromSecret(context, secret_name, password);
+    }
     const auto binds = ParameterBinds(input, "oracle_query");
     oracle_scanner::ValidateOracleQuery(sql, binds);
     auto result = make_uniq<OracleQueryBindData>();
@@ -562,7 +568,6 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
         result->session = AcquireOracleReadSession(context, std::string(), target.catalog_name,
                                                    target.config, target.password);
     } else {
-        auto config = ConnectionFromSecret(context, secret_name, password);
         result->session = AcquireOracleReadSession(context, secret_name, std::string(), config, password);
     }
     try {
@@ -2096,14 +2101,14 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
         std::move(status),
         {{"catalog_name"},
          "Returns local structured status of the current or most recent Oracle transaction; opens no remote session.",
-         "SELECT * FROM oracle_transaction_status('tx');", {"oracle", "transaction", "diagnostics"}}));
+         "SELECT * FROM oracle_transaction_status('ora');", {"oracle", "transaction"}}));
     TableFunction admin("oracle_execute_admin", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                         OracleAdminFunction, OracleAdminBind, OracleAdminInit);
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(admin),
         {{"secret_name", "sql"},
          "Runs one administrative DDL command on a dedicated session, only outside an explicit DuckDB transaction.",
-         "SELECT * FROM oracle_execute_admin('demo', 'CREATE TABLE LAKE_ADMIN_PROBE (ID NUMBER)');",
+         "SELECT * FROM oracle_execute_admin('demo', 'CREATE TABLE QUACK_DEMO_SCRATCH (ID NUMBER)');",
          {"oracle", "administration"}}));
     TableFunction query("oracle_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleQueryFunction, OracleQueryBind,
                         OracleQueryInit);
@@ -2122,7 +2127,7 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
         std::move(transaction_query),
         {{"catalog_name", "sql", "params"},
          "Reads through the attached Oracle catalog's current transaction, pinning one session until COMMIT or ROLLBACK.",
-         "SELECT * FROM oracle_query_transaction('tx', 'SELECT 1 FROM dual');",
+         "SELECT * FROM oracle_query_transaction('ora', 'SELECT 1 FROM dual');",
          {"oracle", "transaction"}}));
 
     TableFunction transaction_execute("oracle_execute_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -2132,9 +2137,9 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
         std::move(transaction_execute),
         {{"catalog_name", "sql", "params"},
          "Runs one INSERT, UPDATE or DELETE in the attached Oracle catalog's transaction, without an independent COMMIT.",
-         "SELECT * FROM oracle_execute_transaction('tx', "
+         "SELECT * FROM oracle_execute_transaction('ora', "
          "'INSERT INTO QUACK_DEMO_LOG (LABEL) VALUES (:label)', {'label': 'example'});",
-         {"oracle", "transaction", "write"}}));
+         {"oracle", "transaction"}}));
 
 
     TableFunction transaction_many("oracle_execute_many_transaction",
@@ -2142,20 +2147,20 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
         OracleTransactionManyFunction, OracleTransactionManyBind, OracleTransactionManyInit);
     transaction_many.named_parameters["exact_counts"] = LogicalType::BOOLEAN;
     infos.push_back(DocumentedTableFunctionInfo(std::move(transaction_many),
-        {{"catalog_name", "sql", "rows"},
+        {{"catalog_name", "sql", "rows", "exact_counts"},
          "Executes bounded DML on the caller transaction. Exact per-row counts default to scalar execution; "
          "exact_counts=false uses native array DML and returns one explicitly aggregate count with NULL row_index.",
-         "SELECT * FROM oracle_execute_many_transaction('tx', 'DELETE FROM QUACK_DEMO_LOG WHERE ID=:id', [{id: 1}]);",
-         {"oracle", "transaction", "write"}}));
+         "SELECT * FROM oracle_execute_many_transaction('ora', 'DELETE FROM QUACK_DEMO_LOG WHERE LOG_ID = :id', [{id: 1}]);",
+         {"oracle", "transaction"}}));
     infos.push_back(DocumentedTableFunctionInfo(
         TableFunction("oracle_call_named_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
             OracleTransactionCallFunction, OracleTransactionCallBind, OracleTransactionCallInit),
         {{"catalog_name", "procedure_name", "arguments"},
          "Calls a NUMBER/VARCHAR scalar procedure on the caller transaction, with no adapter COMMIT. "
          "The procedure itself must preserve transaction ownership.",
-         "SELECT * FROM oracle_call_named_transaction('tx', 'QUACK_DEMO_MOTTO', "
+         "SELECT * FROM oracle_call_named_transaction('ora', 'QUACK_DEMO_MOTTO', "
          "[{name:'P_TEXT',direction:'out',type:'varchar',value:NULL::VARCHAR}]);",
-         {"oracle", "transaction", "call"}}));
+         {"oracle", "transaction"}}));
 
     TableFunction execute("oracle_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleExecuteFunction,
                           OracleExecuteBind, OracleExecuteInit);

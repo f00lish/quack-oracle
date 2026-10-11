@@ -147,6 +147,7 @@ CreateTableFunctionInfo DocumentedTableFunctionInfo(TableFunction function, Orac
 //! it so that a test can inspect every info — its conflict mode and its
 //! description — directly. The Register* functions register exactly these.
 CreateScalarFunctionInfo OracleScannerVersionFunctionInfo();
+CreateScalarFunctionInfo OracleIoDeadlineVersionFunctionInfo();
 vector<CreateTableFunctionInfo> OracleQueryFunctionInfos();
 CreateTableFunctionInfo OracleParallelScanFunctionInfo();
 

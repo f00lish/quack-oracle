@@ -55,6 +55,8 @@
 #include "oracle_scanner/native_session.hpp"
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
+#include "oracle_scanner/lob_prefetch_cursor.hpp"
+#include "oracle_scanner/lob_prefetch_reader.hpp"
 #include "oracle_scanner/ttc_describe.hpp"
 #include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_cursor.hpp"
@@ -5626,6 +5628,208 @@ static void TestSsoWallet() {
     std::remove(sso_file_path.c_str());
 }
 
+// Bounded LOB prefetch: materializing a prefetched value and sizing a fetch
+// batch around it. Carried over from the 2026-10-11 driver transfer's
+// standalone tests, so the protocol suite covers them on every platform.
+namespace lob_prefetch {
+
+static std::vector<uint8_t> Data(bool character, uint64_t units) {
+    std::vector<uint8_t> data;
+    for (uint64_t i = 0; i < units; ++i) {
+        if (character) {
+            data.push_back(0);
+        }
+        data.push_back(static_cast<uint8_t>(33 + i % 90));
+    }
+    return data;
+}
+
+static void RoundTrip(bool character, uint64_t total, uint64_t prefix, uint64_t response_limit) {
+    const auto original = Data(character, total);
+    const uint64_t width = character ? 2 : 1;
+    OracleLobPrefetch lob;
+    lob.character = character;
+    lob.total_units = total;
+    lob.prefix_units = prefix;
+    lob.prefix.assign(original.begin(), original.begin() + static_cast<ptrdiff_t>(prefix * width));
+    lob.locator = {11, 12};
+    uint64_t next = prefix + 1;
+    size_t calls = 0;
+    const auto result = MaterializePrefetchedOracleLob(lob, 65536, 1U << 20U,
+        [&](const std::vector<uint8_t> &locator, uint64_t offset, uint64_t requested) {
+            CHECK(locator == lob.locator && offset == next && requested > 0);
+            CHECK(requested <= (character ? 32767U : 65536U));
+            CHECK(requested <= total - offset + 1);
+            ++calls;
+            TtcLobResponse response;
+            response.amount = (std::min)(requested, response_limit);
+            const auto begin = original.begin() + static_cast<ptrdiff_t>((offset - 1) * width);
+            response.data.assign(begin, begin + static_cast<ptrdiff_t>(response.amount * width));
+            next += response.amount;
+            return response;
+        });
+    CHECK(result && *result == original && next == total + 1);
+    const uint64_t chunk = (std::min)(response_limit, character ? uint64_t(32767) : uint64_t(65536));
+    CHECK(calls == (total - prefix + chunk - 1) / chunk);
+}
+
+template <class Work>
+static void Fails(ProtocolErrorKind kind, Work work) {
+    try {
+        work();
+    } catch (const ProtocolError &error) {
+        CHECK(error.Kind() == kind);
+        return;
+    }
+    throw std::runtime_error("invalid LOB prefetch accepted");
+}
+
+static void InvalidMetadata() {
+    size_t calls = 0;
+    const auto read = [&](const std::vector<uint8_t> &, uint64_t, uint64_t) {
+        ++calls;
+        return TtcLobResponse {};
+    };
+    const auto verify = [&](const OracleLobPrefetch &lob, size_t prefix_budget, size_t content_budget,
+                            ProtocolErrorKind kind) {
+        Fails(kind, [&] { MaterializePrefetchedOracleLob(lob, prefix_budget, content_budget, read); });
+        CHECK(calls == 0);
+    };
+    OracleLobPrefetch lob;
+    verify(lob, 0, 100, ProtocolErrorKind::MALFORMED);
+    verify(lob, 65537, 100, ProtocolErrorKind::MALFORMED);
+    verify(lob, 100, 0, ProtocolErrorKind::MALFORMED);
+    lob.total_units = 1;
+    verify(lob, 100, 100, ProtocolErrorKind::MALFORMED); // missing fallback locator
+    lob.locator = {1};
+    lob.prefix_units = 2;
+    lob.prefix = {1, 2};
+    verify(lob, 100, 100, ProtocolErrorKind::MALFORMED);
+    lob.prefix_units = 1;
+    lob.prefix.clear();
+    verify(lob, 100, 100, ProtocolErrorKind::MALFORMED);
+    lob.prefix = {1};
+    lob.character = true;
+    verify(lob, 100, 100, ProtocolErrorKind::MALFORMED); // odd UTF-16 byte count
+    lob.prefix = {0, 1};
+    verify(lob, 1, 100, ProtocolErrorKind::LIMIT_EXCEEDED);
+    verify(lob, 100, 1, ProtocolErrorKind::LIMIT_EXCEEDED);
+    lob.locator.resize(4097);
+    verify(lob, 100, 100, ProtocolErrorKind::LIMIT_EXCEEDED);
+    lob.locator = {1};
+    lob.total_units = (std::numeric_limits<uint64_t>::max)();
+    lob.prefix_units = 0;
+    lob.prefix.clear();
+    verify(lob, 100, (std::numeric_limits<size_t>::max)(), ProtocolErrorKind::LIMIT_EXCEEDED);
+    lob.character = false;
+    verify(lob, 100, (std::numeric_limits<size_t>::max)(), ProtocolErrorKind::LIMIT_EXCEEDED);
+}
+
+static void InvalidRemainder() {
+    OracleLobPrefetch lob;
+    lob.total_units = 2;
+    lob.prefix_units = 1;
+    lob.prefix = {1};
+    lob.locator = {1};
+    const auto verify = [&](const TtcLobResponse &response, ProtocolErrorKind kind) {
+        size_t calls = 0;
+        Fails(kind, [&] { MaterializePrefetchedOracleLob(lob, 100, 100,
+            [&](const std::vector<uint8_t> &, uint64_t, uint64_t) { ++calls; return response; }); });
+        CHECK(calls == 1);
+    };
+    verify({}, ProtocolErrorKind::TRUNCATED);
+    TtcLobResponse bad;
+    bad.amount = 2;
+    bad.data = {1, 2};
+    verify(bad, ProtocolErrorKind::MALFORMED);
+    bad.amount = 1;
+    verify(bad, ProtocolErrorKind::MALFORMED);
+    bad.data.clear();
+    verify(bad, ProtocolErrorKind::MALFORMED);
+    bad.amount = (std::numeric_limits<uint64_t>::max)();
+    verify(bad, ProtocolErrorKind::MALFORMED);
+    size_t calls = 0;
+    Fails(ProtocolErrorKind::INVALID_STATE, [&] { MaterializePrefetchedOracleLob(lob, 100, 100,
+        [&](const std::vector<uint8_t> &, uint64_t, uint64_t) -> TtcLobResponse {
+            ++calls;
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "closed test session");
+        }); });
+    CHECK(calls == 1);
+}
+
+static void UnicodeBoundary() {
+    // The prefix ends at a high surrogate. Decode only after joining the
+    // low surrogate and remainder, including NUL and a Japanese character.
+    OracleLobPrefetch lob;
+    lob.character = true;
+    lob.total_units = 5;
+    lob.prefix_units = 2;
+    lob.prefix = {0, 'A', 0xd8, 0x3d};
+    lob.locator = {1};
+    const auto content = MaterializePrefetchedOracleLob(lob, 4, 10,
+        [&](const std::vector<uint8_t> &, uint64_t offset, uint64_t amount) {
+            CHECK(offset == 3 && amount == 3);
+            TtcLobResponse response;
+            response.amount = 3;
+            response.data = {0xde, 0x00, 0, 0, 0x65, 0xe5};
+            return response;
+        });
+    const std::vector<uint8_t> expected = {'A', 0xf0, 0x9f, 0x98, 0x80, 0, 0xe6, 0x97, 0xa5};
+    CHECK(content && DecodeUtf16BeToUtf8(*content) == expected);
+}
+
+} // namespace lob_prefetch
+
+static void TestLobPrefetchMaterializer() {
+    using namespace lob_prefetch;
+    size_t null_calls = 0;
+    const auto null_value = MaterializePrefetchedOracleLob(std::nullopt, 4096, 100,
+        [&](const std::vector<uint8_t> &, uint64_t, uint64_t) { ++null_calls; return TtcLobResponse {}; });
+    CHECK(!null_value && null_calls == 0);
+    for (bool character : {false, true}) {
+        for (uint64_t total : {uint64_t(0), uint64_t(1), uint64_t(4095), uint64_t(4096), uint64_t(4097),
+                               uint64_t(32767), uint64_t(32768), uint64_t(65535), uint64_t(65536),
+                               uint64_t(65537), uint64_t(131073)}) {
+            RoundTrip(character, total, (std::min)(total, uint64_t(4096)), 65536);
+        }
+        RoundTrip(character, 1, 0, 65536); // metadata-only prefix
+        RoundTrip(character, 10000, 4096, 1000); // partial reads remain contiguous
+        RoundTrip(character, 12000, 12000, 65536); // entire value: zero LOB calls
+    }
+    InvalidMetadata();
+    InvalidRemainder();
+    UnicodeBoundary();
+}
+
+static void TestLobPrefetchScalarBudget() {
+    OracleColumn lob;
+    lob.oracle_type = 112;
+    lob.character_set_form = 1;
+    OracleColumn text;
+    text.oracle_type = 1;
+    text.character_set_form = 1;
+    text.byte_width = 4000;
+    OracleLobPrefetchLimits limits;
+    std::vector<OracleColumn> columns(240, text);
+    columns.push_back(lob);
+    CHECK(BoundedLobPrefetchRows(columns, 128, limits) == 4);
+    columns.insert(columns.end(), 40, text);
+    bool refused = false;
+    try { BoundedLobPrefetchRows(columns, 2, limits); }
+    catch (const ProtocolError &error) { refused = error.Kind() == ProtocolErrorKind::LIMIT_EXCEEDED; }
+    CHECK(refused);
+    text.byte_width = 0;
+    CHECK(BoundedLobPrefetchRows({lob, text}, 128, limits) == 29);
+    text.omitted_from_row_data = true;
+    CHECK(BoundedLobPrefetchRows({lob, text}, 128, limits) == 128);
+    text.omitted_from_row_data = false;
+    text.byte_width = (std::numeric_limits<uint32_t>::max)();
+    refused = false;
+    try { BoundedLobPrefetchRows({lob, text}, 2, limits); }
+    catch (const ProtocolError &error) { refused = error.Kind() == ProtocolErrorKind::LIMIT_EXCEEDED; }
+    CHECK(refused);
+}
+
 int main() {
 
     TestUniversalIntegers();
@@ -5743,6 +5947,8 @@ int main() {
     TestSessionFactory();
     TestSessionPool();
     TestSsoWallet();
+    TestLobPrefetchMaterializer();
+    TestLobPrefetchScalarBudget();
     std::cout << "oracle_scanner protocol tests passed\n";
     return 0;
 }

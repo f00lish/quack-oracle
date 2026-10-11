@@ -77,10 +77,13 @@ public:
         });
     }
     ~OracleCallerInterruptScope() {
+        Stop();
+        if (signalled) { source->Set(previous); }
+    }
+    void Stop() {
         { std::lock_guard<std::mutex> guard(lock); stop = true; }
         wake.notify_one();
         if (watcher.joinable()) { watcher.join(); }
-        if (signalled) { source->Set(previous); }
     }
     void Check() const { if (context.IsInterrupted()) { throw InterruptException(); } }
 private:
@@ -1563,8 +1566,8 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &co
     }
     auto state = make_uniq<OracleTransactionManyState>();
     state->exact_counts = bind.exact_counts;
+    OracleCallerInterruptScope interrupt(context);
     try {
-        OracleCallerInterruptScope interrupt(context);
         auto &session = TransactionSession(context, target);
         if (bind.exact_counts) {
             state->counts.reserve(bind.rows.size());
@@ -1583,6 +1586,9 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &co
         interrupt.Check();
         return std::move(state);
     } catch (const std::exception &error) {
+        // Join first, retain the expired caller deadline through cleanup.
+        // Rollback cannot wait for a reply on the interrupted exchange.
+        interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
         ThrowOracleAdapterError("oracle_execute_many_transaction failed", error);
     }
@@ -1655,8 +1661,8 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
     if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot call through an attached read-only Oracle catalog");
     }
+    OracleCallerInterruptScope interrupt(context);
     try {
-        OracleCallerInterruptScope interrupt(context);
         auto &session = TransactionSession(context, target);
         auto result = session.Call(bind.procedure, bind.arguments);
         if (!result.explicit_cursors.empty() || !result.implicit_cursors.empty()) {
@@ -1683,6 +1689,9 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
         interrupt.Check();
         return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
     } catch (const std::exception &error) {
+        // Join first, retain the expired caller deadline through cleanup.
+        // Rollback cannot wait for a reply on the interrupted exchange.
+        interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
         ThrowOracleAdapterError("oracle_call_named_transaction failed", error);
     }

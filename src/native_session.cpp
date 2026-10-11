@@ -149,8 +149,10 @@ public:
                 // Never interpret an old locator as a prefetched descriptor.
                 previous_row.reset();prefetch_active=true;
             } else { channel.Fetch(handle,sequence,count); }
+            auto response_limits=prefetch_limits;
+            response_limits.maximum_rows=count;
             auto response=prefetch_active ?
-                channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,prefetch_limits,server_field_version,previous_row) :
+                channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,response_limits,server_field_version,previous_row) :
                 channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row);
             previous_row = response.last_row;
             exhausted = response.exhausted;

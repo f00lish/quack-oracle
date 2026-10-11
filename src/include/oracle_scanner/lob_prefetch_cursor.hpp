@@ -42,10 +42,25 @@ inline uint32_t BoundedLobPrefetchRows(const std::vector<OracleColumn> &columns,
     }
     size_t per_row = 0;
     for (const auto &column : columns) {
-        if (!IsOracleLobType(column.oracle_type) || column.omitted_from_row_data) { continue; }
-        const size_t cell = static_cast<size_t>(limits.prefix_units) * (column.oracle_type == 112 ? 2U : 1U) + 4096U + 64U;
+        if (column.omitted_from_row_data) { continue; }
+        // Scalar values occupy the same reconstructed row and batch budgets.
+        // Prefer the described maximum byte width. Synthetic/unknown widths
+        // use the existing DEFINE capacity or fixed scalar encoding maximum.
+        size_t cell = column.byte_width;
+        if (IsOracleLobType(column.oracle_type)) {
+            cell = static_cast<size_t>(limits.prefix_units) * (column.oracle_type == 112 ? 2U : 1U) + 4096U + 64U;
+        } else {
+            switch (column.oracle_type) {
+            case 1: if (cell == 0) { cell = 131068; } break;
+            case 23: if (cell == 0) { cell = 32767; } break;
+            case 2: cell = (std::max)(cell,size_t(22)); break;
+            case 12: cell = (std::max)(cell,size_t(7)); break;
+            case 180: cell = (std::max)(cell,size_t(11)); break;
+            default: break; // Omitted CHAR was skipped above.
+            }
+        }
         if (cell > limits.maximum_row_bytes - per_row) {
-            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,"LOB prefetch columns exceed row budget");
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,"LOB prefetch row estimate exceeds row budget");
         }
         per_row += cell;
     }

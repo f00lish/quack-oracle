@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/auth_crypto.hpp"
 #include "oracle_scanner/call_registry.hpp"
+#include "oracle_scanner/call_builder.hpp"
 #include "oracle_scanner/descriptor_parser.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/session_factory.hpp"
@@ -774,7 +775,7 @@ unique_ptr<GlobalTableFunctionState> OracleExecuteManyInit(ClientContext &, Tabl
             } catch (...) {
             }
         }
-        throw IOException("oracle_execute_many failed: %s", error.what());
+        ThrowOracleAdapterError("oracle_execute_many failed", error);
     }
 }
 
@@ -1433,6 +1434,213 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
     }
 }
 
+
+// These limits bound adapter bind/output materialization, not Oracle process PGA.
+constexpr size_t ORACLE_TRANSACTION_ROWS_LIMIT = 2048;
+constexpr size_t ORACLE_TRANSACTION_BIND_BYTES = 131072;
+
+void AddTransactionBindBytes(size_t &bytes, size_t amount) {
+    if (amount > ORACLE_TRANSACTION_BIND_BYTES - bytes) {
+        throw BinderException("Oracle transaction bind/output budget exceeds 131072 bytes");
+    }
+    bytes += amount;
+}
+
+struct OracleTransactionManyBindData final : TableFunctionData {
+    std::string catalog_name;
+    std::string sql;
+    std::vector<std::vector<oracle_scanner::OracleBind>> rows;
+    bool exact_counts = true;
+};
+
+struct OracleTransactionManyState final : GlobalTableFunctionState {
+    std::vector<uint64_t> counts;
+    bool exact_counts = true;
+    idx_t next = 0;
+};
+
+unique_ptr<FunctionData> OracleTransactionManyBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() ||
+        input.inputs[2].type().id() != LogicalTypeId::LIST) {
+        throw BinderException("oracle_execute_many_transaction requires catalog, SQL and non-NULL bind rows");
+    }
+    const auto &values = ListValue::GetChildren(input.inputs[2]);
+    const auto type = ListType::GetChildType(input.inputs[2].type()).id();
+    if (values.empty() || values.size() > ORACLE_TRANSACTION_ROWS_LIMIT ||
+        (type != LogicalTypeId::STRUCT && type != LogicalTypeId::LIST)) {
+        throw BinderException("oracle_execute_many_transaction needs 1..2048 STRUCT or LIST rows");
+    }
+    auto result = make_uniq<OracleTransactionManyBindData>();
+    const auto option = input.named_parameters.find("exact_counts");
+    if (option != input.named_parameters.end()) {
+        if (option->second.IsNull()) {
+            throw BinderException("oracle_execute_many_transaction exact_counts cannot be NULL");
+        }
+        result->exact_counts = option->second.GetValue<bool>();
+    }
+    result->sql = input.inputs[1].GetValue<std::string>();
+    if (result->sql.size() > 65536) {
+        throw BinderException("oracle_execute_many_transaction SQL exceeds 65536 bytes");
+    }
+    size_t bytes = 0;
+    result->rows.reserve(values.size());
+    for (idx_t index = 0; index < values.size(); ++index) {
+        if (values[index].IsNull()) {
+            throw BinderException("oracle_execute_many_transaction row %llu is NULL", index + 1);
+        }
+        auto binds = type == LogicalTypeId::STRUCT ? NamedBinds(values[index], "oracle_execute_many_transaction")
+                                                  : PositionalBinds(values[index], "oracle_execute_many_transaction");
+        oracle_scanner::ValidateOracleDml(result->sql, binds);
+        for (const auto &bind : binds) {
+            AddTransactionBindBytes(bytes, bind.name.size());
+            AddTransactionBindBytes(bytes, bind.value ? bind.value->size() : 0);
+        }
+        result->rows.emplace_back(std::move(binds));
+    }
+    auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
+    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot write to an attached read-only Oracle catalog");
+    }
+    result->catalog_name = target.catalog_name;
+    names = {"row_index", "affected_rows", "exact_counts"};
+    return_types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BOOLEAN};
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &context,
+                                                               TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OracleTransactionManyBindData>();
+    auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
+    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot write to an attached read-only Oracle catalog");
+    }
+    auto state = make_uniq<OracleTransactionManyState>();
+    state->exact_counts = bind.exact_counts;
+    try {
+        auto &session = TransactionSession(context, target);
+        if (bind.exact_counts) {
+            state->counts.reserve(bind.rows.size());
+            for (idx_t index = 0; index < bind.rows.size(); ++index) {
+                try {
+                    state->counts.push_back(session.ExecuteWithRowCount(bind.sql, bind.rows[index]));
+                } catch (const oracle_scanner::ProtocolError &error) {
+                    throw oracle_scanner::ProtocolError(error.Kind(),
+                        "Oracle exact batch row " + std::to_string(index + 1) + ": " + error.what(), error.OracleCode());
+                }
+            }
+        } else {
+            state->counts.push_back(session.ExecuteBatch(bind.sql, bind.rows));
+        }
+        return std::move(state);
+    } catch (const std::exception &error) {
+        PoisonTransactionSession(context, target.catalog_name);
+        ThrowOracleAdapterError("oracle_execute_many_transaction failed", error);
+    }
+}
+
+void OracleTransactionManyFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+    auto &state = input.global_state->Cast<OracleTransactionManyState>();
+    const auto count = std::min<idx_t>(state.counts.size() - state.next, STANDARD_VECTOR_SIZE);
+    for (idx_t index = 0; index < count; ++index) {
+        output.SetValue(0, index, state.exact_counts ? Value::UBIGINT(state.next + index + 1)
+                                                   : Value(LogicalType::UBIGINT));
+        output.SetValue(1, index, Value::UBIGINT(state.counts[state.next + index]));
+        output.SetValue(2, index, Value::BOOLEAN(state.exact_counts));
+    }
+    output.SetCardinality(count);
+    state.next += count;
+}
+
+struct OracleTransactionCallBindData final : TableFunctionData {
+    std::string catalog_name;
+    std::string procedure;
+    std::vector<oracle_scanner::OracleBind> arguments;
+};
+
+unique_ptr<FunctionData> OracleTransactionCallBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() ||
+        input.inputs[2].type().id() != LogicalTypeId::LIST || ListValue::GetChildren(input.inputs[2]).size() > 64) {
+        throw BinderException("oracle_call_named_transaction requires catalog, procedure and 1..64 scalar arguments");
+    }
+    auto result = make_uniq<OracleTransactionCallBindData>();
+    result->procedure = input.inputs[1].GetValue<std::string>();
+    result->arguments = CallArguments(input.inputs[2]);
+    size_t bytes = 0;
+    for (const auto &bind : result->arguments) {
+        if (bind.oracle_type != 1 && bind.oracle_type != 2) {
+            throw BinderException("oracle_call_named_transaction currently supports NUMBER and VARCHAR arguments only");
+        }
+        if (bind.value && bind.value->size() > 32767) {
+            throw BinderException("oracle_call_named_transaction scalar value exceeds 32767 bytes");
+        }
+        AddTransactionBindBytes(bytes, bind.name.size());
+        AddTransactionBindBytes(bytes, bind.value ? bind.value->size() : 0);
+        if (bind.direction != oracle_scanner::BindDirection::BIND_IN) {
+            AddTransactionBindBytes(bytes, bind.maximum_bytes);
+        }
+    }
+    oracle_scanner::BuildOracleProcedureCallBlock(result->procedure, result->arguments);
+    auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
+    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot call through an attached read-only Oracle catalog");
+    }
+    result->catalog_name = target.catalog_name;
+    names = {"name", "value"};
+    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &context, TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OracleTransactionCallBindData>();
+    auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
+    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot call through an attached read-only Oracle catalog");
+    }
+    try {
+        auto &session = TransactionSession(context, target);
+        auto result = session.Call(bind.procedure, bind.arguments);
+        if (!result.explicit_cursors.empty() || !result.implicit_cursors.empty()) {
+            for (auto &cursor : result.explicit_cursors) { cursor->Close(); }
+            for (auto &cursor : result.implicit_cursors) { cursor->Close(); }
+            throw BinderException("oracle_call_named_transaction cannot return cursors");
+        }
+        std::vector<OracleCallNamedRow> rows;
+        size_t position = 0;
+        for (const auto &argument : bind.arguments) {
+            if (argument.direction == oracle_scanner::BindDirection::BIND_IN) { continue; }
+            if (position == result.outputs.size() || result.outputs[position].oracle_type != argument.oracle_type) {
+                throw BinderException("oracle_call_named_transaction output shape mismatch");
+            }
+            OracleCallNamedRow row;
+            row.name = argument.name;
+            const auto &value = result.outputs[position++].value;
+            if (value) { row.value = FormatCallScalar(argument.oracle_type, *value); }
+            rows.emplace_back(std::move(row));
+        }
+        if (position != result.outputs.size()) {
+            throw BinderException("oracle_call_named_transaction has unexpected outputs");
+        }
+        return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
+    } catch (const std::exception &error) {
+        PoisonTransactionSession(context, target.catalog_name);
+        ThrowOracleAdapterError("oracle_call_named_transaction failed", error);
+    }
+}
+
+void OracleTransactionCallFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+    auto &state = input.global_state->Cast<OracleCallNamedGlobalState>();
+    const auto count = std::min<idx_t>(state.rows.size() - state.next_row, STANDARD_VECTOR_SIZE);
+    for (idx_t index = 0; index < count; ++index) {
+        const auto &row = state.rows[state.next_row + index];
+        output.SetValue(0, index, Value(row.name));
+        output.SetValue(1, index, row.value ? Value(*row.value) : Value(LogicalType::VARCHAR));
+    }
+    output.SetCardinality(count);
+    state.next_row += count;
+}
+
 unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallNamedBindData>();
     try {
@@ -1859,6 +2067,27 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
          "SELECT * FROM oracle_execute_transaction('tx', "
          "'INSERT INTO QUACK_DEMO_LOG (LABEL) VALUES (:label)', {'label': 'example'});",
          {"oracle", "transaction", "write"}}));
+
+
+    TableFunction transaction_many("oracle_execute_many_transaction",
+        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+        OracleTransactionManyFunction, OracleTransactionManyBind, OracleTransactionManyInit);
+    transaction_many.named_parameters["exact_counts"] = LogicalType::BOOLEAN;
+    infos.push_back(DocumentedTableFunctionInfo(std::move(transaction_many),
+        {{"catalog_name", "sql", "rows"},
+         "Executes bounded DML on the caller transaction. Exact per-row counts default to scalar execution; "
+         "exact_counts=false uses native array DML and returns one explicitly aggregate count with NULL row_index.",
+         "SELECT * FROM oracle_execute_many_transaction('tx', 'DELETE FROM QUACK_DEMO_LOG WHERE ID=:id', [{id: 1}]);",
+         {"oracle", "transaction", "write"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_named_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+            OracleTransactionCallFunction, OracleTransactionCallBind, OracleTransactionCallInit),
+        {{"catalog_name", "procedure_name", "arguments"},
+         "Calls a NUMBER/VARCHAR scalar procedure on the caller transaction, with no adapter COMMIT. "
+         "The procedure itself must preserve transaction ownership.",
+         "SELECT * FROM oracle_call_named_transaction('tx', 'QUACK_DEMO_MOTTO', "
+         "[{name:'P_TEXT',direction:'out',type:'varchar',value:NULL::VARCHAR}]);",
+         {"oracle", "transaction", "call"}}));
 
     TableFunction execute("oracle_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleExecuteFunction,
                           OracleExecuteBind, OracleExecuteInit);

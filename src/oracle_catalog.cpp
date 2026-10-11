@@ -390,12 +390,15 @@ struct OracleAttachedState {
 
 };
 
-BindInfo OracleAttachedScanBindInfo(const optional_ptr<FunctionData> bind_data) {
-    auto &bind = bind_data->CastNoConst<OracleQueryBindData>();
+// DuckDB 2.0 reads the table a scan addresses from get_table_entry (see
+// LogicalGet::GetTable), not from its BindInfo; UPDATE, DELETE and the rowid
+// virtual column depend on it.
+optional_ptr<TableCatalogEntry> OracleAttachedScanTableEntry(optional_ptr<const FunctionData> bind_data) {
+    auto &bind = bind_data->Cast<OracleQueryBindData>();
     if (!bind.table_entry) {
         throw InternalException("an attached Oracle scan has no table entry");
     }
-    return BindInfo(*bind.table_entry);
+    return bind.table_entry;
 }
 
 class OracleAttachedTableEntry final : public TableCatalogEntry {
@@ -461,7 +464,7 @@ public:
         bind_data = std::move(scan_bind);
         TableFunction function({}, OracleQueryFunction, nullptr, OracleQueryInit);
         function.name = "oracle_attached_scan";
-        function.get_bind_info = OracleAttachedScanBindInfo;
+        function.get_table_entry = OracleAttachedScanTableEntry;
         Value pushdown;
         function.filter_pushdown =
             context.TryGetCurrentSetting("oracle_filter_pushdown", pushdown) && BooleanValue::Get(pushdown);
@@ -573,7 +576,7 @@ public:
     }
 
     OracleWriteTarget WriteTarget() {
-        return {GetAttached().GetName(), std::string(), state->config, state->password};
+        return {static_cast<const std::string &>(GetAttached().GetName()), std::string(), state->config, state->password};
     }
 
     PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
@@ -710,7 +713,7 @@ unique_ptr<TransactionManager> OracleAttachedCatalogTransactionManager(optional_
 } // namespace
 
 OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::string &catalog_name) {
-    auto &catalog = Catalog::GetCatalog(context, catalog_name);
+    auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
     if (catalog.GetCatalogType() != "oracle_scanner") {
         throw BinderException("Oracle transaction functions require an attached oracle_scanner catalog");
     }

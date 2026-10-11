@@ -435,6 +435,7 @@ class MaterializedQueryResult {
 public:
     explicit MaterializedQueryResult(duckdb::unique_ptr<duckdb::QueryResult> result) {
         if (result->HasError()) {
+            error_object = result->GetErrorObject();
             error = result->GetError();
             return;
         }
@@ -457,10 +458,12 @@ public:
                 }
             }
         } catch (const std::exception &exception) {
-            error = duckdb::ErrorData(exception).Message();
+            error_object = duckdb::ErrorData(exception);
+            error = error_object.Message();
             rows.clear();
         }
         if (result->HasError() && error.empty()) {
+            error_object = result->GetErrorObject();
             error = result->GetError();
         }
     }
@@ -469,6 +472,10 @@ public:
     }
     const std::string &GetError() const {
         return error;
+    }
+    // Extra fields such as oracle_error_code, carried by the error itself.
+    const duckdb::ErrorData &GetErrorObject() const {
+        return error_object;
     }
     duckdb::idx_t RowCount() const {
         return rows.size();
@@ -488,6 +495,7 @@ public:
 
 private:
     std::string error;
+    duckdb::ErrorData error_object;
     duckdb::idx_t column_count = 0;
     std::vector<duckdb::LogicalType> types;
     std::vector<std::string> names;
@@ -851,15 +859,19 @@ void TestNullsSurviveAboveTheScan() {
 
     // Submitted and read as a stream, chunk by chunk, which is what the shell
     // and every pipeline operator consume in DuckDB 2.0.
-    auto submitted = database.con.Submit("SELECT id, label, label IS NULL AS n FROM " + scan);
-    CHECK(!submitted->HasError());
-    duckdb::QueryResultStream<> streamed(std::move(submitted));
-    auto chunk = streamed.Fetch();
-    CHECK(chunk != nullptr && chunk->size() == 3);
-    CHECK(chunk->GetValue(1, 1).IsNull());
-    CHECK(chunk->GetValue(2, 0).GetValue<bool>() == false);
-    CHECK(chunk->GetValue(2, 1).GetValue<bool>() == true);
-    CHECK(chunk->GetValue(2, 2).GetValue<bool>() == false);
+    // The stream is closed before the next query: DuckDB 2.0 refuses a new
+    // query while the connection still has an open result.
+    {
+        auto submitted = database.con.Submit("SELECT id, label, label IS NULL AS n FROM " + scan);
+        CHECK(!submitted->HasError());
+        duckdb::QueryResultStream<> streamed(std::move(submitted));
+        auto chunk = streamed.Fetch();
+        CHECK(chunk != nullptr && chunk->size() == 3);
+        CHECK(chunk->GetValue(1, 1).IsNull());
+        CHECK(chunk->GetValue(2, 0).GetValue<bool>() == false);
+        CHECK(chunk->GetValue(2, 1).GetValue<bool>() == true);
+        CHECK(chunk->GetValue(2, 2).GetValue<bool>() == false);
+    }
 
     // And the aggregate, which counts non-NULLs by the same validity.
     auto counted = database.Query("SELECT count(label) FROM " + scan);
@@ -2259,9 +2271,9 @@ void TestFunctionExamplesRun() {
         // Parsing first, the way each kind of example is meant to be used: a
         // scalar example is an expression, a table example one whole statement.
         if (is_scalar) {
-            CHECK(duckdb::Parser::ParseExpressionList(example.second).size() == 1);
+            CHECK(duckdb::Parser::GetBuiltinParser().ParseExpressionList(example.second).size() == 1);
         } else {
-            duckdb::Parser parser;
+            auto parser = duckdb::Parser::GetBuiltinParser();
             parser.ParseQuery(example.second);
             CHECK(parser.statements.size() == 1 &&
                   parser.statements[0]->type == duckdb::StatementType::SELECT_STATEMENT);

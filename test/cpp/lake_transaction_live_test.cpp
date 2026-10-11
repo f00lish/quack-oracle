@@ -1,5 +1,6 @@
 #include "duckdb.hpp"
 #include "oracle_scanner_extension.hpp"
+#include "core_functions_extension.hpp"
 #include "oracle_adapter.hpp"
 
 #include <cstdlib>
@@ -39,7 +40,16 @@ static void Failure(const std::string &stage, const std::string &error) {
     throw std::runtime_error("live check failed");
 }
 
-static unique_ptr<MaterializedQueryResult> Run(Connection &con, const std::string &sql, const std::string &stage) {
+// DuckDB 2.0 results are read unit by unit; these checks only need the first value.
+static Value FirstValue(QueryResult &result) {
+    auto chunk = result.Fetch();
+    if (!chunk || chunk->size() == 0) {
+        throw std::runtime_error("live check expected a row");
+    }
+    return chunk->GetValue(0, 0);
+}
+
+static unique_ptr<QueryResult> Run(Connection &con, const std::string &sql, const std::string &stage) {
     auto result = con.Query(sql);
     if (result->HasError()) {
         Failure(stage, result->GetError());
@@ -52,7 +62,7 @@ static std::string Scalar(Connection &con, const std::string &sql, const std::st
     if (result->RowCount() != 1) {
         Failure(stage, "unexpected row count");
     }
-    return result->GetValue(0, 0).ToString();
+    return FirstValue(*result).ToString();
 }
 
 static void Count(Connection &con, const std::string &expected, const std::string &stage) {
@@ -148,12 +158,12 @@ static void TransactionChecks(DuckDB &db, Connection &con) {
         Run(con, "BEGIN;", "begin_prepared");
         Dml(con, "INSERT INTO LAKE_TX_PROBE VALUES (6, 'prepared')", "prepared_insert");
         auto prepared = Run(con, "EXECUTE lake_count;", "execute_prepared");
-        if (prepared->GetValue(0, 0).ToString() != "1") {
+        if (FirstValue(*prepared).ToString() != "1") {
             Failure("prepared_own_write", "unexpected count");
         }
         Run(con, "ROLLBACK;", "rollback_prepared");
         prepared = Run(con, "EXECUTE lake_count;", "execute_prepared_again");
-        if (prepared->GetValue(0, 0).ToString() != "0") {
+        if (FirstValue(*prepared).ToString() != "0") {
             Failure("prepared_after_rollback", "unexpected count");
         }
         Run(con, "BEGIN;", "begin_borrowed_cursors");
@@ -207,7 +217,7 @@ static void ATPChecks(Connection &admin) {
     }
     auto tablespaces = Run(admin, "SELECT * FROM oracle_query('live', "
         "'SELECT DEFAULT_TABLESPACE FROM USER_USERS');", "default_tablespace");
-    const auto tablespace = tablespaces->GetValue(0, 0).ToString();
+    const auto tablespace = FirstValue(*tablespaces).ToString();
     if (!std::regex_match(tablespace, std::regex("[A-Za-z][A-Za-z0-9_]{0,29}"))) {
         Failure("tablespace_configuration", "unsupported tablespace identifier");
     }
@@ -222,12 +232,13 @@ static void ATPChecks(Connection &admin) {
               "create_probe");
         {
             DuckDB runtime(nullptr);
+            runtime.LoadStaticExtension<CoreFunctionsExtension>();
             runtime.LoadStaticExtension<OracleScannerExtension>();
             Connection con(runtime);
             Configure(con, user, password);
             TransactionChecks(runtime, con);
             auto before = Run(con, "SELECT * FROM tx.LAKE_TX_PROBE;", "describe_before_ddl");
-            if (before->types.size() != 2) {
+            if (before->GetTypes().size() != 2) {
                 Failure("describe_before_ddl", "unexpected columns");
             }
             Admin(admin, "ALTER TABLE " + user + ".LAKE_TX_PROBE ADD (EXTRA_ID NUMBER(18,0))", "alter_probe");
@@ -236,7 +247,7 @@ static void ATPChecks(Connection &admin) {
             Run(con, "DETACH tx;", "detach_for_refresh");
             Run(con, "ATTACH 'live' AS tx (TYPE oracle_scanner);", "reattach_for_refresh");
             auto after = Run(con, "SELECT * FROM tx.LAKE_TX_PROBE;", "describe_after_refresh");
-            if (after->types.size() != 3) {
+            if (after->GetTypes().size() != 3) {
                 Failure("describe_after_refresh", "stale metadata");
             }
             std::cout << "PASS catalog refresh by DETACH/ATTACH after administrative ALTER\n";
@@ -261,6 +272,7 @@ static void ATPChecks(Connection &admin) {
 int main(int argc, char **argv) {
     try {
         DuckDB db(nullptr);
+        db.LoadStaticExtension<CoreFunctionsExtension>();
         db.LoadStaticExtension<OracleScannerExtension>();
         Connection con(db);
         Configure(con, Env("ODL_USER"), Env("ODL_PASSWORD"));

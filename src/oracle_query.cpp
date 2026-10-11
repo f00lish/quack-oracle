@@ -1491,7 +1491,11 @@ unique_ptr<FunctionData> OracleTransactionManyBind(ClientContext &context, Table
         }
         auto binds = type == LogicalTypeId::STRUCT ? NamedBinds(values[index], "oracle_execute_many_transaction")
                                                   : PositionalBinds(values[index], "oracle_execute_many_transaction");
-        oracle_scanner::ValidateOracleDml(result->sql, binds);
+        try {
+            oracle_scanner::ValidateOracleDml(result->sql, binds);
+        } catch (const std::exception &error) {
+            throw BinderException("oracle_execute_many_transaction row %llu is invalid: %s", index + 1, error.what());
+        }
         for (const auto &bind : binds) {
             AddTransactionBindBytes(bytes, bind.name.size());
             AddTransactionBindBytes(bytes, bind.value ? bind.value->size() : 0);
@@ -1566,7 +1570,11 @@ unique_ptr<FunctionData> OracleTransactionCallBind(ClientContext &context, Table
     }
     auto result = make_uniq<OracleTransactionCallBindData>();
     result->procedure = input.inputs[1].GetValue<std::string>();
-    result->arguments = CallArguments(input.inputs[2]);
+    try {
+        result->arguments = CallArguments(input.inputs[2]);
+    } catch (const std::exception &error) {
+        throw BinderException("oracle_call_named_transaction arguments are invalid: %s", error.what());
+    }
     size_t bytes = 0;
     for (const auto &bind : result->arguments) {
         if (bind.oracle_type != 1 && bind.oracle_type != 2) {
@@ -1581,7 +1589,11 @@ unique_ptr<FunctionData> OracleTransactionCallBind(ClientContext &context, Table
             AddTransactionBindBytes(bytes, bind.maximum_bytes);
         }
     }
-    oracle_scanner::BuildOracleProcedureCallBlock(result->procedure, result->arguments);
+    try {
+        oracle_scanner::BuildOracleProcedureCallBlock(result->procedure, result->arguments);
+    } catch (const std::exception &error) {
+        throw BinderException("oracle_call_named_transaction name or arguments are invalid: %s", error.what());
+    }
     auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
     if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot call through an attached read-only Oracle catalog");

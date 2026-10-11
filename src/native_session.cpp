@@ -422,7 +422,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
             // for, and anything appended after it competes with the newline
             // Oracle ends it with.
             throw ProtocolError(error.Kind(), "row " + std::to_string(start + error.FailedRow() + 1) +
-                                                  " of the batch failed: " + error.what());
+                                                  " of the batch failed: " + error.what(), error.OracleCode());
         }
         channel->CompleteExecute(handle, false, completion.cursor_id);
         channel->Close(handle);

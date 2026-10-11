@@ -12,6 +12,7 @@
 // not negotiate.
 
 #include "oracle_adapter.hpp"
+#include "duckdb/catalog/catalog.hpp"
 
 #include <optional>
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
@@ -425,7 +426,7 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
 }
 
 OracleSession &TransactionSession(ClientContext &context, const OracleWriteTarget &target) {
-    auto &catalog = Catalog::GetCatalog(context, target.catalog_name);
+    auto &catalog = Catalog::GetCatalog(context, Identifier(target.catalog_name));
     Transaction::Get(context, catalog);
     // Attached catalog configuration is shared across callers. The pinned
     // session belongs to this transaction's caller, not the ATTACH context.

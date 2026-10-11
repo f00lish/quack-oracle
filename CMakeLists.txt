@@ -217,6 +217,10 @@ if(ORACLE_SCANNER_BUILD_TESTS)
   add_executable(oracle_scanner_lake_live_test test/cpp/lake_transaction_live_test.cpp)
   target_link_libraries(oracle_scanner_lake_live_test PRIVATE duckdb_static)
   link_extension_libraries(oracle_scanner_lake_live_test PRIVATE)
+  # As for the adapter test: DuckDB 2.0 resolves linked extensions too late for
+  # the call above, so both archives are named here.
+  target_link_libraries(oracle_scanner_lake_live_test PRIVATE ${EXTENSION_NAME} core_functions_extension)
+  target_include_directories(oracle_scanner_lake_live_test PRIVATE ${CMAKE_SOURCE_DIR}/extension/core_functions/include)
   target_include_directories(oracle_scanner_lake_live_test PRIVATE src/include)
   target_compile_features(oracle_scanner_lake_live_test PRIVATE cxx_std_17)
 endif()

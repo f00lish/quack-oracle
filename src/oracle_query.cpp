@@ -605,17 +605,17 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
 
 
 unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
     return OracleQueryBindCommon(context, input, return_types, names, false);
 }
 
 unique_ptr<FunctionData> OracleTransactionQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
     return OracleQueryBindCommon(context, input, return_types, names, true);
 }
 
 unique_ptr<FunctionData> OracleTransactionExecuteBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_execute_transaction catalog and SQL cannot be NULL");
     }
@@ -624,7 +624,7 @@ unique_ptr<FunctionData> OracleTransactionExecuteBind(ClientContext &context, Ta
     result->binds = ParameterBinds(input, "oracle_execute_transaction");
     oracle_scanner::ValidateOracleDml(result->sql, result->binds);
     auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
-    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
     result->catalog_name = target.catalog_name;
@@ -650,7 +650,7 @@ unique_ptr<FunctionData> OracleExecuteBind(ClientContext &context, TableFunction
 }
 
 unique_ptr<FunctionData> OracleAdminBind(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
     RequireAutoCommit(context, "oracle_execute_admin");
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_execute_admin secret and SQL cannot be NULL");
@@ -683,8 +683,8 @@ void OracleAdminFunction(ClientContext &, TableFunctionInput &input, DataChunk &
     if (state.emitted) {
         return;
     }
-    output.SetValue(0, 0, Value::BOOLEAN(true));
-    output.SetCardinality(1);
+    output.data[0].SetValue(0, Value::BOOLEAN(true));
+    output.SetChildCardinality(1);
     state.emitted = true;
 }
 
@@ -698,7 +698,7 @@ struct OracleStatusGlobalState final : GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> OracleStatusBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull()) {
         throw BinderException("oracle_transaction_status catalog cannot be NULL");
     }
@@ -720,11 +720,11 @@ void OracleStatusFunction(ClientContext &, TableFunctionInput &input, DataChunk 
     if (state.emitted) {
         return;
     }
-    output.SetValue(0, 0, Value(state.status.commit_outcome));
-    output.SetValue(1, 0, Value(state.status.connection_state));
-    output.SetValue(2, 0, state.status.oracle_code ? Value::UINTEGER(*state.status.oracle_code) : Value(LogicalType::UINTEGER));
-    output.SetValue(3, 0, state.status.protocol_kind ? Value::INTEGER(*state.status.protocol_kind) : Value(LogicalType::INTEGER));
-    output.SetCardinality(1);
+    output.data[0].SetValue(0, Value(state.status.commit_outcome));
+    output.data[1].SetValue(0, Value(state.status.connection_state));
+    output.data[2].SetValue(0, state.status.oracle_code ? Value::UINTEGER(*state.status.oracle_code) : Value(LogicalType::UINTEGER));
+    output.data[3].SetValue(0, state.status.protocol_kind ? Value::INTEGER(*state.status.protocol_kind) : Value(LogicalType::INTEGER));
+    output.SetChildCardinality(1);
     state.emitted = true;
 }
 
@@ -744,7 +744,7 @@ unique_ptr<GlobalTableFunctionState> OracleExecuteInit(ClientContext &, TableFun
 unique_ptr<GlobalTableFunctionState> OracleTransactionExecuteInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleExecuteBindData>();
     auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
-    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
     try {
@@ -1511,7 +1511,7 @@ struct OracleTransactionManyState final : GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> OracleTransactionManyBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() ||
         input.inputs[2].type().id() != LogicalTypeId::LIST) {
         throw BinderException("oracle_execute_many_transaction requires catalog, SQL and non-NULL bind rows");
@@ -1554,7 +1554,7 @@ unique_ptr<FunctionData> OracleTransactionManyBind(ClientContext &context, Table
         result->rows.emplace_back(std::move(binds));
     }
     auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
-    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
     result->catalog_name = target.catalog_name;
@@ -1567,7 +1567,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &co
                                                                TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleTransactionManyBindData>();
     auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
-    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
     auto state = make_uniq<OracleTransactionManyState>();
@@ -1604,12 +1604,12 @@ void OracleTransactionManyFunction(ClientContext &, TableFunctionInput &input, D
     auto &state = input.global_state->Cast<OracleTransactionManyState>();
     const auto count = std::min<idx_t>(state.counts.size() - state.next, STANDARD_VECTOR_SIZE);
     for (idx_t index = 0; index < count; ++index) {
-        output.SetValue(0, index, state.exact_counts ? Value::UBIGINT(state.next + index + 1)
+        output.data[0].SetValue(index, state.exact_counts ? Value::UBIGINT(state.next + index + 1)
                                                    : Value(LogicalType::UBIGINT));
-        output.SetValue(1, index, Value::UBIGINT(state.counts[state.next + index]));
-        output.SetValue(2, index, Value::BOOLEAN(state.exact_counts));
+        output.data[1].SetValue(index, Value::UBIGINT(state.counts[state.next + index]));
+        output.data[2].SetValue(index, Value::BOOLEAN(state.exact_counts));
     }
-    output.SetCardinality(count);
+    output.SetChildCardinality(count);
     state.next += count;
 }
 
@@ -1620,7 +1620,7 @@ struct OracleTransactionCallBindData final : TableFunctionData {
 };
 
 unique_ptr<FunctionData> OracleTransactionCallBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() ||
         input.inputs[2].type().id() != LogicalTypeId::LIST || ListValue::GetChildren(input.inputs[2]).size() > 64) {
         throw BinderException("oracle_call_named_transaction requires catalog, procedure and 1..64 scalar arguments");
@@ -1652,7 +1652,7 @@ unique_ptr<FunctionData> OracleTransactionCallBind(ClientContext &context, Table
         throw BinderException("oracle_call_named_transaction name or arguments are invalid: %s", error.what());
     }
     auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
-    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot call through an attached read-only Oracle catalog");
     }
     result->catalog_name = target.catalog_name;
@@ -1664,7 +1664,7 @@ unique_ptr<FunctionData> OracleTransactionCallBind(ClientContext &context, Table
 unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleTransactionCallBindData>();
     auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
-    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot call through an attached read-only Oracle catalog");
     }
     OracleCallerInterruptScope interrupt(context);
@@ -1708,10 +1708,10 @@ void OracleTransactionCallFunction(ClientContext &, TableFunctionInput &input, D
     const auto count = std::min<idx_t>(state.rows.size() - state.next_row, STANDARD_VECTOR_SIZE);
     for (idx_t index = 0; index < count; ++index) {
         const auto &row = state.rows[state.next_row + index];
-        output.SetValue(0, index, Value(row.name));
-        output.SetValue(1, index, row.value ? Value(*row.value) : Value(LogicalType::VARCHAR));
+        output.data[0].SetValue(index, Value(row.name));
+        output.data[1].SetValue(index, row.value ? Value(*row.value) : Value(LogicalType::VARCHAR));
     }
-    output.SetCardinality(count);
+    output.SetChildCardinality(count);
     state.next_row += count;
 }
 
@@ -2143,7 +2143,7 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
 
     TableFunction transaction_query("oracle_query_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                     OracleQueryFunction, OracleTransactionQueryBind, OracleQueryInit);
-    transaction_query.varargs = LogicalType::ANY;
+    transaction_query.GetSignature().AddArgs("params", LogicalType::ANY);
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(transaction_query),
         {{"catalog_name", "sql", "params"},
@@ -2153,7 +2153,7 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
 
     TableFunction transaction_execute("oracle_execute_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                       OracleExecuteFunction, OracleTransactionExecuteBind, OracleTransactionExecuteInit);
-    transaction_execute.varargs = LogicalType::ANY;
+    transaction_execute.GetSignature().AddArgs("params", LogicalType::ANY);
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(transaction_execute),
         {{"catalog_name", "sql", "params"},
@@ -2166,7 +2166,9 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
     TableFunction transaction_many("oracle_execute_many_transaction",
         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
         OracleTransactionManyFunction, OracleTransactionManyBind, OracleTransactionManyInit);
-    transaction_many.named_parameters["exact_counts"] = LogicalType::BOOLEAN;
+    transaction_many.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+        options.Add("exact_counts", LogicalType::BOOLEAN);
+    });
     infos.push_back(DocumentedTableFunctionInfo(std::move(transaction_many),
         {{"catalog_name", "sql", "rows", "exact_counts"},
          "Executes bounded DML on the caller transaction. Exact per-row counts default to scalar execution; "

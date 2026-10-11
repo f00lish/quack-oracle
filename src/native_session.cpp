@@ -250,6 +250,24 @@ std::unique_ptr<NativeOracleSession> NativeOracleSession::Connect(const Connecti
     return std::unique_ptr<NativeOracleSession>(new NativeOracleSession(std::move(connection)));
 }
 
+// Normal native reader owns the response. This only withholds a result after
+// accepted Cancel and records a genuinely decoded error; no drain or replay.
+template <class Operation>
+static auto RunNativeOperation(NativeFetchCancellation &cancellation, Operation operation)
+    -> decltype(operation()) {
+    try {
+        auto result = operation();
+        cancellation.CompleteOperation();
+        return result;
+    } catch (const ProtocolError &error) {
+        cancellation.ObserveError(error);
+        throw;
+    } catch (...) {
+        cancellation.ObserveUnknownError();
+        throw;
+    }
+}
+
 uint8_t NativeOracleSession::NextSequence() {
     const auto result = next_sequence++;
     if (next_sequence == 0) {
@@ -296,7 +314,9 @@ std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql,
 }
 
 uint64_t NativeOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {
-    return ExecuteStatement(sql, binds, OracleSqlKind::DML);
+    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+        return ExecuteStatement(sql, binds, OracleSqlKind::DML);
+    });
 }
 
 void NativeOracleSession::ExecuteAdmin(const std::string &sql) {
@@ -334,56 +354,58 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
 
 uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) {
     RequireOpen();
-    const auto call = channel->LockCall();
-    auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::DML);
-    // PL/SQL bind variables are stricter than SQL placeholders: begin the
-    // generated name with a letter even though the SQL scanner also permits
-    // an underscore there.
-    std::string count_name = "oracle_scanner_row_count";
-    for (;;) {
-        const auto canonical = CanonicalOracleBindName(count_name);
-        bool collides = false;
-        for (const auto &bind : ordered_binds) {
-            if (CanonicalOracleBindName(bind.name) == canonical) {
-                collides = true;
+    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+        const auto call = channel->LockCall();
+        auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::DML);
+        // PL/SQL bind variables are stricter than SQL placeholders: begin the
+        // generated name with a letter even though the SQL scanner also permits
+        // an underscore there.
+        std::string count_name = "oracle_scanner_row_count";
+        for (;;) {
+            const auto canonical = CanonicalOracleBindName(count_name);
+            bool collides = false;
+            for (const auto &bind : ordered_binds) {
+                if (CanonicalOracleBindName(bind.name) == canonical) {
+                    collides = true;
+                    break;
+                }
+            }
+            if (!collides) {
                 break;
             }
+            count_name += "_";
         }
-        if (!collides) {
-            break;
-        }
-        count_name += "_";
-    }
-    ordered_binds.push_back({count_name, 2, BindDirection::BIND_OUT, std::nullopt, 22});
-    const auto block = "BEGIN " + sql + "; :" + count_name + " := SQL%ROWCOUNT; END;";
+        ordered_binds.push_back({count_name, 2, BindDirection::BIND_OUT, std::nullopt, 22});
+        const auto block = "BEGIN " + sql + "; :" + count_name + " := SQL%ROWCOUNT; END;";
 
-    const auto handle = statements.Open(OracleSqlKind::PLSQL);
-    TtcExecuteBindsRequest execute;
-    execute.sequence = NextSequence();
-    execute.sql = block;
-    execute.binds = ordered_binds;
-    execute.is_plsql = true;
-    channel->ExecuteBinds(handle, execute);
-    const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
-                                                    connection->TtcServerFieldVersion());
-    channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
-    channel->Close(handle);
-    if (!decoded.out_binds || decoded.out_binds->scalar_values.size() != 1 ||
-        decoded.out_binds->cursor_values.size() != 1 || !decoded.out_binds->scalar_values[0]) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML row-count OUT bind is missing");
-    }
-    const auto text = DecodeOracleNumber(*decoded.out_binds->scalar_values[0]);
-    size_t parsed = 0;
-    uint64_t result = 0;
-    try {
-        result = std::stoull(text, &parsed);
-    } catch (const std::exception &) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML row count is not an unsigned integer");
-    }
-    if (parsed != text.size()) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML row count is not an unsigned integer");
-    }
-    return result;
+        const auto handle = statements.Open(OracleSqlKind::PLSQL);
+        TtcExecuteBindsRequest execute;
+        execute.sequence = NextSequence();
+        execute.sql = block;
+        execute.binds = ordered_binds;
+        execute.is_plsql = true;
+        channel->ExecuteBinds(handle, execute);
+        const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
+                                                        connection->TtcServerFieldVersion());
+        channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
+        channel->Close(handle);
+        if (!decoded.out_binds || decoded.out_binds->scalar_values.size() != 1 ||
+            decoded.out_binds->cursor_values.size() != 1 || !decoded.out_binds->scalar_values[0]) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML row-count OUT bind is missing");
+        }
+        const auto text = DecodeOracleNumber(*decoded.out_binds->scalar_values[0]);
+        size_t parsed = 0;
+        uint64_t result = 0;
+        try {
+            result = std::stoull(text, &parsed);
+        } catch (const std::exception &) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML row count is not an unsigned integer");
+        }
+        if (parsed != text.size()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML row count is not an unsigned integer");
+        }
+        return result;
+    });
 }
 
 // One OALL8 per group of rows rather than one per row: Oracle parses the
@@ -392,156 +414,163 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
 // request stays a bounded message; the row counts are summed across groups.
 uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::vector<std::vector<OracleBind>> &rows) {
     RequireOpen();
-    if (rows.empty()) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "native Oracle DML batch cannot be empty");
-    }
-    constexpr size_t maximum_iterations_per_execute = 1024;
-    uint64_t affected_rows = 0;
-    for (size_t start = 0; start < rows.size(); start += maximum_iterations_per_execute) {
-        const auto call = channel->LockCall();
-        const auto end = (std::min)(rows.size(), start + maximum_iterations_per_execute);
-        auto ordered_first = OrderOracleStatementBinds(sql, rows[start], OracleBindUse::DML);
-        const auto handle = statements.Open(OracleSqlKind::DML);
-        TtcExecuteBindsRequest execute;
-        execute.sequence = NextSequence();
-        execute.sql = sql;
-        execute.binds = std::move(ordered_first);
-        execute.additional_iterations.reserve(end - start - 1);
-        for (size_t index = start + 1; index < end; index++) {
-            execute.additional_iterations.push_back(OrderOracleStatementBinds(sql, rows[index], OracleBindUse::DML));
+    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+        if (rows.empty()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "native Oracle DML batch cannot be empty");
         }
-        channel->ExecuteBinds(handle, execute);
-        TtcErrorInfo completion;
-        try {
-            completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion());
-        } catch (const OracleDmlError &error) {
-            // The server reports the iteration it was on, zero-based and
-            // relative to this request; the caller counts from the start of the
-            // batch it handed over.
-            // The row goes first: Oracle's own text is what a reader looks
-            // for, and anything appended after it competes with the newline
-            // Oracle ends it with.
-            throw ProtocolError(error.Kind(), "row " + std::to_string(start + error.FailedRow() + 1) +
-                                                  " of the batch failed: " + error.what(), error.OracleCode());
+        constexpr size_t maximum_iterations_per_execute = 1024;
+        uint64_t affected_rows = 0;
+        for (size_t start = 0; start < rows.size(); start += maximum_iterations_per_execute) {
+            RequireOpen();
+            const auto call = channel->LockCall();
+            const auto end = (std::min)(rows.size(), start + maximum_iterations_per_execute);
+            auto ordered_first = OrderOracleStatementBinds(sql, rows[start], OracleBindUse::DML);
+            const auto handle = statements.Open(OracleSqlKind::DML);
+            TtcExecuteBindsRequest execute;
+            execute.sequence = NextSequence();
+            execute.sql = sql;
+            execute.binds = std::move(ordered_first);
+            execute.additional_iterations.reserve(end - start - 1);
+            for (size_t index = start + 1; index < end; index++) {
+                execute.additional_iterations.push_back(OrderOracleStatementBinds(sql, rows[index], OracleBindUse::DML));
+            }
+            channel->ExecuteBinds(handle, execute);
+            TtcErrorInfo completion;
+            try {
+                completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion());
+            } catch (const OracleDmlError &error) {
+                // The server reports the iteration it was on, zero-based and
+                // relative to this request; the caller counts from the start of the
+                // batch it handed over.
+                // The row goes first: Oracle's own text is what a reader looks
+                // for, and anything appended after it competes with the newline
+                // Oracle ends it with.
+                throw ProtocolError(error.Kind(), "row " + std::to_string(start + error.FailedRow() + 1) +
+                                                      " of the batch failed: " + error.what(), error.OracleCode());
+            }
+            channel->CompleteExecute(handle, false, completion.cursor_id);
+            channel->Close(handle);
+            if ((std::numeric_limits<uint64_t>::max)() - affected_rows < completion.row_count) {
+                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "native Oracle DML batch row count overflows uint64");
+            }
+            affected_rows += completion.row_count;
         }
-        channel->CompleteExecute(handle, false, completion.cursor_id);
-        channel->Close(handle);
-        if ((std::numeric_limits<uint64_t>::max)() - affected_rows < completion.row_count) {
-            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "native Oracle DML batch row count overflows uint64");
-        }
-        affected_rows += completion.row_count;
-    }
-    return affected_rows;
+        return affected_rows;
+    });
 }
 
 std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string &sql,
                                                               const std::vector<OracleBind> &binds) {
     RequireOpen();
-    const auto call = channel->LockCall();
-    // The statement already names its own OUT binds — `RETURNING x INTO :y` —
-    // so unlike ExecuteWithRowCount nothing is appended to it. Wrapping it in a
-    // PL/SQL block is what puts it on the out-bind wire path, which is the one
-    // that carries values back.
-    auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::CALL);
-    const auto block = "BEGIN " + sql + "; END;";
+    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+        const auto call = channel->LockCall();
+        // The statement already names its own OUT binds — `RETURNING x INTO :y` —
+        // so unlike ExecuteWithRowCount nothing is appended to it. Wrapping it in a
+        // PL/SQL block is what puts it on the out-bind wire path, which is the one
+        // that carries values back.
+        auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::CALL);
+        const auto block = "BEGIN " + sql + "; END;";
 
-    const auto handle = statements.Open(OracleSqlKind::PLSQL);
-    TtcExecuteBindsRequest execute;
-    execute.sequence = NextSequence();
-    execute.sql = block;
-    execute.binds = ordered_binds;
-    execute.is_plsql = true;
-    channel->ExecuteBinds(handle, execute);
-    const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
-                                                      connection->TtcServerFieldVersion());
-    channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
-    channel->Close(handle);
+        const auto handle = statements.Open(OracleSqlKind::PLSQL);
+        TtcExecuteBindsRequest execute;
+        execute.sequence = NextSequence();
+        execute.sql = block;
+        execute.binds = ordered_binds;
+        execute.is_plsql = true;
+        channel->ExecuteBinds(handle, execute);
+        const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
+                                                          connection->TtcServerFieldVersion());
+        channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
+        channel->Close(handle);
 
-    std::vector<OracleBind> outputs;
-    for (const auto &bind : ordered_binds) {
-        if (bind.direction != BindDirection::BIND_IN) {
-            outputs.push_back(bind);
+        std::vector<OracleBind> outputs;
+        for (const auto &bind : ordered_binds) {
+            if (bind.direction != BindDirection::BIND_IN) {
+                outputs.push_back(bind);
+            }
         }
-    }
-    if (!decoded.out_binds || decoded.out_binds->scalar_values.size() != outputs.size()) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED,
-                            "Oracle RETURNING produced a different number of values than the statement declared");
-    }
-    for (size_t index = 0; index < outputs.size(); index++) {
-        outputs[index].value = decoded.out_binds->scalar_values[index];
-    }
-    return outputs;
+        if (!decoded.out_binds || decoded.out_binds->scalar_values.size() != outputs.size()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                "Oracle RETURNING produced a different number of values than the statement declared");
+        }
+        for (size_t index = 0; index < outputs.size(); index++) {
+            outputs[index].value = decoded.out_binds->scalar_values[index];
+        }
+        return outputs;
+    });
 }
 
 OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
     RequireOpen();
-    const auto call = channel->LockCall();
-    const auto sql = BuildOracleCallBlock(request);
-    std::vector<OracleBind> binds;
-    if (request.return_bind) {
-        binds.push_back(*request.return_bind);
-    }
-    binds.insert(binds.end(), request.arguments.begin(), request.arguments.end());
-    ValidateOracleBinds(binds, OracleBindUse::CALL);
-
-    const auto handle = statements.Open(OracleSqlKind::PLSQL);
-    if (binds.empty()) {
-        TtcExecuteNoBindsRequest execute;
-        execute.sequence = NextSequence();
-        execute.sql = sql;
-        execute.is_plsql = true;
-        channel->ExecuteNoBinds(handle, execute);
-    } else {
-        TtcExecuteBindsRequest execute;
-        execute.sequence = NextSequence();
-        execute.sql = sql;
-        execute.binds = binds;
-        execute.is_plsql = true;
-        channel->ExecuteBinds(handle, execute);
-    }
-    const auto decoded = channel->ReceiveCallResponse(handle, binds, connection->TtcFieldVersion(),
-                                                connection->TtcServerFieldVersion());
-    channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
-    channel->Close(handle);
-
-    OracleCallResult result;
-    std::vector<size_t> output_indexes;
-    for (size_t index = 0; index < binds.size(); index++) {
-        if (binds[index].direction != BindDirection::BIND_IN) {
-            output_indexes.push_back(index);
+    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+        const auto call = channel->LockCall();
+        const auto sql = BuildOracleCallBlock(request);
+        std::vector<OracleBind> binds;
+        if (request.return_bind) {
+            binds.push_back(*request.return_bind);
         }
-    }
-    if (decoded.out_binds) {
-        if (decoded.out_binds->scalar_values.size() != output_indexes.size() ||
-            decoded.out_binds->cursor_values.size() != output_indexes.size()) {
-            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle call OUT-bind result count disagrees with request");
+        binds.insert(binds.end(), request.arguments.begin(), request.arguments.end());
+        ValidateOracleBinds(binds, OracleBindUse::CALL);
+
+        const auto handle = statements.Open(OracleSqlKind::PLSQL);
+        if (binds.empty()) {
+            TtcExecuteNoBindsRequest execute;
+            execute.sequence = NextSequence();
+            execute.sql = sql;
+            execute.is_plsql = true;
+            channel->ExecuteNoBinds(handle, execute);
+        } else {
+            TtcExecuteBindsRequest execute;
+            execute.sequence = NextSequence();
+            execute.sql = sql;
+            execute.binds = binds;
+            execute.is_plsql = true;
+            channel->ExecuteBinds(handle, execute);
         }
-        for (size_t output_position = 0; output_position < output_indexes.size(); output_position++) {
-            auto output = binds[output_indexes[output_position]];
-            if (output.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
-                const auto &descriptor = decoded.out_binds->cursor_values[output_position];
-                if (!descriptor) {
-                    continue;
-                }
-                const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
-                channel->CompleteExecute(cursor_handle, true, descriptor->cursor_id);
-                result.explicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
-                    *channel, next_sequence, lifetime, cursor_handle, descriptor->columns, std::vector<TtcRowData> {}, false,
-                    connection->TtcServerFieldVersion()));
-            } else {
-                output.value = decoded.out_binds->scalar_values[output_position];
-                result.outputs.push_back(std::move(output));
+        const auto decoded = channel->ReceiveCallResponse(handle, binds, connection->TtcFieldVersion(),
+                                                    connection->TtcServerFieldVersion());
+        channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
+        channel->Close(handle);
+
+        OracleCallResult result;
+        std::vector<size_t> output_indexes;
+        for (size_t index = 0; index < binds.size(); index++) {
+            if (binds[index].direction != BindDirection::BIND_IN) {
+                output_indexes.push_back(index);
             }
         }
-    }
-    for (const auto &descriptor : decoded.implicit_cursors) {
-        const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
-        channel->CompleteExecute(cursor_handle, true, descriptor.cursor_id);
-        result.implicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
-            *channel, next_sequence, lifetime, cursor_handle, descriptor.columns, std::vector<TtcRowData> {}, false,
-            connection->TtcServerFieldVersion()));
-    }
-    return result;
+        if (decoded.out_binds) {
+            if (decoded.out_binds->scalar_values.size() != output_indexes.size() ||
+                decoded.out_binds->cursor_values.size() != output_indexes.size()) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle call OUT-bind result count disagrees with request");
+            }
+            for (size_t output_position = 0; output_position < output_indexes.size(); output_position++) {
+                auto output = binds[output_indexes[output_position]];
+                if (output.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
+                    const auto &descriptor = decoded.out_binds->cursor_values[output_position];
+                    if (!descriptor) {
+                        continue;
+                    }
+                    const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
+                    channel->CompleteExecute(cursor_handle, true, descriptor->cursor_id);
+                    result.explicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
+                        *channel, next_sequence, lifetime, cursor_handle, descriptor->columns, std::vector<TtcRowData> {}, false,
+                        connection->TtcServerFieldVersion()));
+                } else {
+                    output.value = decoded.out_binds->scalar_values[output_position];
+                    result.outputs.push_back(std::move(output));
+                }
+            }
+        }
+        for (const auto &descriptor : decoded.implicit_cursors) {
+            const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
+            channel->CompleteExecute(cursor_handle, true, descriptor.cursor_id);
+            result.implicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
+                *channel, next_sequence, lifetime, cursor_handle, descriptor.columns, std::vector<TtcRowData> {}, false,
+                connection->TtcServerFieldVersion()));
+        }
+        return result;
+    });
 }
 
 void NativeOracleSession::Commit() {

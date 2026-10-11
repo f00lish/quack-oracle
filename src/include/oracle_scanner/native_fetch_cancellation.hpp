@@ -42,6 +42,16 @@ public:
         }
     }
 
+    // Non-cursor result delivery obeys the same accepted-cancellation state.
+    void CompleteOperation() {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (pending || unusable) {
+            unusable = true;
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
+                                "Oracle operation cancelled locally; close the session before reuse");
+        }
+    }
+
     void ObserveError(const ProtocolError &error) {
         std::lock_guard<std::mutex> guard(mutex);
         if (pending && !unusable && error.OracleCode() == 1013) {

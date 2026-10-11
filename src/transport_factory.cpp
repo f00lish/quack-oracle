@@ -10,8 +10,17 @@
 namespace oracle_scanner {
 
 namespace {
-thread_local std::shared_ptr<OracleIoDeadline> transport_source;
-thread_local std::optional<std::chrono::steady_clock::time_point> transport_deadline;
+// The deadline and its source of the connect running on this thread, held
+// in function-local thread_locals as connect_plan.cpp holds its own.
+std::shared_ptr<OracleIoDeadline> &TransportSource() {
+    thread_local std::shared_ptr<OracleIoDeadline> source;
+    return source;
+}
+
+std::optional<std::chrono::steady_clock::time_point> &TransportDeadline() {
+    thread_local std::optional<std::chrono::steady_clock::time_point> deadline;
+    return deadline;
+}
 
 std::mutex &FactoryLock() {
     static std::mutex lock;
@@ -30,9 +39,9 @@ OracleHostResolver &InstalledResolver() {
 
 } // namespace
 
-std::optional<std::chrono::steady_clock::time_point> OracleTransportConnectDeadline() { return transport_deadline; }
+std::optional<std::chrono::steady_clock::time_point> OracleTransportConnectDeadline() { return TransportDeadline(); }
 
-std::shared_ptr<OracleIoDeadline> OracleTransportIoDeadlineSource() { return transport_source; }
+std::shared_ptr<OracleIoDeadline> OracleTransportIoDeadlineSource() { return TransportSource(); }
 
 std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_t port,
                                                 uint32_t connect_timeout_seconds, uint32_t read_timeout_seconds,
@@ -46,15 +55,15 @@ std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_
     const TlsConfiguration &tls, std::optional<std::chrono::steady_clock::time_point> deadline,
     std::shared_ptr<OracleIoDeadline> source) {
     struct RestoreSource {
-        std::shared_ptr<OracleIoDeadline> previous = transport_source;
-        ~RestoreSource() { transport_source = std::move(previous); }
+        std::shared_ptr<OracleIoDeadline> previous = TransportSource();
+        ~RestoreSource() { TransportSource() = std::move(previous); }
     } restore_source;
-    if (source) { transport_source = std::move(source); }
+    if (source) { TransportSource() = std::move(source); }
     struct RestoreDeadline {
-        std::optional<std::chrono::steady_clock::time_point> previous = transport_deadline;
-        ~RestoreDeadline() { transport_deadline = previous; }
+        std::optional<std::chrono::steady_clock::time_point> previous = TransportDeadline();
+        ~RestoreDeadline() { TransportDeadline() = previous; }
     } restore;
-    if (deadline && (!transport_deadline || *deadline < *transport_deadline)) { transport_deadline = deadline; }
+    if (deadline && (!TransportDeadline() || *deadline < *TransportDeadline())) { TransportDeadline() = deadline; }
     OracleTransportFactory factory;
     {
         std::lock_guard<std::mutex> guard(FactoryLock());

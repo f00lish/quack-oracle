@@ -487,6 +487,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     // On macOS blocking SIGPIPE in this thread is insufficient: a socket write
     // can signal another unblocked thread. Suppress it on the native BIO socket
     // before TLS can write, leaving EPIPE/error handling intact.
+#if !defined(_WIN32)
 #if defined(SO_NOSIGPIPE)
     int native_socket = -1;
     int suppress_sigpipe = 1;
@@ -494,6 +495,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
         setsockopt(native_socket, SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe, sizeof(suppress_sigpipe)) != 0) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TCP socket SIGPIPE protection failed");
     }
+#endif
 #endif
     if (use_tls) {
         result->context = SSL_CTX_new(TLS_client_method());

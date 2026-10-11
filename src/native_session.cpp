@@ -1,4 +1,5 @@
 #include "oracle_scanner/native_session.hpp"
+#include "oracle_scanner/native_fetch_cancellation.hpp"
 
 #include "oracle_scanner/bind_validation.hpp"
 #include "oracle_scanner/call_builder.hpp"
@@ -21,6 +22,7 @@ namespace oracle_scanner {
 
 struct NativeSessionLifetime {
     bool open = true;
+    NativeFetchCancellation fetch_cancellation;
 };
 
 namespace {
@@ -124,6 +126,9 @@ public:
         if (closed || !lifetime->open || requested_rows == 0) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle cursor is closed or fetch size is zero");
         }
+        const auto fetch_call = channel.LockCall();
+        lifetime->fetch_cancellation.RequireUsable();
+        try {
         OracleBatch result;
         result.columns = columns;
         const auto take_pending = [&] {
@@ -163,14 +168,22 @@ public:
             }
         }
         result.exhausted = exhausted && pending.empty();
+        lifetime->fetch_cancellation.CompleteFetch();
         return result;
+        } catch (const ProtocolError &error) {
+            lifetime->fetch_cancellation.ObserveError(error);
+            throw;
+        } catch (...) {
+            lifetime->fetch_cancellation.ObserveUnknownError();
+            throw;
+        }
     }
 
     void Cancel() override {
         if (closed || !lifetime->open) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle cursor is closed");
         }
-        channel.Cancel(handle);
+        lifetime->fetch_cancellation.Request([&] { channel.Cancel(handle); });
     }
 
     void Close() override {
@@ -178,7 +191,7 @@ public:
             // A caller may close the session before releasing a cursor. Do
             // not dereference the channel reference after that point: closing
             // the transport already releases its server-side state.
-            if (lifetime->open) {
+            if (lifetime->open && lifetime->fetch_cancellation.CanUseConnection()) {
                 const auto call = channel.LockCall();
                 channel.Close(handle);
             }
@@ -249,6 +262,7 @@ void NativeOracleSession::RequireOpen() const {
     if (!connection || connection->State() != OracleConnectionState::AUTHENTICATED) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "native Oracle session is closed");
     }
+    lifetime->fetch_cancellation.RequireUsable();
 }
 
 std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql, const std::vector<OracleBind> &binds) {
@@ -544,7 +558,7 @@ void NativeOracleSession::Rollback() {
 
 void NativeOracleSession::Cancel() {
     RequireOpen();
-    connection->Ttc().Cancel();
+    lifetime->fetch_cancellation.Request([&] { connection->Ttc().Cancel(); });
 }
 
 void NativeOracleSession::Close() {

@@ -96,6 +96,7 @@ void TtcChannel::Send(const std::vector<uint8_t> &message) {
 
 std::vector<uint8_t> TtcChannel::Receive() {
     size_t reset_count = 0;
+    size_t empty_fragment_count = 0;
     while (true) {
         const auto packet = packets.Receive();
         if (packet.type == TnsPacketType::MARKER) {
@@ -127,6 +128,17 @@ std::vector<uint8_t> TtcChannel::Receive() {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle sent an empty TTC message");
             }
             return std::move(*complete);
+        }
+        // A non-final DATA fragment containing only flags cannot complete a
+        // TTC response, even if earlier fragments have buffered bytes. Keep
+        // waiting under the existing IO deadline; never return empty success.
+        // Bound empty fragments per Receive independently of message size.
+        if (packet.type == TnsPacketType::DATA && packet.payload.size() == 2) {
+            if (++empty_fragment_count > 16) {
+                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                    "Oracle sent too many non-final empty DATA fragments");
+            }
+            continue;
         }
         // Oracle 19c sends the initial TTIPRO response in a short DATA packet
         // without END_OF_RESPONSE. A short packet cannot be an SDU-sized

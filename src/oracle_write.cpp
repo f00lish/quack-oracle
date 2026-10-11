@@ -97,11 +97,14 @@ struct OracleWriteState final : ClientContextState {
             session = std::move(entry->second);
             pinned.erase(entry);
         }
-        // Never let a failed cleanup escape: this runs from a failure path and
-        // from DuckDB's rollback notification, neither of which can take one.
-        try {
-            session->Rollback();
-        } catch (...) {
+        // A poisoned exchange may have an unread response. Close it without
+        // another transaction operation; disconnect rolls back server state.
+        // Normal caller rollback keeps its explicit acknowledgement path.
+        if (!poison) {
+            try {
+                session->Rollback();
+            } catch (...) {
+            }
         }
         try {
             session->Close();

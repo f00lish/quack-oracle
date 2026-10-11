@@ -9,6 +9,7 @@
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_out_binds.hpp"
 
+#include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -43,6 +44,11 @@ public:
                                         uint8_t ttc_field_version = 12, uint8_t server_field_version = 12);
     void CompleteExecute(OracleStatementHandle handle, bool is_query, uint32_t remote_cursor_id);
     void Fetch(OracleStatementHandle handle, uint8_t sequence, uint32_t requested_rows);
+    void DefineLobPrefetch(OracleStatementHandle handle,uint8_t sequence,
+        const std::vector<OracleColumn> &columns,uint32_t rows,uint8_t field_version,const OracleLobPrefetchLimits &limits);
+    TtcFetchResponse ReceiveDecodedLobPrefetchFetchResponse(OracleStatementHandle handle,
+        const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,uint8_t server_field_version,
+        const std::optional<TtcRowData> &preceding_row);
     void Cancel(OracleStatementHandle handle);
     std::vector<uint8_t> ReceiveFetchResponse(OracleStatementHandle handle);
     TtcFetchResponse ReceiveDecodedFetchResponse(OracleStatementHandle handle, const std::vector<OracleColumn> &columns,

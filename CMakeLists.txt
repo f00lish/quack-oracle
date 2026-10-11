@@ -74,6 +74,7 @@ set(EXTENSION_SOURCES
     src/oracle_pool.cpp
     src/oracle_parallel.cpp
     src/ttc_fetch_response.cpp
+    src/lob_prefetch_fetch.cpp
     src/ttc_describe.cpp
     src/ttc_execute_response.cpp
     src/ttc_cursor.cpp
@@ -152,6 +153,7 @@ if(ORACLE_SCANNER_BUILD_TESTS)
     src/ttc_lob.cpp
                  src/native_session.cpp
                  src/ttc_fetch_response.cpp
+                 src/lob_prefetch_fetch.cpp
                  src/ttc_describe.cpp
                  src/ttc_execute_response.cpp
                  src/ttc_cursor.cpp

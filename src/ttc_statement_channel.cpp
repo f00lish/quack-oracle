@@ -270,6 +270,31 @@ void TtcStatementChannel::Fetch(OracleStatementHandle handle, uint8_t sequence, 
     }
 }
 
+void TtcStatementChannel::DefineLobPrefetch(OracleStatementHandle handle,uint8_t sequence,
+    const std::vector<OracleColumn> &columns,uint32_t rows,uint8_t field_version,const OracleLobPrefetchLimits &limits) {
+    const auto cursor=statements.RemoteCursorId(handle);
+    const auto request=EncodeLobPrefetchDefine(sequence,cursor,columns,rows,field_version,limits);
+    statements.BeginFetch(handle);
+    try { channel.Send(request); }
+    catch (...) { statements.Poison(handle);throw; }
+}
+
+TtcFetchResponse TtcStatementChannel::ReceiveDecodedLobPrefetchFetchResponse(OracleStatementHandle handle,
+    const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,uint8_t server_field_version,
+    const std::optional<TtcRowData> &preceding_row) {
+    try {
+        std::optional<TtcFetchResponse> response;
+        (void)ReceiveResponseFragments(channel,[&](const std::vector<uint8_t> &message) {
+            response=DecodeLobPrefetchFetchResponse(message,columns,limits,server_field_version,preceding_row);
+            return response->completed;
+        });
+        return std::move(*response);
+    } catch (...) {
+        if (statements.State(handle)!=OracleStatementState::POISONED) { statements.Poison(handle); }
+        throw;
+    }
+}
+
 void TtcStatementChannel::Cancel(OracleStatementHandle handle) {
     // State validation ensures a cursor cannot interrupt an unrelated or
     // already terminal statement; the reader consumes the resulting TTIOER.

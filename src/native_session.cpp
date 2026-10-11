@@ -8,6 +8,7 @@
 #include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/lob_reader.hpp"
+#include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include "oracle_scanner/value_codec.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
 
@@ -29,10 +30,18 @@ public:
     NativeOracleCursor(TtcStatementChannel &channel_p, uint8_t &next_sequence_p, std::shared_ptr<NativeSessionLifetime> lifetime_p,
                        OracleStatementHandle handle_p,
                        std::vector<OracleColumn> columns_p, std::vector<TtcRowData> prefetched_p, bool exhausted_p,
-                       uint8_t server_field_version_p)
+                       uint8_t server_field_version_p,uint8_t field_version_p=0)
         : channel(channel_p), next_sequence(next_sequence_p), lifetime(std::move(lifetime_p)), handle(handle_p),
           columns(std::move(columns_p)), pending(std::move(prefetched_p)), server_field_version(server_field_version_p),
-          exhausted(exhausted_p) {
+          exhausted(exhausted_p),field_version(field_version_p) {
+        prefetch_eligible=SupportsLobPrefetchColumns(columns,field_version);
+        if (prefetch_eligible) {
+            try { (void)BoundedLobPrefetchRows(columns,1,prefetch_limits); }
+            catch (const ProtocolError &error) {
+                if (error.Kind()!=ProtocolErrorKind::LIMIT_EXCEEDED) { throw; }
+                prefetch_eligible=false;
+            }
+        }
         if (!pending.empty()) {
             previous_row = pending.back();
         }
@@ -52,7 +61,7 @@ public:
     // happen: above the session nothing has a channel, and below it nothing
     // knows which columns are LOBs. Everything upstream then sees plain bytes
     // and needs no notion of a locator at all.
-    void ResolveLobs(OracleBatch &batch) {
+    void ResolveLobs(OracleBatch &batch,bool prefetched=false) {
         bool any = false;
         for (const auto &column : columns) {
             any = any || IsOracleLobType(column.oracle_type);
@@ -65,7 +74,18 @@ public:
                 if (!IsOracleLobType(columns[index].oracle_type) || !row[index]) {
                     continue;
                 }
-                row[index] = ReadWholeLob(*row[index], columns[index].oracle_type == ORACLE_WIRE_TYPE_CLOB);
+                const bool character=columns[index].oracle_type==ORACLE_WIRE_TYPE_CLOB;
+                if (!prefetched) { row[index]=ReadWholeLob(*row[index],character);continue; }
+                const auto call=channel.LockCall();
+                const auto cell=DecodeStoredLobPrefetch(*row[index],character,prefetch_limits);
+                const auto content=MaterializePrefetchedOracleLob(cell,65536,prefetch_limits.maximum_content_bytes,
+                    [&](const std::vector<uint8_t> &locator,uint64_t offset,uint64_t amount) {
+                        TtcLobRequest request;request.sequence=NextCursorSequence();request.locator=locator;
+                        request.operation=LOB_OP_READ;request.offset=offset;request.amount=amount;
+                        return channel.LobOperation(request,server_field_version);
+                    });
+                if (!content) { throw ProtocolError(ProtocolErrorKind::MALFORMED,"non-NULL prefetched LOB became NULL"); }
+                row[index]=character ? DecodeUtf16BeToUtf8(*content) : *content;
             }
         }
     }
@@ -113,25 +133,34 @@ public:
             pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(count));
         };
         take_pending();
+        // Initial execute rows always retain the old locator representation.
+        // Resolve them before DEFINE, separately from prefetched rows.
+        ResolveLobs(result,false);
         if (result.rows.size() < requested_rows && !exhausted) {
             // The fetch and the response that answers it are one call, and a
             // shared session may have another pipeline waiting to make its own.
             const auto call = channel.LockCall();
-            const auto sequence = next_sequence++;
-            if (next_sequence == 0) {
-                next_sequence = 1;
-            }
-            channel.Fetch(handle, sequence, static_cast<uint32_t>(requested_rows - result.rows.size()));
-            const auto response = channel.ReceiveDecodedFetchResponse(handle, columns, server_field_version, previous_row);
-            result.rows.insert(result.rows.end(), response.rows.begin(), response.rows.end());
+            const auto desired=requested_rows-result.rows.size();
+            const auto count=prefetch_eligible ? BoundedLobPrefetchRows(columns,desired,prefetch_limits) :
+                static_cast<uint32_t>((std::min)(desired,size_t((std::numeric_limits<uint32_t>::max)())));
+            const auto sequence=NextCursorSequence();
+            if (prefetch_eligible && !prefetch_active) {
+                channel.DefineLobPrefetch(handle,sequence,columns,count,field_version,prefetch_limits);
+                // Never interpret an old locator as a prefetched descriptor.
+                previous_row.reset();prefetch_active=true;
+            } else { channel.Fetch(handle,sequence,count); }
+            auto response=prefetch_active ?
+                channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,prefetch_limits,server_field_version,previous_row) :
+                channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row);
             previous_row = response.last_row;
             exhausted = response.exhausted;
+            OracleBatch decoded;decoded.rows=std::move(response.rows);ResolveLobs(decoded,prefetch_active);
+            result.rows.insert(result.rows.end(),std::make_move_iterator(decoded.rows.begin()),std::make_move_iterator(decoded.rows.end()));
             if (exhausted) {
                 channel.MarkFetchExhausted(handle);
             }
         }
         result.exhausted = exhausted && pending.empty();
-        ResolveLobs(result);
         return result;
     }
 
@@ -166,6 +195,10 @@ private:
     uint8_t server_field_version = ORACLE_CLIENT_TTC_FIELD_VERSION;
     bool exhausted = false;
     bool closed = false;
+    uint8_t field_version=0;
+    bool prefetch_eligible=false;
+    bool prefetch_active=false;
+    OracleLobPrefetchLimits prefetch_limits;
 };
 
 } // namespace
@@ -243,7 +276,7 @@ std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql,
     }
     channel->CompleteExecute(handle, true, response.completion->cursor_id);
     return std::make_unique<NativeOracleCursor>(*channel, next_sequence, lifetime, handle, response.columns, response.rows,
-                                                response.exhausted, connection->TtcServerFieldVersion());
+                                                response.exhausted, connection->TtcServerFieldVersion(),connection->TtcFieldVersion());
 }
 
 uint64_t NativeOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {

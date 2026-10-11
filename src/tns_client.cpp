@@ -381,7 +381,7 @@ private:
             try {
                 stream = OpenOracleTransport(address, target.port, AttemptTimeoutSeconds(), config.read_timeout_seconds,
                                              target.protocol == TransportProtocol::TCPS, attempt_tls,
-                                             config.io_deadline ? config.io_deadline->Get() : std::nullopt);
+                                             config.io_deadline ? config.io_deadline->Get() : std::nullopt, config.io_deadline);
             } catch (const OracleConnectError &error) {
                 attempts.AddFailure(target, address, error);
                 remember(error, depth);

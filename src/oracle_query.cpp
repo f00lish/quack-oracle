@@ -1,3 +1,6 @@
+#include "oracle_io_deadline.hpp"
+#include <condition_variable>
+#include <thread>
 #include "oracle_adapter.hpp"
 
 #include "oracle_scanner/auth_crypto.hpp"
@@ -51,6 +54,45 @@ using oracle_scanner::OracleColumn;
 using oracle_scanner::OracleCursor;
 using oracle_scanner::OracleSession;
 
+
+// The watcher touches only the caller's synchronized deadline, never its
+// session, socket or TLS objects. Join before unwinding the adapter scope.
+class OracleCallerInterruptScope {
+public:
+    explicit OracleCallerInterruptScope(ClientContext &context_p)
+        : context(context_p), source(OracleIoDeadlineFor(context)), previous(source->Get()) {
+        Check();
+        watcher = std::thread([this] {
+            std::unique_lock<std::mutex> guard(lock);
+            while (!stop) {
+                if (context.IsInterrupted()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto current = source->Get();
+                    source->Set(current ? (std::min)(*current, now) : now);
+                    signalled = true;
+                    return;
+                }
+                wake.wait_for(guard, std::chrono::milliseconds(20), [this] { return stop; });
+            }
+        });
+    }
+    ~OracleCallerInterruptScope() {
+        { std::lock_guard<std::mutex> guard(lock); stop = true; }
+        wake.notify_one();
+        if (watcher.joinable()) { watcher.join(); }
+        if (signalled) { source->Set(previous); }
+    }
+    void Check() const { if (context.IsInterrupted()) { throw InterruptException(); } }
+private:
+    ClientContext &context;
+    std::shared_ptr<oracle_scanner::OracleIoDeadline> source;
+    oracle_scanner::OracleIoDeadline::Deadline previous;
+    std::mutex lock;
+    std::condition_variable wake;
+    std::thread watcher;
+    bool stop = false;
+    bool signalled = false;
+};
 
 struct OracleExecuteBindData final : TableFunctionData {
     std::string catalog_name;
@@ -1522,10 +1564,12 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &co
     auto state = make_uniq<OracleTransactionManyState>();
     state->exact_counts = bind.exact_counts;
     try {
+        OracleCallerInterruptScope interrupt(context);
         auto &session = TransactionSession(context, target);
         if (bind.exact_counts) {
             state->counts.reserve(bind.rows.size());
             for (idx_t index = 0; index < bind.rows.size(); ++index) {
+                interrupt.Check();
                 try {
                     state->counts.push_back(session.ExecuteWithRowCount(bind.sql, bind.rows[index]));
                 } catch (const oracle_scanner::ProtocolError &error) {
@@ -1536,6 +1580,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &co
         } else {
             state->counts.push_back(session.ExecuteBatch(bind.sql, bind.rows));
         }
+        interrupt.Check();
         return std::move(state);
     } catch (const std::exception &error) {
         PoisonTransactionSession(context, target.catalog_name);
@@ -1611,6 +1656,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
         throw TransactionException("Cannot call through an attached read-only Oracle catalog");
     }
     try {
+        OracleCallerInterruptScope interrupt(context);
         auto &session = TransactionSession(context, target);
         auto result = session.Call(bind.procedure, bind.arguments);
         if (!result.explicit_cursors.empty() || !result.implicit_cursors.empty()) {
@@ -1634,6 +1680,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
         if (position != result.outputs.size()) {
             throw BinderException("oracle_call_named_transaction has unexpected outputs");
         }
+        interrupt.Check();
         return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
     } catch (const std::exception &error) {
         PoisonTransactionSession(context, target.catalog_name);

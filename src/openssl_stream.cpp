@@ -1,3 +1,5 @@
+#include "oracle_scanner/io_deadline.hpp"
+#include <mutex>
 // Before any include. Windows defines min and max as function-like macros, and
 // OpenSSL's own headers pull in <windows.h> on that platform — so defining this
 // down beside <winsock2.h> happens after the damage is already done, which is
@@ -111,6 +113,16 @@ struct OpenSslByteStream::Impl {
     // Set by the connect loop while it talks to a listener; see
     // ByteStream::SetDeadline.
     std::optional<std::chrono::steady_clock::time_point> deadline;
+
+    std::shared_ptr<OracleIoDeadline> source;
+    mutable std::mutex deadline_lock;
+    std::optional<std::chrono::steady_clock::time_point> EffectiveDeadline() const {
+        std::optional<std::chrono::steady_clock::time_point> result;
+        { std::lock_guard<std::mutex> guard(deadline_lock); result = deadline; }
+        const auto caller = source ? source->Get() : std::nullopt;
+        if (caller && (!result || *caller < *result)) { result = caller; }
+        return result;
+    }
 
     ~Impl() {
         // Also covers destruction while Connect unwinds after an error.
@@ -309,29 +321,36 @@ static timeval StepTimeout(uint32_t timeout_seconds,
 }
 
 static bool WaitForBio(BIO *bio, uint32_t timeout_seconds,
-                       const std::optional<std::chrono::steady_clock::time_point> &deadline) {
+                       const std::optional<std::chrono::steady_clock::time_point> &deadline,
+                       const std::shared_ptr<OracleIoDeadline> &source) {
     int socket_fd = -1;
-    if (BIO_get_fd(bio, &socket_fd) < 0 || socket_fd < 0) {
-        return false;
-    }
+    if (BIO_get_fd(bio, &socket_fd) < 0 || socket_fd < 0) { return false; }
     const auto want_read = BIO_should_read(bio);
     const auto want_write = BIO_should_write(bio);
-    if (!want_read && !want_write) {
-        return false;
+    if (!want_read && !want_write) { return false; }
+    // One absolute read budget: polling must never restart the timeout.
+    auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+    if (deadline && *deadline < limit) { limit = *deadline; }
+    while (true) {
+        auto effective = limit;
+        const auto caller = source ? source->Get() : std::nullopt;
+        if (caller && *caller < effective) { effective = *caller; }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= effective) { return false; }
+        auto wait = std::chrono::duration_cast<std::chrono::microseconds>(effective - now);
+        if (source) { wait = (std::min)(wait, std::chrono::microseconds(50000)); }
+        fd_set readable, writable;
+        FD_ZERO(&readable); FD_ZERO(&writable);
+        if (want_read) { FD_SET(socket_fd, &readable); }
+        if (want_write) { FD_SET(socket_fd, &writable); }
+        const auto count = wait.count();
+        timeval timeout {static_cast<decltype(timeval::tv_sec)>(count / 1000000),
+                         static_cast<decltype(timeval::tv_usec)>(count % 1000000)};
+        const auto ready = select(socket_fd + 1, want_read ? &readable : nullptr,
+                                  want_write ? &writable : nullptr, nullptr, &timeout);
+        if (ready > 0) { return true; }
+        if (ready < 0 || !source) { return false; }
     }
-    fd_set readable;
-    fd_set writable;
-    FD_ZERO(&readable);
-    FD_ZERO(&writable);
-    if (want_read) {
-        FD_SET(socket_fd, &readable);
-    }
-    if (want_write) {
-        FD_SET(socket_fd, &writable);
-    }
-    timeval timeout = StepTimeout(timeout_seconds, deadline);
-    return select(socket_fd + 1, want_read ? &readable : nullptr, want_write ? &writable : nullptr, nullptr,
-                  &timeout) > 0;
 }
 
 // Waits for the BIO's socket to become readable (or writable) until the
@@ -422,6 +441,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TCP timeout is outside the supported range");
     }
     auto result = std::make_unique<Impl>();
+    result->source = OracleTransportIoDeadlineSource();
     result->read_timeout_seconds = read_timeout_seconds;
     result->use_tls = use_tls;
     const auto endpoint = HostAndPort(host, port);
@@ -660,7 +680,8 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
     const ScopedSigPipeBlock no_sigpipe;
     const auto requested = static_cast<int>((std::min)(maximum_size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
-        if (implementation->deadline && std::chrono::steady_clock::now() >= *implementation->deadline) {
+        const auto deadline = implementation->EffectiveDeadline();
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) {
             throw ProtocolError(ProtocolErrorKind::TRUNCATED,"Oracle IO deadline expired");
         }
         // The SSL BIO derives retry flags through SSL_get_error, which requires
@@ -690,7 +711,7 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
                 "Oracle TCP read failed (socket error " + std::to_string(socket_error) +
                 ", TLS reason " + std::to_string(ERR_GET_REASON(tls_error)) + ")");
         }
-        if (!WaitForBio(implementation->bio, implementation->read_timeout_seconds, implementation->deadline)) {
+        if (!WaitForBio(implementation->bio, implementation->read_timeout_seconds, deadline, implementation->source)) {
             ERR_clear_error();
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle TCP read timed out");
         }
@@ -704,7 +725,8 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
     const ScopedSigPipeBlock no_sigpipe;
     const auto requested = static_cast<int>((std::min)(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
-        if (implementation->deadline && std::chrono::steady_clock::now() >= *implementation->deadline) {
+        const auto deadline = implementation->EffectiveDeadline();
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) {
             throw ProtocolError(ProtocolErrorKind::TRUNCATED,"Oracle IO deadline expired");
         }
         ERR_clear_error();
@@ -713,7 +735,7 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
             return static_cast<size_t>(count);
         }
         if (!BIO_should_retry(implementation->bio) ||
-            !WaitForBio(implementation->bio, implementation->read_timeout_seconds, implementation->deadline)) {
+            !WaitForBio(implementation->bio, implementation->read_timeout_seconds, deadline, implementation->source)) {
             ERR_clear_error();
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TCP write failed or timed out");
         }
@@ -735,7 +757,8 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
 #else
     const ScopedSigPipeBlock no_sigpipe;
     while (true) {
-        if (implementation->deadline && std::chrono::steady_clock::now() >= *implementation->deadline) {
+        const auto deadline = implementation->EffectiveDeadline();
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) {
             throw ProtocolError(ProtocolErrorKind::TRUNCATED,"Oracle IO deadline expired");
         }
         const auto sent = send(implementation->socket_fd, &value, 1, MSG_OOB);
@@ -746,7 +769,7 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
             fd_set writable;
             FD_ZERO(&writable);
             FD_SET(implementation->socket_fd, &writable);
-            timeval timeout = StepTimeout(implementation->read_timeout_seconds, implementation->deadline);
+            timeval timeout = StepTimeout(implementation->read_timeout_seconds, deadline);
             if (select(implementation->socket_fd + 1, nullptr, &writable, nullptr, &timeout) > 0) {
                 continue;
             }
@@ -758,6 +781,7 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
 
 void OpenSslByteStream::SetDeadline(std::optional<std::chrono::steady_clock::time_point> deadline) {
     if (implementation) {
+        std::lock_guard<std::mutex> guard(implementation->deadline_lock);
         implementation->deadline = deadline;
     }
 }

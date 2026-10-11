@@ -37,6 +37,13 @@ std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_
                                                 bool use_tls, const TlsConfiguration &tls = {},
                                                 std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
+class OracleIoDeadline;
+std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_t port,
+    uint32_t connect_timeout_seconds, uint32_t read_timeout_seconds, bool use_tls,
+    const TlsConfiguration &tls, std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::shared_ptr<OracleIoDeadline> source);
+std::shared_ptr<OracleIoDeadline> OracleTransportIoDeadlineSource();
+
 // Available only during a synchronous transport factory invocation. Native
 // Connect uses it too, so custom test relays can preserve the caller's exact
 // millisecond TCP/TLS budget without changing the existing factory signature.

@@ -2307,8 +2307,14 @@ void TestRawCatalogTransactionsPinReadsAndWrites() {
     database.Run("BEGIN;");
     database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (3)');");
     script->execute_should_fail = true;
+    const auto rollbacks_before_failure = script->rollbacks;
     auto failed_dml = database.Query("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (4)');");
     CHECK(failed_dml->HasError());
+    // DRV-012: a session poisoned by a failed exchange is closed without
+    // another Rollback, which could only wait on its unread response; closing
+    // the connection is what rolls the server transaction back.
+    CHECK(script->rollbacks == rollbacks_before_failure);
+    CHECK(failed_dml->GetError().find("localized constraint failure") != std::string::npos);
     CHECK(failed_dml->GetErrorObject().ExtraInfo().count("oracle_error_code") == 1);
     CHECK(failed_dml->GetErrorObject().ExtraInfo().at("oracle_error_code") == "1");
     CHECK(failed_dml->GetErrorObject().ExtraInfo().at("oracle_connection_state") == "discarded");

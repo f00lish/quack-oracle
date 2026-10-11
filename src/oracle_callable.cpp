@@ -157,13 +157,13 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
         return value.GetValue<std::string>();
     };
     if (type_name == "number") {
-        if (require_out_is_null("NUMBER")) {
+        if (require_out_is_null("NUMBER") || value.IsNull()) {
             return {2, 22, std::nullopt};
         }
         return {2, 22, oracle_scanner::EncodeOracleNumber(require_value("NUMBER"))};
     }
     if (type_name == "varchar") {
-        if (require_out_is_null("VARCHAR")) {
+        if (require_out_is_null("VARCHAR") || value.IsNull()) {
             return {1, 32767, std::nullopt};
         }
         const auto text = require_value("VARCHAR");

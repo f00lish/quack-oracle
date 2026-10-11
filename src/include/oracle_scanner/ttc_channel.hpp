@@ -24,8 +24,8 @@ public:
     // leave the session waiting for a function body that never arrives.
     void QueueCloseCursor(uint32_t cursor_id);
     size_t PendingCloseCursorCount() const;
-    TtcTransactionStatus Commit(uint8_t sequence);
-    TtcTransactionStatus Rollback(uint8_t sequence);
+    TtcTransactionStatus Commit(uint8_t sequence, uint8_t server_field_version = 12);
+    TtcTransactionStatus Rollback(uint8_t sequence, uint8_t server_field_version = 12);
     // Sends the capture-verified TCP interrupt marker. The reader that owns
     // the in-flight response completes the subsequent RESET exchange.
     void Cancel();
@@ -43,6 +43,7 @@ public:
     }
 
 private:
+    TtcTransactionStatus ReceiveTransactionStatus(uint8_t server_field_version);
     TnsPacketStream &packets;
     size_t negotiated_sdu;
     TnsDataAssembler assembler;

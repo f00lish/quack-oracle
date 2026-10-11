@@ -505,13 +505,13 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
 void NativeOracleSession::Commit() {
     RequireOpen();
     const auto call = channel->LockCall();
-    (void)connection->Ttc().Commit(NextSequence());
+    (void)connection->Ttc().Commit(NextSequence(),connection->TtcServerFieldVersion());
 }
 
 void NativeOracleSession::Rollback() {
     RequireOpen();
     const auto call = channel->LockCall();
-    (void)connection->Ttc().Rollback(NextSequence());
+    (void)connection->Ttc().Rollback(NextSequence(),connection->TtcServerFieldVersion());
 }
 
 void NativeOracleSession::Cancel() {

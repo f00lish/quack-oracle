@@ -1,6 +1,7 @@
 #include "oracle_scanner/ttc_channel.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/ttc_piggyback.hpp"
+#include "oracle_scanner/ttc_error.hpp"
 
 #include <string>
 
@@ -26,14 +27,30 @@ size_t TtcChannel::PendingCloseCursorCount() const {
     return pending_close_cursors.size();
 }
 
-TtcTransactionStatus TtcChannel::Commit(uint8_t sequence) {
-    Send(EncodeTtcCommitRequest(sequence));
-    return DecodeTtcTransactionStatus(Receive());
+TtcTransactionStatus TtcChannel::ReceiveTransactionStatus(uint8_t server_field_version) {
+    const auto response = Receive();
+    // Transaction calls can fail just like DML. Use the existing structured
+    // error decoder and negotiated server version; never guess from text or
+    // mistake a rejected COMMIT for a malformed STATUS acknowledgement.
+    if (IsTtcErrorMessage(response)) {
+        const auto error = DecodeTtcErrorPrefix(response,server_field_version);
+        if (error.error_number != 0) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
+                                error.message.empty() ? "Oracle transaction call failed" : error.message,
+                                error.error_number);
+        }
+    }
+    return DecodeTtcTransactionStatus(response);
 }
 
-TtcTransactionStatus TtcChannel::Rollback(uint8_t sequence) {
+TtcTransactionStatus TtcChannel::Commit(uint8_t sequence, uint8_t server_field_version) {
+    Send(EncodeTtcCommitRequest(sequence));
+    return ReceiveTransactionStatus(server_field_version);
+}
+
+TtcTransactionStatus TtcChannel::Rollback(uint8_t sequence, uint8_t server_field_version) {
     Send(EncodeTtcRollbackRequest(sequence));
-    return DecodeTtcTransactionStatus(Receive());
+    return ReceiveTransactionStatus(server_field_version);
 }
 
 void TtcChannel::Cancel() {

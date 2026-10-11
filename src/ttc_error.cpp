@@ -219,7 +219,7 @@ TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t t
 
 [[noreturn]] void ThrowTtcServerError(const std::vector<uint8_t> &message) {
     const auto error = ParseTtcServerError(message);
-    throw ProtocolError(ProtocolErrorKind::INVALID_STATE, error.message);
+    throw ProtocolError(ProtocolErrorKind::INVALID_STATE, error.message, error.ora_code);
 }
 
 } // namespace oracle_scanner

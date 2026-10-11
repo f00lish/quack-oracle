@@ -254,10 +254,20 @@ std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql,
 }
 
 uint64_t NativeOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {
+    return ExecuteStatement(sql, binds, OracleSqlKind::DML);
+}
+
+void NativeOracleSession::ExecuteAdmin(const std::string &sql) {
+    ValidateOracleAdmin(sql);
+    (void)ExecuteStatement(sql, {}, OracleSqlKind::ADMIN);
+}
+
+uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std::vector<OracleBind> &binds,
+                                              OracleSqlKind kind) {
     RequireOpen();
     const auto call = channel->LockCall();
     const auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::DML);
-    const auto handle = statements.Open(OracleSqlKind::DML);
+    const auto handle = statements.Open(kind);
     if (ordered_binds.empty()) {
         TtcExecuteNoBindsRequest request;
         request.sequence = NextSequence();

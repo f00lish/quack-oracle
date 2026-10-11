@@ -45,8 +45,9 @@ struct TtcErrorInfo {
 // which row did it.
 class OracleDmlError : public ProtocolError {
 public:
-    OracleDmlError(uint32_t failed_row_p, const std::string &message)
-        : ProtocolError(ProtocolErrorKind::INVALID_STATE, message), failed_row(failed_row_p) {
+    OracleDmlError(uint32_t failed_row_p, const std::string &message,
+                   std::optional<uint32_t> oracle_code = std::nullopt)
+        : ProtocolError(ProtocolErrorKind::INVALID_STATE, message, oracle_code), failed_row(failed_row_p) {
     }
 
     //! Zero-based index of the iteration that failed.

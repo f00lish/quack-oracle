@@ -133,6 +133,7 @@ struct FakeScript {
     std::vector<std::string> queries;
     std::vector<std::vector<OracleBind>> query_binds;
     std::vector<std::string> plain_executes;
+    std::vector<std::string> admin_executes;
     std::vector<std::string> counted_executes;
     std::vector<std::vector<OracleBind>> counted_execute_binds;
     std::vector<std::vector<OracleBind>> batch_rows;
@@ -161,6 +162,8 @@ struct FakeScript {
     std::optional<oracle_scanner::ProtocolErrorKind> fetch_failure;
     std::string fetch_failure_message;
     bool batch_should_fail = false;
+    bool execute_should_fail = false;
+    bool commit_should_fail = false;
 
     size_t sessions_opened = 0;
     size_t sessions_destroyed = 0;
@@ -307,10 +310,19 @@ public:
         return script->affected_rows;
     }
 
+    void ExecuteAdmin(const std::string &sql) override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        script->admin_executes.push_back(sql);
+    }
+
     uint64_t ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) override {
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->counted_executes.push_back(sql);
         script->counted_execute_binds.push_back(binds);
+        if (script->execute_should_fail) {
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                                 "localized constraint failure", 1);
+        }
         return script->affected_rows;
     }
 
@@ -378,6 +390,9 @@ public:
     void Commit() override {
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->commits++;
+        if (script->commit_should_fail) {
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::TRUNCATED, "lost COMMIT response");
+        }
     }
 
     void Rollback() override {
@@ -1759,6 +1774,19 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
                                            CHECK(result.RowCount() == 1 &&
                                                  !result.GetValue(0, 0).ToString().empty());
                                        }};
+    cases["oracle_execute_admin"] = {
+        [](FakeScript &) {}, {},
+        [](FakeScript &script, MaterializedQueryResult &result) {
+            CHECK(script.admin_executes.size() == 1);
+            CHECK(result.GetValue(0, 0).GetValue<bool>());
+        }};
+    cases["oracle_transaction_status"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+        }, {"ATTACH 'demo' AS tx (TYPE oracle_scanner);"},
+        [](FakeScript &, MaterializedQueryResult &result) {
+            CHECK(result.GetValue(0, 0).ToString() == "not_attempted");
+        }};
     cases["oracle_query"] = {[](FakeScript &script) {
                                  script.columns = {Column("VALUE", 2)};
                                  script.rows = {{Number("42")}};
@@ -1769,6 +1797,28 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
                                  CHECK(script.query_binds.back().size() == 1);
                                  CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "42");
                              }};
+    cases["oracle_query_transaction"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            script.columns = {Column("VALUE", 2)};
+            script.rows = {{Number("1")}};
+        },
+        {"ATTACH 'demo' AS tx (TYPE oracle_scanner);"},
+        [](FakeScript &script, MaterializedQueryResult &result) {
+            CHECK(script.queries.back() == "SELECT 1 FROM dual");
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "1");
+        }};
+    cases["oracle_execute_transaction"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            script.affected_rows = 1;
+        },
+        {"ATTACH 'demo' AS tx (TYPE oracle_scanner);"},
+        [](FakeScript &script, MaterializedQueryResult &result) {
+            CHECK(script.counted_executes.size() == 1);
+            CHECK(script.counted_execute_binds[0].size() == 1);
+            CHECK(result.GetValue(0, 0).GetValue<int64_t>() == 1);
+        }};
     cases["oracle_execute"] = {[](FakeScript &script) { script.affected_rows = 1; },
                                {},
                                [](FakeScript &script, MaterializedQueryResult &result) {
@@ -2019,7 +2069,7 @@ void TestFunctionExamplesRun() {
     auto cases = FunctionExampleCases();
     // The same set on both sides: a function added without an executable
     // example, or a case left for a function that is gone, fails here.
-    CHECK(examples.size() == cases.size() && examples.size() == 20);
+    CHECK(examples.size() == cases.size() && examples.size() == 24);
     for (const auto &example : examples) {
         const auto found = cases.find(example.first);
         if (found == cases.end()) {
@@ -2102,7 +2152,7 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     }
     const auto parallel = duckdb::OracleParallelScanFunctionInfo();
     check(parallel, parallel.functions.name);
-    CHECK(names.size() == 20);
+    CHECK(names.size() == 24);
 
     // And what that mode means on a database that already has the functions:
     // an extra overload under an existing name is added to it, where
@@ -2134,8 +2184,125 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     std::cout << "documented registrations use ALTER_ON_CONFLICT" << std::endl;
 }
 
-int main() {
+void TestReadOnlyHiddenCatalogGuardsWrites() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->columns = {Column("VALUE", 2)};
+    script->rows = {{Number("42")}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ro (TYPE oracle_scanner, READ_ONLY, HIDDEN true);");
+    CHECK(database.Query("SELECT * FROM oracle_query_transaction('ro', 'SELECT 42 FROM dual');")->GetValue(0, 0).ToString() == "42");
+    const auto opened = script->sessions_opened;
+    auto refused = database.Query("SELECT * FROM oracle_execute_transaction('ro', 'INSERT INTO items VALUES (1)');");
+    CHECK(refused->HasError() && refused->GetError().find("read-only") != std::string::npos);
+    CHECK(script->sessions_opened == opened);
+    database.Run("ATTACH 'ora' AS changed (TYPE oracle_scanner);");
+    database.Run("PREPARE stale_write AS SELECT * FROM oracle_execute_transaction('changed', 'INSERT INTO items VALUES (1)');");
+    database.Run("DETACH changed;");
+    database.Run("ATTACH 'ora' AS changed (TYPE oracle_scanner, READ_ONLY);");
+    const auto before_execution = script->sessions_opened;
+    auto stale = database.Query("EXECUTE stale_write;");
+    CHECK(stale->HasError() && stale->GetError().find("read-only") != std::string::npos);
+    CHECK(script->sessions_opened == before_execution);
+}
 
+void TestRawCatalogTransactionsPinReadsAndWrites() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->columns = {Column("VALUE", 2)};
+    script->rows = {{Number("42")}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+    const auto opened = script->sessions_opened;
+    const auto commits = script->commits;
+    database.Run("BEGIN;");
+    database.Run("SELECT * FROM oracle_query_transaction('tx', 'SELECT :1 FROM dual', [42]);");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (:1)', [1]);");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'UPDATE items SET id = :1', [2]);");
+    database.Run("SELECT * FROM oracle_query_transaction('tx', 'SELECT 42 FROM dual');");
+    CHECK(script->sessions_opened == opened + 1);
+    CHECK(script->commits == commits);
+    database.Run("ROLLBACK;");
+    CHECK(script->rollbacks == 1 && script->commits == commits);
+    database.Run("BEGIN;");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM items');");
+    database.Run("COMMIT;");
+    CHECK(script->sessions_opened == opened + 2 && script->commits == commits + 1);
+
+    // Invalid DDL must fail before opening an Oracle session.
+    const auto before_ddl = script->sessions_opened;
+    CHECK(database.Query("SELECT * FROM oracle_execute_transaction('tx', 'CREATE TABLE bad(id NUMBER)');")->HasError());
+    CHECK(script->sessions_opened == before_ddl);
+    CHECK(database.Query("SELECT * FROM oracle_query_transaction('memory', 'SELECT 1');")->HasError());
+    database.Run("PREPARE admin_plan AS SELECT * FROM oracle_execute_admin('ora', 'CREATE TABLE ADMIN_PROBE (ID NUMBER)');");
+    database.Run("BEGIN;");
+    CHECK(database.Query("EXECUTE admin_plan;")->HasError());
+    CHECK(database.Query("SELECT * FROM oracle_execute_admin('ora', 'CREATE TABLE ADMIN_PROBE (ID NUMBER)');")->HasError());
+    CHECK(script->admin_executes.empty() && script->sessions_opened == before_ddl);
+    database.Run("ROLLBACK;");
+    database.Run("EXECUTE admin_plan;");
+    CHECK(script->admin_executes.size() == 1);
+
+    database.Run("PREPARE lake_read AS SELECT * FROM oracle_query_transaction('tx', 'SELECT 42 FROM dual');");
+    database.Run("BEGIN;");
+    CHECK(database.Query("EXECUTE lake_read;")->GetValue(0, 0).ToString() == "42");
+    CHECK(database.Query("EXECUTE lake_read;")->GetValue(0, 0).ToString() == "42");
+    database.Run("COMMIT;");
+    database.Run("BEGIN;");
+    CHECK(database.Query("EXECUTE lake_read;")->GetValue(0, 0).ToString() == "42");
+    database.Run("ROLLBACK;");
+    const auto stable_commits = script->commits;
+
+    database.Run("BEGIN;");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (8)');");
+    script->fetch_failure = oracle_scanner::ProtocolErrorKind::TRUNCATED;
+    script->fetch_failure_message = "injected failed fetch";
+    CHECK(database.Query("SELECT * FROM oracle_query_transaction('tx', 'SELECT 42 FROM dual');")->HasError());
+    script->fetch_failure.reset();
+    const auto after_fetch_failure = script->sessions_opened;
+    CHECK(database.Query("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (9)');")->HasError());
+    CHECK(script->sessions_opened == after_fetch_failure);
+    database.Run("ROLLBACK;");
+
+    database.Run("BEGIN;");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (3)');");
+    script->execute_should_fail = true;
+    auto failed_dml = database.Query("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (4)');");
+    CHECK(failed_dml->HasError());
+    CHECK(failed_dml->GetErrorObject().ExtraInfo().count("oracle_error_code") == 1);
+    CHECK(failed_dml->GetErrorObject().ExtraInfo().at("oracle_error_code") == "1");
+    CHECK(failed_dml->GetErrorObject().ExtraInfo().at("oracle_connection_state") == "discarded");
+    const auto after_failure = script->sessions_opened;
+    CHECK(database.Query("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (5)');")->HasError());
+    CHECK(script->sessions_opened == after_failure && script->commits == stable_commits);
+    database.Run("ROLLBACK;");
+    script->execute_should_fail = false;
+    database.Run("BEGIN;");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (6)');");
+    script->commit_should_fail = true;
+    auto failed_commit = database.Query("COMMIT;");
+    CHECK(failed_commit->HasError());
+    CHECK(failed_commit->GetError().find("outcome is unknown") != std::string::npos);
+    auto status = database.Query("SELECT * FROM oracle_transaction_status('tx');");
+    CHECK(!status->HasError());
+    CHECK(status->GetValue(0, 0).ToString() == "unknown");
+    CHECK(status->GetValue(1, 0).ToString() == "discarded");
+    CHECK(status->GetValue(3, 0).GetValue<int32_t>() == static_cast<int32_t>(oracle_scanner::ProtocolErrorKind::TRUNCATED));
+    script->commit_should_fail = false;
+    database.Run("BEGIN;");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (7)');");
+    database.Run("ROLLBACK;");
+    std::cout << "raw catalog reads and writes follow commit/rollback and reject failed transaction reuse" << std::endl;
+}
+
+int main() {
+    TestReadOnlyHiddenCatalogGuardsWrites();
+
+    TestRawCatalogTransactionsPinReadsAndWrites();
     TestQueryTypeMappingAndValues();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();

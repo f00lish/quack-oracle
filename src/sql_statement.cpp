@@ -142,4 +142,15 @@ void ValidateOracleDml(const std::string &sql, const std::vector<OracleBind> &bi
     ValidateOracleStatementBinds(sql, binds, OracleBindUse::DML);
 }
 
+void ValidateOracleAdmin(const std::string &sql) {
+    RejectStatementTerminators(sql);
+    const auto keyword = FirstKeyword(sql);
+    if (keyword != "CREATE" && keyword != "ALTER" && keyword != "DROP" && keyword != "GRANT" &&
+        keyword != "REVOKE" && keyword != "COMMENT" && keyword != "TRUNCATE") {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "oracle_execute_admin accepts only one administrative DDL statement");
+    }
+    ValidateOracleStatementBinds(sql, {}, OracleBindUse::DML);
+}
+
 } // namespace oracle_scanner

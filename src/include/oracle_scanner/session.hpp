@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "oracle_scanner/protocol_error.hpp"
 
 namespace oracle_scanner {
 
@@ -90,6 +91,11 @@ public:
     virtual ~OracleSession() = default;
     virtual std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
     virtual uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
+    // One administrative DDL command on a dedicated autocommit session. This
+    // must never be used on the metadata runtime transaction.
+    virtual void ExecuteAdmin(const std::string &) {
+        throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "Oracle session does not implement administrative DDL");
+    }
     // Executes the same single DML statement as Execute but guarantees the
     // returned count is Oracle's own SQL%ROWCOUNT rather than a count derived
     // from the DML response. The two are separate operations because they use

@@ -112,7 +112,8 @@ TtcLobResponse TtcStatementChannel::LobOperation(const TtcLobRequest &request, u
         const auto completion = DecodeTtcErrorPrefix(tail, server_field_version);
         if (completion.error_number != 0) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
-                                completion.message.empty() ? "Oracle refused a LOB read" : completion.message);
+                                completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
+                                completion.error_number);
         }
     }
     return decoded;
@@ -170,8 +171,12 @@ TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStat
         (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
             decoded.reset();
             if (IsTtcErrorMessage(message)) {
-                (void)DecodeTtcErrorPrefix(message, server_field_version);
-                ThrowTtcServerError(message);
+                const auto completion = DecodeTtcErrorPrefix(message, server_field_version);
+                if (completion.error_number != 0) {
+                    throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
+                                        completion.message.empty() ? "Oracle query failed" : completion.message,
+                                        completion.error_number);
+                }
             }
             decoded = DecodeTtcExecuteResponse(message, ttc_field_version, server_field_version);
             return decoded->completed;
@@ -195,7 +200,8 @@ TtcErrorInfo TtcStatementChannel::ReceiveDmlResponse(OracleStatementHandle handl
         if (completion.error_number != 0) {
             statements.Poison(handle);
             throw OracleDmlError(completion.current_row,
-                                 completion.message.empty() ? "Oracle DML execution failed" : completion.message);
+                                 completion.message.empty() ? "Oracle DML execution failed" : completion.message,
+                                 completion.error_number);
         }
         return completion;
     } catch (...) {

@@ -46,15 +46,36 @@ using oracle_scanner::OracleSession;
 // what was being done. UNSUPPORTED means the server sent a shape this client
 // does not implement, which is what NotImplementedException is for; every other
 // kind is a failure of the connection to Oracle.
+inline unordered_map<string, string> OracleErrorInfo(const std::exception &error,
+                                                     const string &connection_state = "discarded") {
+    auto info = ErrorData(error).ExtraInfo();
+    const auto *protocol = dynamic_cast<const oracle_scanner::ProtocolError *>(&error);
+    if (protocol) {
+        info["oracle_protocol_error_kind"] = std::to_string(static_cast<int>(protocol->Kind()));
+        if (protocol->OracleCode()) {
+            info["oracle_error_code"] = std::to_string(*protocol->OracleCode());
+        }
+    }
+    info["oracle_connection_state"] = connection_state;
+    return info;
+}
+
+[[noreturn]] inline void ThrowOracleAdapterError(const char *operation, const std::exception &error) {
+    const auto info = OracleErrorInfo(error);
+    const auto *protocol = dynamic_cast<const oracle_scanner::ProtocolError *>(&error);
+    const auto message = ErrorData(error).RawMessage();
+    if (protocol && protocol->Kind() == oracle_scanner::ProtocolErrorKind::UNSUPPORTED) {
+        throw NotImplementedException(info, "%s: %s", operation, message);
+    }
+    throw IOException(info, "%s: %s", operation, message);
+}
+
 template <class FUNCTION>
 auto TranslatingOracleErrors(const char *operation, FUNCTION function) -> decltype(function()) {
     try {
         return function();
     } catch (const oracle_scanner::ProtocolError &error) {
-        if (error.Kind() == oracle_scanner::ProtocolErrorKind::UNSUPPORTED) {
-            throw NotImplementedException("%s: %s", operation, error.what());
-        }
-        throw IOException("%s: %s", operation, error.what());
+        ThrowOracleAdapterError(operation, error);
     }
 }
 
@@ -139,6 +160,15 @@ OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::
 
 void RegisterOracleSessionPool(ExtensionLoader &loader);
 
+struct OracleTransactionStatus {
+    std::string commit_outcome = "not_attempted";
+    std::string connection_state = "idle";
+    std::optional<uint32_t> oracle_code;
+    std::optional<int> protocol_kind;
+};
+
+OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const std::string &catalog_name);
+
 struct OracleQueryBindData final : TableFunctionData {
     // oracle_query has to run its statement while binding, because only the
     // Oracle describe can tell DuckDB what the result columns are.
@@ -146,6 +176,9 @@ struct OracleQueryBindData final : TableFunctionData {
     std::unique_ptr<OracleCursor> cursor;
     std::vector<OracleColumn> columns;
     std::vector<LogicalType> types;
+    bool transactional_query = false;
+    std::string query_sql;
+    std::vector<oracle_scanner::OracleBind> query_binds;
 
     // An attached table already knows its columns from the dictionary, so its
     // statement is deferred to init, where the requested column ids are known
@@ -193,6 +226,7 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     // chunk to all of them, while an attached scan fetches only the projected
     // columns and gets a chunk of exactly those.
     size_t chunk_columns = 0;
+    std::string catalog_name;
 };
 
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input);
@@ -273,6 +307,10 @@ struct OracleWriteTarget {
     ConnectionConfig config;
     std::string password;
 };
+
+OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::string &catalog_name);
+void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name);
+void RollbackOracleTransaction(ClientContext &context, const std::string &catalog_name) noexcept;
 
 //! Converts one DuckDB value into a bind for a specific Oracle column. The
 //! column's Oracle type decides the encoding, never the DuckDB type alone, so

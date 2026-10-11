@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/default/default_generator.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -562,6 +563,10 @@ public:
         return "oracle_scanner";
     }
 
+    OracleWriteTarget WriteTarget() {
+        return {GetAttached().GetName(), std::string(), state->config, state->password};
+    }
+
     PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                  optional_ptr<PhysicalOperator> plan) override {
         auto &table = op.table.Cast<OracleAttachedTableEntry>();
@@ -621,7 +626,11 @@ unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInf
         throw BinderException("Oracle ATTACH requires the Oracle secret name as its path");
     }
     for (const auto &option : info.options) {
-        if (!StringUtil::CIEquals(option.first, "type")) {
+        // Generic DuckDB flags are already applied to the attached-database
+        // wrapper; DuckLake forwards them when attaching its metadata catalog.
+        if (!StringUtil::CIEquals(option.first, "type") && !StringUtil::CIEquals(option.first, "read_only") &&
+            !StringUtil::CIEquals(option.first, "readonly") && !StringUtil::CIEquals(option.first, "read_write") &&
+            !StringUtil::CIEquals(option.first, "hidden")) {
             throw BinderException(
                 "Oracle ATTACH does not accept option '%s' yet; use ATTACH 'secret_name' AS name (TYPE oracle_scanner)",
                 option.first);
@@ -636,7 +645,13 @@ unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInf
     // a custom catalog. Keep that storage in memory: the ATTACH path is a
     // secret name, never a local database file.
     info.path = ":memory:";
-    // The attached database stays read-write so INSERT can bind against it.
+    // AttachedDatabase records READ_ONLY before invoking this callback.
+    // Its dummy DuckCatalog storage must be initialized read-write because
+    // DuckDB cannot initialize :memory: read-only. The attached database's
+    // IsReadOnly flag stays set and still guards every user write.
+    options.access_mode = AccessMode::READ_WRITE;
+    // The attached database is read-write by default so INSERT can bind.
+    // Explicit READ_ONLY is enforced by DuckDB and transactional DML below.
     // Nothing DuckDB-local is written: the catalog refuses every DDL entry
     // point above, and the only statement that reaches Oracle is the INSERT.
     auto catalog = make_uniq<OracleAttachedCatalog>(db, std::move(state));
@@ -644,12 +659,54 @@ unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInf
     return catalog;
 }
 
+class OracleAttachedTransactionManager final : public DuckTransactionManager {
+public:
+    explicit OracleAttachedTransactionManager(AttachedDatabase &db_p)
+        : DuckTransactionManager(db_p), catalog_name(db_p.GetName()) {
+    }
+
+    ErrorData CommitTransaction(ClientContext &context, Transaction &transaction) override {
+        try {
+            // Generated dictionary entries use system transactions. The raw
+            // SQL/DML path must have no local changes before remote COMMIT.
+            if (transaction.Cast<DuckTransaction>().ChangesMade()) {
+                throw TransactionException("Oracle transactions cannot commit local catalog or storage changes");
+            }
+            CommitOracleTransaction(context, catalog_name);
+        } catch (const std::exception &error) {
+            RollbackOracleTransaction(context, catalog_name);
+            DuckTransactionManager::RollbackTransaction(transaction);
+            return ErrorData(error);
+        }
+        return DuckTransactionManager::CommitTransaction(context, transaction);
+    }
+
+    void RollbackTransaction(Transaction &transaction) override {
+        auto context = transaction.context.lock();
+        if (context) {
+            RollbackOracleTransaction(*context, catalog_name);
+        }
+        DuckTransactionManager::RollbackTransaction(transaction);
+    }
+
+private:
+    std::string catalog_name;
+};
+
 unique_ptr<TransactionManager> OracleAttachedCatalogTransactionManager(optional_ptr<StorageExtensionInfo>,
                                                                          AttachedDatabase &db, Catalog &) {
-    return make_uniq<DuckTransactionManager>(db);
+    return make_uniq<OracleAttachedTransactionManager>(db);
 }
 
 } // namespace
+
+OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::string &catalog_name) {
+    auto &catalog = Catalog::GetCatalog(context, catalog_name);
+    if (catalog.GetCatalogType() != "oracle_scanner") {
+        throw BinderException("Oracle transaction functions require an attached oracle_scanner catalog");
+    }
+    return catalog.Cast<OracleAttachedCatalog>().WriteTarget();
+}
 
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,

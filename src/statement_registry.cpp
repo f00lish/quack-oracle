@@ -13,7 +13,8 @@ OracleStatementRegistry::OracleStatementRegistry(size_t maximum_open_statements_
 }
 
 OracleStatementHandle OracleStatementRegistry::Open(OracleSqlKind kind) {
-    if (kind != OracleSqlKind::QUERY && kind != OracleSqlKind::DML && kind != OracleSqlKind::PLSQL) {
+    if (kind != OracleSqlKind::QUERY && kind != OracleSqlKind::DML && kind != OracleSqlKind::PLSQL &&
+        kind != OracleSqlKind::ADMIN) {
         throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "Oracle statement kind is not executable");
     }
     std::lock_guard<std::mutex> guard(mutex);

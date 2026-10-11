@@ -196,6 +196,13 @@ if(ORACLE_SCANNER_BUILD_TESTS)
   target_include_directories(oracle_scanner_adapter_test PRIVATE src/include)
   target_compile_features(oracle_scanner_adapter_test PRIVATE cxx_std_17)
   add_test(NAME oracle_scanner_adapter_test COMMAND oracle_scanner_adapter_test)
+
+  # Opt-in live runner: credentials are supplied only in its environment.
+  add_executable(oracle_scanner_lake_live_test test/cpp/lake_transaction_live_test.cpp)
+  target_link_libraries(oracle_scanner_lake_live_test PRIVATE duckdb_static)
+  link_extension_libraries(oracle_scanner_lake_live_test PRIVATE)
+  target_include_directories(oracle_scanner_lake_live_test PRIVATE src/include)
+  target_compile_features(oracle_scanner_lake_live_test PRIVATE cxx_std_17)
 endif()
 
 install(

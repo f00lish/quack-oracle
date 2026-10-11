@@ -290,7 +290,8 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
             result.completion = completion;
             if (completion.error_number != 0 && !result.exhausted) {
                 throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
-                                    completion.message.empty() ? "Oracle returned a TTC fetch error" : completion.message);
+                                    completion.message.empty() ? "Oracle returned a TTC fetch error" : completion.message,
+                                    completion.error_number);
             }
             // The end-of-call is consumed by what was actually decoded, not by
             // declaring the rest of the message part of it. That stand-in was

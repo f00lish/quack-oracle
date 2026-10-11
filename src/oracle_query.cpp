@@ -52,6 +52,7 @@ using oracle_scanner::OracleSession;
 
 
 struct OracleExecuteBindData final : TableFunctionData {
+    std::string catalog_name;
     ConnectionConfig config;
     std::string password;
     std::string sql;
@@ -492,28 +493,42 @@ std::vector<oracle_scanner::OracleBind> CallArguments(const Value &value) {
     return result;
 }
 
-unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names,
+                                               bool transactional) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_query secret and SQL cannot be NULL");
     }
     const auto secret_name = input.inputs[0].GetValue<std::string>();
     const auto sql = input.inputs[1].GetValue<std::string>();
     std::string password;
-    auto config = ConnectionFromSecret(context, secret_name, password);
-
     const auto binds = ParameterBinds(input, "oracle_query");
     oracle_scanner::ValidateOracleQuery(sql, binds);
     auto result = make_uniq<OracleQueryBindData>();
     result->secret_name = secret_name;
-    try {
+    if (transactional) {
+        result->transactional_query = true;
+        result->query_sql = sql;
+        result->query_binds = binds;
+        auto target = ResolveOracleWriteTarget(context, secret_name);
+        result->catalog_name = target.catalog_name;
+        TransactionSession(context, target);
+        result->session = AcquireOracleReadSession(context, std::string(), target.catalog_name,
+                                                   target.config, target.password);
+    } else {
+        auto config = ConnectionFromSecret(context, secret_name, password);
         result->session = AcquireOracleReadSession(context, secret_name, std::string(), config, password);
+    }
+    try {
         result->cursor = result->session->Query(sql, binds);
     } catch (const std::exception &error) {
         // A pooled session whose statement failed cannot be handed to the next
         // one: the failure may have left the channel mid-message.
         result->session.Poison();
-        throw IOException("oracle_query could not open Oracle query: %s", error.what());
+        if (transactional) {
+            PoisonTransactionSession(context, result->catalog_name);
+        }
+        ThrowOracleAdapterError("oracle_query could not open Oracle query", error);
     }
     result->columns = result->cursor->Columns();
     if (result->columns.empty()) {
@@ -525,10 +540,46 @@ unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBi
         result->types.push_back(TypeFor(result->columns[index]));
         return_types.push_back(result->types.back());
     }
+    if (transactional) {
+        // Keep only describe metadata in a reusable plan. Execution must
+        // reacquire the current transaction, never retain a borrowed session
+        // across COMMIT or consume a cursor opened by PREPARE.
+        result->cursor.reset();
+        result->session = OracleSessionHandle();
+    }
     return std::move(result);
 }
 
 
+
+unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types, vector<string> &names) {
+    return OracleQueryBindCommon(context, input, return_types, names, false);
+}
+
+unique_ptr<FunctionData> OracleTransactionQueryBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+    return OracleQueryBindCommon(context, input, return_types, names, true);
+}
+
+unique_ptr<FunctionData> OracleTransactionExecuteBind(ClientContext &context, TableFunctionBindInput &input,
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+        throw BinderException("oracle_execute_transaction catalog and SQL cannot be NULL");
+    }
+    auto result = make_uniq<OracleExecuteBindData>();
+    result->sql = input.inputs[1].GetValue<std::string>();
+    result->binds = ParameterBinds(input, "oracle_execute_transaction");
+    oracle_scanner::ValidateOracleDml(result->sql, result->binds);
+    auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
+    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot write to an attached read-only Oracle catalog");
+    }
+    result->catalog_name = target.catalog_name;
+    names.push_back("affected_rows");
+    return_types.push_back(LogicalType::UBIGINT);
+    return std::move(result);
+}
 
 unique_ptr<FunctionData> OracleExecuteBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
@@ -546,6 +597,85 @@ unique_ptr<FunctionData> OracleExecuteBind(ClientContext &context, TableFunction
     return std::move(result);
 }
 
+unique_ptr<FunctionData> OracleAdminBind(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names) {
+    RequireAutoCommit(context, "oracle_execute_admin");
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+        throw BinderException("oracle_execute_admin secret and SQL cannot be NULL");
+    }
+    auto result = make_uniq<OracleExecuteBindData>();
+    result->sql = input.inputs[1].GetValue<std::string>();
+    oracle_scanner::ValidateOracleAdmin(result->sql);
+    result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
+    names.push_back("completed");
+    return_types.push_back(LogicalType::BOOLEAN);
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OracleAdminInit(ClientContext &context, TableFunctionInitInput &input) {
+    // Recheck at execution: a prepared DDL plan can outlive its bind transaction.
+    RequireAutoCommit(context, "oracle_execute_admin");
+    const auto &bind = input.bind_data->Cast<OracleExecuteBindData>();
+    try {
+        auto session = OpenOracleSession(bind.config, bind.password);
+        session->ExecuteAdmin(bind.sql);
+        session->Close();
+        return make_uniq<OracleExecuteGlobalState>(0);
+    } catch (const std::exception &error) {
+        ThrowOracleAdapterError("oracle_execute_admin failed", error);
+    }
+}
+
+void OracleAdminFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+    auto &state = input.global_state->Cast<OracleExecuteGlobalState>();
+    if (state.emitted) {
+        return;
+    }
+    output.SetValue(0, 0, Value::BOOLEAN(true));
+    output.SetCardinality(1);
+    state.emitted = true;
+}
+
+struct OracleStatusBindData final : TableFunctionData {
+    std::string catalog_name;
+};
+
+struct OracleStatusGlobalState final : GlobalTableFunctionState {
+    OracleTransactionStatus status;
+    bool emitted = false;
+};
+
+unique_ptr<FunctionData> OracleStatusBind(ClientContext &context, TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types, vector<string> &names) {
+    if (input.inputs[0].IsNull()) {
+        throw BinderException("oracle_transaction_status catalog cannot be NULL");
+    }
+    auto result = make_uniq<OracleStatusBindData>();
+    result->catalog_name = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>()).catalog_name;
+    names = {"commit_outcome", "connection_state", "oracle_error_code", "protocol_error_kind"};
+    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UINTEGER, LogicalType::INTEGER};
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OracleStatusInit(ClientContext &context, TableFunctionInitInput &input) {
+    auto state = make_uniq<OracleStatusGlobalState>();
+    state->status = GetOracleTransactionStatus(context, input.bind_data->Cast<OracleStatusBindData>().catalog_name);
+    return std::move(state);
+}
+
+void OracleStatusFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+    auto &state = input.global_state->Cast<OracleStatusGlobalState>();
+    if (state.emitted) {
+        return;
+    }
+    output.SetValue(0, 0, Value(state.status.commit_outcome));
+    output.SetValue(1, 0, Value(state.status.connection_state));
+    output.SetValue(2, 0, state.status.oracle_code ? Value::UINTEGER(*state.status.oracle_code) : Value(LogicalType::UINTEGER));
+    output.SetValue(3, 0, state.status.protocol_kind ? Value::INTEGER(*state.status.protocol_kind) : Value(LogicalType::INTEGER));
+    output.SetCardinality(1);
+    state.emitted = true;
+}
+
 unique_ptr<GlobalTableFunctionState> OracleExecuteInit(ClientContext &, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleExecuteBindData>();
     try {
@@ -556,6 +686,22 @@ unique_ptr<GlobalTableFunctionState> OracleExecuteInit(ClientContext &, TableFun
         return make_uniq<OracleExecuteGlobalState>(affected_rows);
     } catch (const std::exception &error) {
         throw IOException("oracle_execute failed: %s", error.what());
+    }
+}
+
+unique_ptr<GlobalTableFunctionState> OracleTransactionExecuteInit(ClientContext &context, TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OracleExecuteBindData>();
+    auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
+    if (Catalog::GetCatalog(context, target.catalog_name).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot write to an attached read-only Oracle catalog");
+    }
+    try {
+        auto &session = TransactionSession(context, target);
+        const auto affected_rows = session.ExecuteWithRowCount(bind.sql, bind.binds);
+        return make_uniq<OracleExecuteGlobalState>(affected_rows);
+    } catch (const std::exception &error) {
+        PoisonTransactionSession(context, target.catalog_name);
+        ThrowOracleAdapterError("oracle_execute_transaction failed", error);
     }
 }
 
@@ -1536,6 +1682,34 @@ unique_ptr<GlobalTableFunctionState> OracleCursorInit(ClientContext &, TableFunc
 
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleQueryBindData>();
+    if (bind.transactional_query) {
+        auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
+        TransactionSession(context, target);
+        auto session = AcquireOracleReadSession(context, std::string(), target.catalog_name,
+                                                target.config, target.password);
+        std::unique_ptr<OracleCursor> cursor;
+        try {
+            cursor = session->Query(bind.query_sql, bind.query_binds);
+            const auto &columns = cursor->Columns();
+            if (columns.size() != bind.columns.size()) {
+                throw IOException("Oracle query describe changed; prepare the query again");
+            }
+            for (idx_t i = 0; i < columns.size(); i++) {
+                if (TypeFor(columns[i]) != bind.types[i]) {
+                    throw IOException("Oracle query type changed; prepare the query again");
+                }
+            }
+            auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor),
+                columns, bind.types, std::move(input.column_ids), columns.size());
+            state->catalog_name = bind.catalog_name;
+            return std::move(state);
+        } catch (const std::exception &error) {
+            cursor.reset();
+            session.Poison();
+            PoisonTransactionSession(context, bind.catalog_name);
+            ThrowOracleAdapterError("oracle_query_transaction failed", error);
+        }
+    }
     for (const auto column_id : input.column_ids) {
         if (column_id >= bind.columns.size()) {
             // An attached table advertises Oracle's ROWID and the scan selects
@@ -1581,7 +1755,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                                              std::move(types), std::move(input.column_ids), chunk_columns);
 }
 
-void OracleQueryFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleQueryGlobalState>();
     const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
         try {
@@ -1590,6 +1764,10 @@ void OracleQueryFunction(ClientContext &, TableFunctionInput &input, DataChunk &
             // Same rule as at bind: a failed fetch leaves the channel in a
             // state this side cannot describe, so the session is not reused.
             state.session.Poison();
+            if (!state.catalog_name.empty()) {
+                state.cursor.reset();
+                PoisonTransactionSession(context, state.catalog_name);
+            }
             throw;
         }
     });
@@ -1636,6 +1814,21 @@ CreateTableFunctionInfo DocumentedTableFunctionInfo(TableFunction function, Orac
 // that section shows. None of them runs against an empty DuckDB.
 vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
     vector<CreateTableFunctionInfo> infos;
+    TableFunction status("oracle_transaction_status", {LogicalType::VARCHAR},
+                         OracleStatusFunction, OracleStatusBind, OracleStatusInit);
+    infos.push_back(DocumentedTableFunctionInfo(
+        std::move(status),
+        {{"catalog_name"},
+         "Returns local structured status of the current or most recent Oracle transaction; opens no remote session.",
+         "SELECT * FROM oracle_transaction_status('tx');", {"oracle", "transaction", "diagnostics"}}));
+    TableFunction admin("oracle_execute_admin", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                        OracleAdminFunction, OracleAdminBind, OracleAdminInit);
+    infos.push_back(DocumentedTableFunctionInfo(
+        std::move(admin),
+        {{"secret_name", "sql"},
+         "Runs one administrative DDL command on a dedicated session, only outside an explicit DuckDB transaction.",
+         "SELECT * FROM oracle_execute_admin('demo', 'CREATE TABLE LAKE_ADMIN_PROBE (ID NUMBER)');",
+         {"oracle", "administration"}}));
     TableFunction query("oracle_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleQueryFunction, OracleQueryBind,
                         OracleQueryInit);
     query.varargs = LogicalType::ANY;
@@ -1645,6 +1838,27 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
          "Runs an Oracle SELECT query with optional positional or named bind parameters and returns its rows.",
          "SELECT * FROM oracle_query('demo', 'SELECT :1 AS value FROM dual', [42]);",
          {"oracle", "query"}}));
+
+    TableFunction transaction_query("oracle_query_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                    OracleQueryFunction, OracleTransactionQueryBind, OracleQueryInit);
+    transaction_query.varargs = LogicalType::ANY;
+    infos.push_back(DocumentedTableFunctionInfo(
+        std::move(transaction_query),
+        {{"catalog_name", "sql", "params"},
+         "Reads through the attached Oracle catalog's current transaction, pinning one session until COMMIT or ROLLBACK.",
+         "SELECT * FROM oracle_query_transaction('tx', 'SELECT 1 FROM dual');",
+         {"oracle", "transaction"}}));
+
+    TableFunction transaction_execute("oracle_execute_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                      OracleExecuteFunction, OracleTransactionExecuteBind, OracleTransactionExecuteInit);
+    transaction_execute.varargs = LogicalType::ANY;
+    infos.push_back(DocumentedTableFunctionInfo(
+        std::move(transaction_execute),
+        {{"catalog_name", "sql", "params"},
+         "Runs one INSERT, UPDATE or DELETE in the attached Oracle catalog's transaction, without an independent COMMIT.",
+         "SELECT * FROM oracle_execute_transaction('tx', "
+         "'INSERT INTO QUACK_DEMO_LOG (LABEL) VALUES (:label)', {'label': 'example'});",
+         {"oracle", "transaction", "write"}}));
 
     TableFunction execute("oracle_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleExecuteFunction,
                           OracleExecuteBind, OracleExecuteInit);

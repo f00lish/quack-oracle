@@ -24,6 +24,7 @@ public:
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override;
     uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) override;
+    void ExecuteAdmin(const std::string &sql) override;
     // Executes one validated DML statement through a bounded anonymous PL/SQL
     // block and returns SQL%ROWCOUNT via a NUMBER OUT bind.
     uint64_t ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) override;
@@ -39,6 +40,7 @@ private:
     explicit NativeOracleSession(std::unique_ptr<TnsClientConnection> connection);
     uint8_t NextSequence();
     void RequireOpen() const;
+    uint64_t ExecuteStatement(const std::string &sql, const std::vector<OracleBind> &binds, OracleSqlKind kind);
 
     std::unique_ptr<TnsClientConnection> connection;
     OracleStatementRegistry statements;

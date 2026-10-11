@@ -15,6 +15,7 @@ public:
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override;
     uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) override;
+    void ExecuteAdmin(const std::string &sql) override;
     uint64_t ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) override;
     uint64_t ExecuteBatch(const std::string &sql, const std::vector<std::vector<OracleBind>> &rows) override;
     std::vector<OracleBind> ExecuteReturning(const std::string &sql, const std::vector<OracleBind> &binds) override;

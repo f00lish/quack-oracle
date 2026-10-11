@@ -62,7 +62,8 @@ TtcCallResponse DecodeTtcCallResponse(const std::vector<uint8_t> &message, const
             result.completion = completion;
             if (completion.error_number != 0) {
                 throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
-                                    completion.message.empty() ? "Oracle returned a TTC execute error" : completion.message);
+                                    completion.message.empty() ? "Oracle returned a TTC execute error" : completion.message,
+                                    completion.error_number);
             }
             result.completed = completion.bytes_consumed == tail.size();
             break;

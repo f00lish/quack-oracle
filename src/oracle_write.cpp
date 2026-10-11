@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/transaction/transaction.hpp"
 
 #include "oracle_scanner/session_factory.hpp"
 
@@ -32,6 +33,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace duckdb {
@@ -52,9 +54,14 @@ struct OracleWriteState final : ClientContextState {
     // borrows it, and a write that fails discards it while that read may still
     // hold an open cursor on it. The last user decides when it dies.
     std::unordered_map<std::string, std::shared_ptr<OracleSession>> pinned;
+    std::unordered_set<std::string> failed;
+    std::unordered_map<std::string, OracleTransactionStatus> status;
 
     OracleSession &Pin(const OracleWriteTarget &target) {
         std::lock_guard<std::mutex> guard(lock);
+        if (failed.count(target.catalog_name)) {
+            throw TransactionException("Oracle transaction failed; ROLLBACK is required");
+        }
         const auto existing = pinned.find(target.catalog_name);
         if (existing != pinned.end()) {
             return *existing->second;
@@ -64,13 +71,24 @@ struct OracleWriteState final : ClientContextState {
         });
         auto &reference = *session;
         pinned.emplace(target.catalog_name, std::move(session));
+        status[target.catalog_name] = OracleTransactionStatus();
+        status[target.catalog_name].connection_state = "active";
         return reference;
     }
 
-    void Discard(const std::string &catalog_name) noexcept {
+    void Discard(const std::string &catalog_name, bool poison = false) noexcept {
         std::shared_ptr<OracleSession> session;
         {
             std::lock_guard<std::mutex> guard(lock);
+            if (poison) {
+                failed.insert(catalog_name);
+                status[catalog_name].connection_state = "discarded";
+            } else {
+                failed.erase(catalog_name);
+                if (status[catalog_name].commit_outcome != "unknown") {
+                    status[catalog_name].connection_state = "idle";
+                }
+            }
             const auto entry = pinned.find(catalog_name);
             if (entry == pinned.end()) {
                 return;
@@ -101,22 +119,67 @@ struct OracleWriteState final : ClientContextState {
         return sessions;
     }
 
-    // DuckDB has already committed its own side by the time this runs, so a
-    // failing Oracle COMMIT is reported to the user with Oracle's own error and
-    // Oracle's own transaction is what did not happen. Oracle is the only
-    // durable store here, so there is nothing else to undo.
-    void TransactionCommit(MetaTransaction &, ClientContext &) override {
-        auto sessions = TakeAll();
-        for (auto &session : sessions) {
-            TranslatingOracleErrors("Oracle write could not commit", [&] {
+    // The attached catalog's transaction manager calls this before committing
+    // DuckDB's local catalog state. A failed statement cannot open a fresh
+    // session and accidentally turn a partial transaction into success.
+    void Commit(const std::string &catalog_name) {
+        std::shared_ptr<OracleSession> session;
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            if (failed.count(catalog_name)) {
+                throw TransactionException("Oracle transaction failed; ROLLBACK is required");
+            }
+            const auto entry = pinned.find(catalog_name);
+            if (entry == pinned.end()) {
+                return;
+            }
+            session = std::move(entry->second);
+            pinned.erase(entry);
+        }
+        try {
+            TranslatingOracleErrors("Oracle COMMIT failed", [&] {
                 session->Commit();
                 return 0;
             });
+        } catch (const std::exception &error) {
             try {
                 session->Close();
             } catch (...) {
             }
+            // Without a confirmed rejection, a lost acknowledgement must not
+            // invite replay or deletion of files possibly already published.
+            auto info = OracleErrorInfo(error);
+            info["oracle_commit_outcome"] = "unknown";
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                auto &last = status[catalog_name];
+                last.commit_outcome = "unknown";
+                last.connection_state = "discarded";
+                if (info.count("oracle_error_code")) {
+                    last.oracle_code = std::stoul(info.at("oracle_error_code"));
+                }
+                if (info.count("oracle_protocol_error_kind")) {
+                    last.protocol_kind = std::stoi(info.at("oracle_protocol_error_kind"));
+                }
+            }
+            throw IOException(info, "Oracle COMMIT outcome is unknown; do not replay the transaction or delete its files "
+                              "without reconciling the catalog");
         }
+        try {
+            session->Close();
+        } catch (...) {
+        }
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            status[catalog_name].commit_outcome = "committed";
+            status[catalog_name].connection_state = "idle";
+        }
+    }
+
+    OracleTransactionStatus Status(const std::string &catalog_name) {
+        std::lock_guard<std::mutex> guard(lock);
+        const auto found = status.find(catalog_name);
+        return found == status.end() ? OracleTransactionStatus() : found->second;
     }
 
     void TransactionRollback(MetaTransaction &, ClientContext &) override {
@@ -128,6 +191,15 @@ struct OracleWriteState final : ClientContextState {
     }
 
     void RollbackAll() noexcept {
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            failed.clear();
+            for (auto &entry : status) {
+                if (entry.second.connection_state == "active") {
+                    entry.second.connection_state = "idle";
+                }
+            }
+        }
         auto sessions = TakeAll();
         for (auto &session : sessions) {
             try {
@@ -344,6 +416,8 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
 }
 
 OracleSession &TransactionSession(ClientContext &context, const OracleWriteTarget &target) {
+    auto &catalog = Catalog::GetCatalog(context, target.catalog_name);
+    Transaction::Get(context, catalog);
     return WriteStateFor(context).Pin(target);
 }
 
@@ -358,6 +432,21 @@ std::shared_ptr<OracleSession> TryTransactionSession(ClientContext &context, con
 }
 
 void PoisonTransactionSession(ClientContext &context, const std::string &catalog_name) noexcept {
+    try {
+        WriteStateFor(context).Discard(catalog_name, true);
+    } catch (...) {
+    }
+}
+
+void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name) {
+    WriteStateFor(context).Commit(catalog_name);
+}
+
+OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const std::string &catalog_name) {
+    return WriteStateFor(context).Status(catalog_name);
+}
+
+void RollbackOracleTransaction(ClientContext &context, const std::string &catalog_name) noexcept {
     try {
         WriteStateFor(context).Discard(catalog_name);
     } catch (...) {

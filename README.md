@@ -473,6 +473,59 @@ Columns you do not name are left out of the statement, so Oracle's own
 the table does not need a primary key. (`RETURNING` on `UPDATE`/`DELETE` is not
 supported yet.)
 
+`ATTACH 'ora' AS o (TYPE oracle_scanner, READ_ONLY)` prevents writes through
+both normal SQL and `oracle_execute_transaction`. Prepared raw DML rechecks the
+current catalog mode at execution. `HIDDEN` is accepted for internal catalogs;
+DuckDB enforces visibility. The scanner's in-memory storage wrapper stays
+writable internally because DuckDB cannot open an in-memory database read-only;
+the attached Oracle catalog retains its read-only access flag.
+
+### Raw SQL in the attached transaction
+
+The explicit catalog functions pin a session even when a SELECT comes before
+the first write. Their first argument is the ATTACH alias, not a secret name:
+
+```sql
+BEGIN;
+SELECT * FROM oracle_query_transaction('o', 'SELECT id FROM ITEMS WHERE id = :1', [7]);
+SELECT * FROM oracle_execute_transaction('o', 'UPDATE ITEMS SET label = :1 WHERE id = :2', ['VII', 7]);
+ROLLBACK;
+```
+
+`oracle_execute_transaction` accepts INSERT, UPDATE and DELETE and returns the
+affected row count. Physical DDL is rejected. A statement or fetch failure
+invalidates the remote transaction: issue ROLLBACK before starting another.
+COMMIT failures report an unknown outcome; reconcile the database before replay
+or file cleanup. Atomic commit across multiple catalogs is not guaranteed.
+
+Statement/fetch errors expose numeric `oracle_error_code` and
+`oracle_connection_state` in DuckDB's `ErrorData::ExtraInfo()`. DuckDB 1.5.6
+discards extra fields while wrapping COMMIT errors, so immediately inspect
+`SELECT * FROM oracle_transaction_status('o')` after a failed COMMIT. It opens
+no Oracle session and returns `commit_outcome`, `connection_state`, nullable
+`oracle_error_code` and `protocol_error_kind`. A new remote transaction resets
+this status; inspect it before replay. `unknown` requires reconciliation.
+
+Physical DDL has a separate explicit API:
+
+```sql
+SELECT * FROM oracle_execute_admin('ora', 'CREATE TABLE ADMIN_PROBE (ID NUMBER)');
+```
+
+It accepts one CREATE/ALTER/DROP/GRANT/REVOKE/COMMENT/TRUNCATE command on a
+dedicated session and returns `completed`. It rejects explicit DuckDB
+transactions at bind and execution, including a previously prepared command.
+Oracle DDL commits implicitly; this is an administrative bootstrap/migration
+path, never part of a metadata DML transaction. No automatic DDL replay occurs.
+After schema changes, refresh dictionary entries outside transactions using
+`DETACH o` followed by the original `ATTACH 'ora' AS o (TYPE oracle_scanner)`;
+prepare dependent statements again. In-place cache refresh is not supported.
+
+Prepared transactional SELECTs acquire the current transaction at each execution.
+Describe currently executes a SELECT at bind time, then execution opens it again;
+account for that extra round trip and for locks taken by a blocking SELECT.
+Use the ordinary functions below for their existing autocommit behavior.
+
 ### One statement at a time
 
 ```sql

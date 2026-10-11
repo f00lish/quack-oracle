@@ -31,6 +31,11 @@ uint64_t ValidatedOracleSession::Execute(const std::string &sql, const std::vect
     return Inner().Execute(sql, binds);
 }
 
+void ValidatedOracleSession::ExecuteAdmin(const std::string &sql) {
+    ValidateOracleAdmin(sql);
+    Inner().ExecuteAdmin(sql);
+}
+
 uint64_t ValidatedOracleSession::ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) {
     // Same statement class and bind rules as Execute; only the row-count
     // guarantee differs, and that is settled below this layer.

@@ -738,6 +738,11 @@ static void TestTtcErrorDiagnostics() {
     const auto error = ParseTtcServerError(response);
     CHECK(error.ora_code == 1017 && error.message == "ORA-01017: invalid logon");
     ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { ThrowTtcServerError(response); });
+    try {
+        ThrowTtcServerError(response);
+    } catch (const ProtocolError &failure) {
+        CHECK(failure.OracleCode() == 1017);
+    }
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ParseTtcServerError({TTC_MESSAGE_PARAMETER}); });
 
     // The end-of-call up to the extended error number and row count. The two
@@ -1986,6 +1991,11 @@ static void TestSqlStatementValidation() {
     CHECK(ClassifyOracleSql("begin app.ping; end") == OracleSqlKind::PLSQL);
     ValidateOracleQuery("select * from invoices where id = :id", binds);
     ValidateOracleDml("delete from invoices where id = :id", binds);
+    ValidateOracleAdmin("CREATE TABLE admin_probe (label VARCHAR2(100) DEFAULT 'x;y')");
+    ValidateOracleAdmin("GRANT CREATE SESSION TO admin_probe");
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateOracleAdmin("COMMIT"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateOracleAdmin("CREATE TABLE x(id NUMBER); DROP TABLE y"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateOracleAdmin("CREATE TABLE x AS SELECT :1 FROM dual"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateOracleQuery("delete from invoices where id = :id", binds); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateOracleDml("merge into invoices x using dual on (1=1)", {}); });
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateOracleQuery("select 1; delete from x", {}); });

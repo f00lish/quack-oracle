@@ -95,7 +95,7 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.3.1 targets **DuckDB v1.5.6**, which is the DuckDB version that will
+Version 0.4.0 targets **DuckDB v1.5.6**, which is the DuckDB version that will
 load it. On DuckDB v1.5.5 the same command still installs 0.2.2, the last
 release built for it.
 
@@ -526,6 +526,42 @@ Describe currently executes a SELECT at bind time, then execution opens it again
 account for that extra round trip and for locks taken by a blocking SELECT.
 Use the ordinary functions below for their existing autocommit behavior.
 
+### Batches and procedure calls in the attached transaction
+
+Two more functions run on the same pinned session, so their work commits or
+rolls back with everything else in the DuckDB transaction. Neither commits on
+its own.
+
+```sql
+BEGIN;
+SELECT * FROM oracle_execute_many_transaction('o',
+    'UPDATE ITEMS SET label = :label WHERE id = :id',
+    [{'id': 7, 'label': 'VII'}, {'id': 8, 'label': 'VIII'}]);
+SELECT * FROM oracle_call_named_transaction('o', 'APP.TOUCH_ITEM',
+    [{name: 'P_ID', direction: 'in', type: 'number', value: '7'},
+     {name: 'P_STATUS', direction: 'out', type: 'varchar', value: NULL::VARCHAR}]);
+COMMIT;
+```
+
+`oracle_execute_many_transaction` takes 1 to 2048 rows of binds, SQL of at most
+65536 bytes, and at most 131072 bytes of encoded binds and names. By default it
+executes the rows one at a time and returns one row per input row: `row_index`,
+its `affected_rows`, and `exact_counts = true`. With `exact_counts := false` it
+sends Oracle array DML instead, in groups of up to 1024 rows, and returns a
+single row whose `affected_rows` is the total and whose `row_index` is NULL —
+the count of the whole batch, not a per-row breakdown.
+
+`oracle_call_named_transaction` calls a procedure with 1 to 64 `NUMBER` or
+`VARCHAR` arguments, `IN`, `OUT` or `IN OUT`, NULL included, and returns one
+row per `OUT`/`IN OUT` argument. REF CURSOR, LOB and object arguments are not
+supported here. The procedure runs inside your transaction, so it must not
+`COMMIT`, run DDL or use an autonomous transaction.
+
+Both refuse on a `READ_ONLY` catalog. A bind that fails local validation is
+refused at bind time and leaves the transaction as it was. A failure from
+Oracle invalidates the remote transaction, as for `oracle_execute_transaction`:
+`ROLLBACK` before going on. Nothing is retried or replayed automatically.
+
 ### One statement at a time
 
 ```sql
@@ -631,6 +667,12 @@ assume:
 
 The `oracle_execute` and `oracle_execute_many` examples write to
 `QUACK_DEMO_LOG` and commit in Oracle as they run.
+
+The `*_transaction` functions and `oracle_transaction_status` take an
+attached catalog rather than a secret; their examples assume
+`ATTACH 'demo' AS ora (TYPE oracle_scanner)`. The `oracle_execute_admin`
+example creates a table, `QUACK_DEMO_SCRATCH`, and Oracle commits DDL at once;
+drop it afterwards.
 
 `oracle_cursor` and `oracle_close_call` take a handle, so their examples read
 it from a DuckDB variable. Fill each from its own fresh call, on the same

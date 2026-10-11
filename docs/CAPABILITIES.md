@@ -170,6 +170,9 @@ Every SQL string handed to this extension goes through one gate:
 | --- | --- | --- |
 | `oracle_query` | queries only | `SELECT`, `WITH` |
 | `oracle_execute`, `oracle_execute_many` | DML only | `INSERT`, `UPDATE`, `DELETE` |
+| `oracle_query_transaction` | queries only | `SELECT`, `WITH` |
+| `oracle_execute_transaction`, `oracle_execute_many_transaction` | DML only | `INSERT`, `UPDATE`, `DELETE` |
+| `oracle_execute_admin` | one DDL command | `CREATE`, `ALTER`, `DROP`, `GRANT`, `REVOKE`, `COMMENT`, `TRUNCATE` |
 
 And, in **all** cases:
 
@@ -182,13 +185,16 @@ The consequences are concrete and worth stating plainly:
   over: `BEGIN` is not an accepted first keyword for either function, and the
   `;` that PL/SQL itself requires is refused. There is no third function that
   takes a block.
-- **DDL cannot be issued.** `CREATE`, `DROP`, `ALTER`, `TRUNCATE`, and
-  `CREATE OR REPLACE PROCEDURE` are all refused — the last one also because a
-  procedure body is full of semicolons.
+- **DDL goes only through `oracle_execute_admin`.** The query and DML
+  functions refuse `CREATE`, `DROP`, `ALTER` and `TRUNCATE`. `oracle_execute_admin`
+  takes one such command, on a session of its own and never inside an explicit
+  DuckDB transaction, because Oracle commits DDL implicitly. `CREATE OR REPLACE
+  PROCEDURE` is still refused everywhere: a procedure body is full of
+  semicolons.
 - **`COMMIT` and `ROLLBACK` cannot be sent as SQL.** Transaction control is
   DuckDB's; see §6.
 
-**The workaround for DDL**, and the only one:
+**Another way to run DDL**, one that predates `oracle_execute_admin`:
 
 ```sql
 SELECT * FROM oracle_call_auto('ora', 'DBMS_UTILITY.EXEC_DDL_STATEMENT',
@@ -298,11 +304,16 @@ in as `''` comes back as NULL. That is Oracle's behavior, faithfully reproduced.
 `CLOB`, `NCLOB`, and `BLOB` are **read**. `BFILE` is not, and no LOB can be
 **written**.
 
-A LOB column carries only a locator in the row, so every value costs its own
-round trips: one length call, then a read per 32 767 characters or 65 536 bytes.
-Measured on a local 19c, 2 000 rows each holding a 2 000-character CLOB — 4 MB —
-took **1.22 s**, against **0.004 s** for the same 2 000 rows with the LOB column
-left out of the selection. That is round-trip bound, not bandwidth bound.
+A LOB column carries a locator in the row. Against a server that negotiates
+the 12c field version (19c, 23ai and Autonomous do), the fetch asks Oracle to
+send the first 4 096 characters or bytes of each LOB along with the row, in
+batches of at most 128 rows and 4 MB; a value that fits costs no LOB call at
+all, and a longer one reads only its remainder, 32 767 characters or 65 536
+bytes per round trip. Where prefetch does not apply, every value costs its own
+round trips: its first chunk, then the rest. Before prefetch, a local 19c took
+**1.22 s** for 2 000 rows each holding a 2 000-character CLOB, against
+**0.004 s** with the LOB column left out — round-trip bound, not bandwidth
+bound. Long LOBs remain so.
 
 **Select a LOB column only when you need it.** No other column type has a cost
 profile remotely like this.
@@ -401,6 +412,34 @@ undo, so the mismatch is refused rather than hidden.
 
 `oracle_execute_many` uses Oracle array DML: one execute carrying every
 iteration, not one round trip per row. A row that fails reports its position.
+
+### Raw SQL inside the attached transaction
+
+For SQL the `ATTACH` path cannot express, five functions take the attached
+catalog's name instead of a secret and run on the session pinned to the DuckDB
+transaction, so their work commits and rolls back with it:
+
+- `oracle_query_transaction` — a query; it sees the transaction's own
+  uncommitted rows.
+- `oracle_execute_transaction` — one `INSERT`, `UPDATE` or `DELETE`.
+- `oracle_execute_many_transaction` — 1 to 2048 bind rows. Exact per-row counts
+  by default, one execution per row; `exact_counts := false` sends array DML in
+  groups of up to 1024 rows and returns one aggregate count.
+- `oracle_call_named_transaction` — a procedure with up to 64 `NUMBER` or
+  `VARCHAR` arguments, `IN`, `OUT` or `IN OUT`, NULL included. No cursors, LOBs
+  or objects. The procedure must not commit, run DDL or use an autonomous
+  transaction.
+- `oracle_transaction_status` — the outcome of the current or last transaction
+  (`commit_outcome`, `connection_state`, `oracle_error_code`,
+  `protocol_error_kind`), read locally without opening a session. DuckDB 1.5.6
+  drops the extra error fields when it wraps a failed `COMMIT`, so this is where
+  they are.
+
+None of them commits. A `READ_ONLY` catalog refuses the writing ones. A bind
+that fails local validation is refused at bind time and leaves the transaction
+untouched; a failure from Oracle invalidates the remote transaction, which then
+needs `ROLLBACK`. A `COMMIT` that fails has an unknown outcome until checked.
+Nothing is retried or replayed.
 
 ---
 

@@ -237,7 +237,7 @@ public:
         deadline = environment.now() + std::chrono::seconds(EffectiveConnectBudgetSeconds(config));
         if (config.io_deadline) {
             const auto caller_deadline = config.io_deadline->Get();
-            if (caller_deadline) { deadline = std::min(deadline,*caller_deadline); }
+            if (caller_deadline) { deadline = (std::min)(deadline,*caller_deadline); }
         }
         auto shared = std::make_shared<ConnectLimits>();
         shared->environment = environment;

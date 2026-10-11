@@ -428,7 +428,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     // One deadline for this attempt: the TCP connect and the TLS handshake
     // share connect_timeout_seconds between them, as they always did.
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(connect_timeout_seconds);
-    if (OracleTransportConnectDeadline()) { deadline = std::min(deadline,*OracleTransportConnectDeadline()); }
+    if (OracleTransportConnectDeadline()) { deadline = (std::min)(deadline,*OracleTransportConnectDeadline()); }
 
     // TCP first, on its own BIO, driven by hand rather than by
     // BIO_do_connect_retry. That helper resets and retries a refused connect

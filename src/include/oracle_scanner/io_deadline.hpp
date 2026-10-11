@@ -22,7 +22,7 @@ class ScopedOracleIoDeadline {
 public:
     ScopedOracleIoDeadline(std::shared_ptr<OracleIoDeadline> source_p, std::chrono::steady_clock::time_point deadline)
         : source(std::move(source_p)), previous(source->Get()) {
-        source->Set(previous ? std::min(*previous,deadline) : deadline);
+        source->Set(previous ? (std::min)(*previous,deadline) : deadline);
     }
     ~ScopedOracleIoDeadline() { source->Set(previous); }
     ScopedOracleIoDeadline(const ScopedOracleIoDeadline &) = delete;

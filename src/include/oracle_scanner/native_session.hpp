@@ -40,6 +40,7 @@ private:
     explicit NativeOracleSession(std::unique_ptr<TnsClientConnection> connection);
     uint8_t NextSequence();
     void RequireOpen() const;
+    std::unique_ptr<OracleCursor> OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds);
     uint64_t ExecuteStatement(const std::string &sql, const std::vector<OracleBind> &binds, OracleSqlKind kind);
 
     std::unique_ptr<TnsClientConnection> connection;

@@ -284,6 +284,14 @@ void NativeOracleSession::RequireOpen() const {
 }
 
 std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql, const std::vector<OracleBind> &binds) {
+    // Like every other operation: an ORA-01013 answering an accepted Cancel is
+    // observed here, which is what makes the session usable again afterwards.
+    return RunNativeOperation(lifetime->fetch_cancellation, [&]() -> std::unique_ptr<OracleCursor> {
+        return OpenQuery(sql, binds);
+    });
+}
+
+std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds) {
     RequireOpen();
     const auto call = channel->LockCall();
     const auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::QUERY);

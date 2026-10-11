@@ -182,6 +182,11 @@ if(ORACLE_SCANNER_BUILD_TESTS)
   target_compile_features(oracle_scanner_protocol_test PRIVATE cxx_std_17)
   add_test(NAME oracle_scanner_protocol_test COMMAND oracle_scanner_protocol_test)
 
+  add_executable(oracle_scanner_lob_reader_test test/cpp/lob_reader_test.cpp)
+  target_include_directories(oracle_scanner_lob_reader_test PRIVATE src/include)
+  target_compile_features(oracle_scanner_lob_reader_test PRIVATE cxx_std_17)
+  add_test(NAME oracle_scanner_lob_reader_test COMMAND oracle_scanner_lob_reader_test)
+
   # Adapter tests link DuckDB itself so they can drive src/oracle_query.cpp
   # against a fake session installed through OpenOracleSession, with no database
   # and no network. duckdb_static is defined later in the DuckDB tree than this

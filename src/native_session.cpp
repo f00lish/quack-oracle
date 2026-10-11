@@ -7,6 +7,7 @@
 #include "oracle_scanner/sql_statement.hpp"
 #include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
+#include "oracle_scanner/lob_reader.hpp"
 #include "oracle_scanner/value_codec.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
 
@@ -72,32 +73,22 @@ public:
     std::vector<uint8_t> ReadWholeLob(const std::vector<uint8_t> &locator, bool is_character) {
         // Sequence allocation and every request/response share the session call lock.
         const auto call = channel.LockCall();
-        TtcLobRequest length_request;
-        length_request.sequence = NextCursorSequence();
-        length_request.locator = locator;
-        length_request.operation = LOB_OP_GET_LENGTH;
-        const auto total = channel.LobOperation(length_request, server_field_version).amount;
-        std::vector<uint8_t> content;
-        // The unit is Oracle's: characters for a CLOB, bytes for a BLOB. The
-        // offset advances by what the server says it served, so a multi-byte
-        // character never splits the count.
-        uint64_t served = 0;
-        while (served < total) {
-            TtcLobRequest read_request;
-            read_request.sequence = NextCursorSequence();
-            read_request.locator = locator;
-            read_request.operation = LOB_OP_READ;
-            read_request.offset = served + 1;
-            read_request.amount = std::min<uint64_t>(total - served, is_character ? 32767 : 65536);
-            const auto response = channel.LobOperation(read_request, server_field_version);
-            if (response.amount == 0 && response.data.empty()) {
-                // The server has nothing more to give. Stopping here is the
-                // only alternative to looping on an unchanging offset.
-                break;
-            }
-            content.insert(content.end(), response.data.begin(), response.data.end());
-            served += response.amount != 0 ? response.amount : response.data.size();
-        }
+        auto content = ReadOracleLobContent(is_character,
+            [&](uint64_t offset, uint64_t amount) {
+                TtcLobRequest request;
+                request.sequence = NextCursorSequence();
+                request.locator = locator;
+                request.operation = LOB_OP_READ;
+                request.offset = offset;
+                request.amount = amount;
+                return channel.LobOperation(request, server_field_version);
+            }, [&] {
+                TtcLobRequest request;
+                request.sequence = NextCursorSequence();
+                request.locator = locator;
+                request.operation = LOB_OP_GET_LENGTH;
+                return channel.LobOperation(request, server_field_version).amount;
+            });
         return is_character ? DecodeUtf16BeToUtf8(content) : content;
     }
 

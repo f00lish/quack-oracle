@@ -78,7 +78,8 @@ TtcLobResponse TtcStatementChannel::LobOperation(const TtcLobRequest &request, u
     if (IsTtcErrorMessage(response)) {
         const auto completion = DecodeTtcErrorPrefix(response, server_field_version);
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
-                            completion.message.empty() ? "Oracle refused a LOB read" : completion.message);
+                            completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
+                            completion.error_number);
     }
     // A LOB large enough to outgrow one packet arrives as several, and the
     // return parameter that says how much was served is in the last of them.

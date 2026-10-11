@@ -43,14 +43,16 @@ namespace oracle_scanner {
 // Windows has no SIGPIPE; a closed peer surfaces as an error return.
 class ScopedSigPipeBlock {};
 #else
-// Blocks SIGPIPE for this thread across a write, and consumes the one our own
-// write may have raised.
+// Blocks SIGPIPE for this thread across an operation that may write, and
+// consumes the one our own operation may have raised. TLS reads may send
+// alerts or other control records too.
 //
 // Writing to a peer that has closed returns EPIPE and raises SIGPIPE, whose
 // default action terminates the process. Without this, an Oracle server closing
 // mid-write takes down the whole DuckDB process instead of failing one
-// statement. macOS suppresses the signal for sockets and Linux does not, which
-// is why it only ever appeared there.
+// statement. macOS additionally needs SO_NOSIGPIPE on the socket because the
+// signal may reach another unblocked thread. The application's process-wide
+// signal policy is left unchanged.
 //
 // Only a signal this scope could have raised is consumed. If SIGPIPE was
 // already blocked on entry, a pending one may predate us and belongs to
@@ -110,12 +112,18 @@ struct OpenSslByteStream::Impl {
     std::optional<std::chrono::steady_clock::time_point> deadline;
 
     ~Impl() {
+        // Also covers destruction while Connect unwinds after an error.
+        const ScopedSigPipeBlock no_sigpipe;
+        ERR_clear_error();
         if (bio) {
             BIO_free_all(bio);
         }
         if (context) {
             SSL_CTX_free(context);
         }
+        // A failed socket/TLS shutdown must not contaminate another session
+        // that subsequently performs TLS I/O on the same caller thread.
+        ERR_clear_error();
     }
 };
 
@@ -434,6 +442,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     // SIGPIPE here just as an ordinary write would.
     const ScopedSigPipeBlock no_sigpipe;
     while (true) {
+        ERR_clear_error();
         if (BIO_do_connect(result->bio) > 0) {
             break;
         }
@@ -449,6 +458,17 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
         }
     }
 
+    // On macOS blocking SIGPIPE in this thread is insufficient: a socket write
+    // can signal another unblocked thread. Suppress it on the native BIO socket
+    // before TLS can write, leaving EPIPE/error handling intact.
+#if defined(SO_NOSIGPIPE)
+    int native_socket = -1;
+    int suppress_sigpipe = 1;
+    if (BIO_get_fd(result->bio, &native_socket) < 0 || native_socket < 0 ||
+        setsockopt(native_socket, SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe, sizeof(suppress_sigpipe)) != 0) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TCP socket SIGPIPE protection failed");
+    }
+#endif
     if (use_tls) {
         result->context = SSL_CTX_new(TLS_client_method());
         if (!result->context) {
@@ -498,6 +518,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
             RequireOpenSsl(SSL_set1_host(ssl, server_name.c_str()), "setting TLS hostname verification");
         }
         while (true) {
+            ERR_clear_error();
             if (BIO_do_handshake(result->bio) > 0) {
                 break;
             }
@@ -625,19 +646,40 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
     if (!implementation || implementation->closed || !destination || maximum_size == 0) {
         return 0;
     }
+    // BIO_read over TLS can write alerts/control records to a closed peer.
+    const ScopedSigPipeBlock no_sigpipe;
     const auto requested = static_cast<int>((std::min)(maximum_size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
+        // The SSL BIO derives retry flags through SSL_get_error, which requires
+        // an empty error queue before this operation (even on a healthy socket).
+        ERR_clear_error();
+#if defined(_WIN32)
+        WSASetLastError(0);
+#else
+        errno = 0;
+#endif
         const auto count = BIO_read(implementation->bio, destination, requested);
+#if defined(_WIN32)
+        const auto socket_error = WSAGetLastError();
+#else
+        const auto socket_error = errno;
+#endif
         if (count > 0) {
             return static_cast<size_t>(count);
         }
         if (count == 0 && BIO_eof(implementation->bio)) {
             return 0;
         }
-        if (!BIO_should_retry(implementation->bio) ||
-            !WaitForBio(implementation->bio, implementation->read_timeout_seconds, implementation->deadline)) {
+        if (!BIO_should_retry(implementation->bio)) {
+            const auto tls_error = ERR_peek_last_error();
             ERR_clear_error();
-            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle TCP read failed or timed out");
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED,
+                "Oracle TCP read failed (socket error " + std::to_string(socket_error) +
+                ", TLS reason " + std::to_string(ERR_GET_REASON(tls_error)) + ")");
+        }
+        if (!WaitForBio(implementation->bio, implementation->read_timeout_seconds, implementation->deadline)) {
+            ERR_clear_error();
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle TCP read timed out");
         }
     }
 }
@@ -649,6 +691,7 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
     const ScopedSigPipeBlock no_sigpipe;
     const auto requested = static_cast<int>((std::min)(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
+        ERR_clear_error();
         const auto count = BIO_write(implementation->bio, source, requested);
         if (count > 0) {
             return static_cast<size_t>(count);

@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
@@ -1468,7 +1469,8 @@ namespace local_tls {
 // client under test only needs the handshake's verdict.
 class Server {
 public:
-    explicit Server(const Identity &identity) {
+    explicit Server(const Identity &identity, bool reset_read_p = false, bool delayed_read_p = false)
+        : reset_read(reset_read_p), delayed_read(delayed_read_p) {
         context = SSL_CTX_new(TLS_server_method());
         CHECK(context);
         std::unique_ptr<BIO, decltype(&BIO_free)> certificate_bio(
@@ -1516,6 +1518,12 @@ public:
         return port;
     }
 
+    void ResetReadAndWait() {
+        release_read.store(true);
+        if (worker.joinable()) { worker.join(); }
+    }
+    void ReleaseRead() { release_read.store(true); }
+
 private:
     void Serve() {
         // This thread's own writes can meet a client that has already rejected
@@ -1538,7 +1546,20 @@ private:
             SSL_set_fd(ssl, accepted);
             // A rejected certificate makes this fail, which is the expected
             // outcome for three of the four cases and not an error here.
-            (void)SSL_accept(ssl);
+            const auto accepted_tls = SSL_accept(ssl);
+            if (accepted_tls == 1 && (reset_read || delayed_read)) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!release_read.load() && std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (delayed_read) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    const uint8_t byte = 0x5a;
+                    (void)SSL_write(ssl, &byte, 1);
+                } else {
+                    linger reset {1,0}; setsockopt(accepted, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+                }
+            }
             SSL_free(ssl);
         }
         close(accepted);
@@ -1548,9 +1569,43 @@ private:
     int listener = -1;
     uint16_t port = 0;
     std::thread worker;
+    bool reset_read = false;
+    bool delayed_read = false;
+    std::atomic<bool> release_read {false};
 };
 
 } // namespace local_tls
+
+static void TestTlsReadFailureDoesNotKillTheProcess() {
+    const std::string name = "oracle-scanner.test";
+    auto identity = local_tls::MakeIdentity(name, -3600, 3600);
+    local_tls::Server server(identity, true);
+    TlsConfiguration tls; tls.server_name = name; tls.ca_pem_contents = identity.certificate_pem;
+    auto stream = OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls);
+    server.ResetReadAndWait();
+    bool failed = false;
+    uint8_t byte;
+    try { failed = stream->Read(&byte, 1) == 0; }
+    catch (const ProtocolError &error) { failed = error.Kind() == ProtocolErrorKind::TRUNCATED; }
+    CHECK(failed);
+    stream->Close();
+}
+
+static void TestTlsReadIgnoresUnrelatedErrorQueue() {
+    const std::string name = "oracle-scanner.test";
+    auto identity = local_tls::MakeIdentity(name, -3600, 3600);
+    local_tls::Server server(identity, false, true);
+    TlsConfiguration tls; tls.server_name = name; tls.ca_pem_contents = identity.certificate_pem;
+    auto stream = OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls);
+    // Represents an unrelated failed BIO on the same caller thread. A healthy
+    // nonblocking TLS read must still wait for the delayed byte, not fail with
+    // this stale EPIPE when SSL_get_error determines WANT_READ.
+    ERR_raise(ERR_LIB_SYS, EPIPE);
+    server.ReleaseRead();
+    uint8_t byte = 0;
+    CHECK(stream->Read(&byte, 1) == 1 && byte == 0x5a);
+    stream->Close();
+}
 
 // The wallet-free TLS path and the certificate cases no live endpoint provides.
 static void TestLocalTlsCertificateVerification() {
@@ -3316,23 +3371,27 @@ static void TestWriteToClosedPeerDoesNotKillTheProcess() {
     closer.join();
     close(listener);
 
-    // The first write usually lands in the kernel buffer; the peer's RST is
-    // seen by the next one. Both are attempted, and either an error or a clean
-    // return is acceptable — what is not acceptable is dying.
+    // Keep another unblocked thread alive: on macOS a socket SIGPIPE may reach
+    // it even while the writing thread blocks the signal. Continue after the
+    // first ECONNRESET so a subsequent write reaches EPIPE too.
+    std::atomic<bool> done {false};
+    std::thread observer([&] {
+        while (!done.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    });
     const std::vector<uint8_t> payload(64, 0x5a);
     bool reported = false;
-    for (int attempt = 0; attempt < 8 && !reported; attempt++) {
+    for (int attempt = 0; attempt < 8; attempt++) {
         try {
             stream->Write(payload.data(), payload.size());
         } catch (const ProtocolError &error) {
             reported = error.Kind() == ProtocolErrorKind::INVALID_STATE ||
                        error.Kind() == ProtocolErrorKind::TRUNCATED;
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    // There is deliberately no CHECK on `reported`: whether the peer's RST has
-    // arrived by any given attempt is timing, and asserting on it would make
-    // this flaky. Reaching this line is the assertion — an unprotected write
-    // would have killed the process several lines ago, with no output.
+    done = true;
+    observer.join();
+    CHECK(reported);
     (void)reported;
     stream->Close();
 }
@@ -5600,6 +5659,8 @@ int main() {
     TestTtcExecuteRefCursorBindShape();
 #if !defined(_WIN32)
     TestLocalTlsCertificateVerification();
+    TestTlsReadFailureDoesNotKillTheProcess();
+    TestTlsReadIgnoresUnrelatedErrorQueue();
 #endif
     TestDescriptorSecuritySection();
     TestServerDnComparison();

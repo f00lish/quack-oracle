@@ -70,6 +70,8 @@ public:
     }
 
     std::vector<uint8_t> ReadWholeLob(const std::vector<uint8_t> &locator, bool is_character) {
+        // Sequence allocation and every request/response share the session call lock.
+        const auto call = channel.LockCall();
         TtcLobRequest length_request;
         length_request.sequence = NextCursorSequence();
         length_request.locator = locator;

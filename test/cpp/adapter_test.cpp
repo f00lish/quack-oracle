@@ -2058,7 +2058,9 @@ void TestFunctionExamplesRun() {
     {
         TestDatabase database;
         auto listed = database.Query("SELECT function_name, function_type, examples FROM duckdb_functions() "
-                                     "WHERE starts_with(function_name, 'oracle_') ORDER BY function_name");
+                                     // Internal backend capability probe is not a user SQL example API.
+                                     "WHERE starts_with(function_name, 'oracle_') "
+                                     "AND function_name <> 'oracle_scanner_io_deadline_version' ORDER BY function_name");
         CHECK(!listed->HasError());
         for (duckdb::idx_t row = 0; row < listed->RowCount(); row++) {
             const auto list = duckdb::ListValue::GetChildren(listed->GetValue(2, row));

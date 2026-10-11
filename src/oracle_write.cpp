@@ -1,3 +1,4 @@
+#include "oracle_io_deadline.hpp"
 // Writing to an attached Oracle table: the transaction-pinned session, the
 // value-to-bind conversion, and the INSERT operator.
 //
@@ -418,7 +419,11 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
 OracleSession &TransactionSession(ClientContext &context, const OracleWriteTarget &target) {
     auto &catalog = Catalog::GetCatalog(context, target.catalog_name);
     Transaction::Get(context, catalog);
-    return WriteStateFor(context).Pin(target);
+    // Attached catalog configuration is shared across callers. The pinned
+    // session belongs to this transaction's caller, not the ATTACH context.
+    auto caller_target = target;
+    caller_target.config.io_deadline = OracleIoDeadlineFor(context);
+    return WriteStateFor(context).Pin(caller_target);
 }
 
 std::shared_ptr<OracleSession> TryTransactionSession(ClientContext &context, const std::string &catalog_name) {

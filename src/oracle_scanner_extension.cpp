@@ -45,9 +45,17 @@ void RegisterOracleScannerVersion(ExtensionLoader &loader) {
 	loader.RegisterFunction(OracleScannerVersionFunctionInfo());
 }
 
+static void OracleIoDeadlineVersion(DataChunk &, ExpressionState &, Vector &result) {
+    result.SetVectorType(VectorType::CONSTANT_VECTOR);
+    ConstantVector::SetNull(result, false);
+    ConstantVector::GetData<uint64_t>(result)[0] = 1;
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Native Oracle TNS/TTC connectivity for DuckDB");
 	RegisterOracleScannerVersion(loader);
+    loader.RegisterFunction(ScalarFunction("oracle_scanner_io_deadline_version", {}, LogicalType::UBIGINT,
+                                           OracleIoDeadlineVersion));
 	RegisterOracleSecrets(loader);
 	RegisterOracleQuery(loader);
 	RegisterOracleAttachedCatalog(loader);

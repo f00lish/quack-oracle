@@ -10,6 +10,7 @@
 namespace oracle_scanner {
 
 namespace {
+thread_local std::optional<std::chrono::steady_clock::time_point> transport_deadline;
 
 std::mutex &FactoryLock() {
     static std::mutex lock;
@@ -28,9 +29,17 @@ OracleHostResolver &InstalledResolver() {
 
 } // namespace
 
+std::optional<std::chrono::steady_clock::time_point> OracleTransportConnectDeadline() { return transport_deadline; }
+
 std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_t port,
                                                 uint32_t connect_timeout_seconds, uint32_t read_timeout_seconds,
-                                                bool use_tls, const TlsConfiguration &tls) {
+                                                bool use_tls, const TlsConfiguration &tls,
+                                                std::optional<std::chrono::steady_clock::time_point> deadline) {
+    struct RestoreDeadline {
+        std::optional<std::chrono::steady_clock::time_point> previous = transport_deadline;
+        ~RestoreDeadline() { transport_deadline = previous; }
+    } restore;
+    if (deadline && (!transport_deadline || *deadline < *transport_deadline)) { transport_deadline = deadline; }
     OracleTransportFactory factory;
     {
         std::lock_guard<std::mutex> guard(FactoryLock());

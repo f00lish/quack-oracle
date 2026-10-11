@@ -235,6 +235,10 @@ public:
     ConnectRun(const ConnectionConfig &config_p, const TlsConfiguration &tls_p)
         : config(config_p), tls(tls_p), environment(CurrentOracleConnectEnvironment()) {
         deadline = environment.now() + std::chrono::seconds(EffectiveConnectBudgetSeconds(config));
+        if (config.io_deadline) {
+            const auto caller_deadline = config.io_deadline->Get();
+            if (caller_deadline) { deadline = std::min(deadline,*caller_deadline); }
+        }
         auto shared = std::make_shared<ConnectLimits>();
         shared->environment = environment;
         shared->deadline = deadline;
@@ -376,7 +380,8 @@ private:
             std::unique_ptr<ByteStream> stream;
             try {
                 stream = OpenOracleTransport(address, target.port, AttemptTimeoutSeconds(), config.read_timeout_seconds,
-                                             target.protocol == TransportProtocol::TCPS, attempt_tls);
+                                             target.protocol == TransportProtocol::TCPS, attempt_tls,
+                                             config.io_deadline ? config.io_deadline->Get() : std::nullopt);
             } catch (const OracleConnectError &error) {
                 attempts.AddFailure(target, address, error);
                 remember(error, depth);
@@ -393,6 +398,9 @@ private:
                 attempts.AddFailure(target, address, unreachable);
                 remember(unreachable, depth);
                 continue;
+            }
+            if (config.io_deadline) {
+                stream = std::make_unique<OracleDeadlineStream>(std::move(stream),config.io_deadline);
             }
             auto *establishment = new EstablishmentStream(std::move(stream), limits);
             stream.reset(establishment);

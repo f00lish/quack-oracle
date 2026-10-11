@@ -7,6 +7,7 @@
 #endif
 
 #include "oracle_scanner/byte_stream.hpp"
+#include "oracle_scanner/transport_factory.hpp"
 #include "oracle_scanner/connect_error.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
@@ -426,7 +427,8 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     const auto endpoint = HostAndPort(host, port);
     // One deadline for this attempt: the TCP connect and the TLS handshake
     // share connect_timeout_seconds between them, as they always did.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(connect_timeout_seconds);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(connect_timeout_seconds);
+    if (OracleTransportConnectDeadline()) { deadline = std::min(deadline,*OracleTransportConnectDeadline()); }
 
     // TCP first, on its own BIO, driven by hand rather than by
     // BIO_do_connect_retry. That helper resets and retries a refused connect
@@ -442,6 +444,10 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     // SIGPIPE here just as an ordinary write would.
     const ScopedSigPipeBlock no_sigpipe;
     while (true) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw OracleConnectError(ProtocolErrorKind::TRUNCATED,ConnectFailure::BUDGET_EXHAUSTED,
+                                     "Oracle TCP establishment deadline expired");
+        }
         ERR_clear_error();
         if (BIO_do_connect(result->bio) > 0) {
             break;
@@ -518,6 +524,10 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
             RequireOpenSsl(SSL_set1_host(ssl, server_name.c_str()), "setting TLS hostname verification");
         }
         while (true) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw OracleConnectError(ProtocolErrorKind::TRUNCATED,ConnectFailure::BUDGET_EXHAUSTED,
+                                         "Oracle TLS establishment deadline expired");
+            }
             ERR_clear_error();
             if (BIO_do_handshake(result->bio) > 0) {
                 break;
@@ -650,6 +660,9 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
     const ScopedSigPipeBlock no_sigpipe;
     const auto requested = static_cast<int>((std::min)(maximum_size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
+        if (implementation->deadline && std::chrono::steady_clock::now() >= *implementation->deadline) {
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED,"Oracle IO deadline expired");
+        }
         // The SSL BIO derives retry flags through SSL_get_error, which requires
         // an empty error queue before this operation (even on a healthy socket).
         ERR_clear_error();
@@ -691,6 +704,9 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
     const ScopedSigPipeBlock no_sigpipe;
     const auto requested = static_cast<int>((std::min)(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
+        if (implementation->deadline && std::chrono::steady_clock::now() >= *implementation->deadline) {
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED,"Oracle IO deadline expired");
+        }
         ERR_clear_error();
         const auto count = BIO_write(implementation->bio, source, requested);
         if (count > 0) {
@@ -719,6 +735,9 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
 #else
     const ScopedSigPipeBlock no_sigpipe;
     while (true) {
+        if (implementation->deadline && std::chrono::steady_clock::now() >= *implementation->deadline) {
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED,"Oracle IO deadline expired");
+        }
         const auto sent = send(implementation->socket_fd, &value, 1, MSG_OOB);
         if (sent == 1) {
             return;

@@ -3,6 +3,7 @@
 // transport work.
 
 #include "oracle_adapter.hpp"
+#include "oracle_io_deadline.hpp"
 
 #include "oracle_scanner/descriptor_parser.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
@@ -57,6 +58,7 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
         throw BinderException("Secret '%s' is not an Oracle secret", secret_name);
     }
     ConnectionConfig config;
+    config.io_deadline = OracleIoDeadlineFor(context);
     config.user = RequireString(*secret, "user");
     password = RequireString(*secret, "password");
     config.connect_timeout_seconds = OptionalUInt(*secret, "connect_timeout", 10);

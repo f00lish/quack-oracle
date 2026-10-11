@@ -5,6 +5,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "oracle_scanner/io_deadline.hpp"
 
 namespace oracle_scanner {
 
@@ -70,6 +71,8 @@ struct ConnectRouting {
 };
 
 struct ConnectionConfig {
+    // Caller-owned IO budget; excluded from secrets, target keys and pooling.
+    std::shared_ptr<OracleIoDeadline> io_deadline;
     // The single-address form, kept for HOST/PORT/SERVICE_NAME secrets. When
     // routing.address_lists is non-empty, host is empty and port is unused.
     std::string host;

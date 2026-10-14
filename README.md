@@ -722,6 +722,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
+| `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_filter_pushdown` | `false` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS

@@ -398,6 +398,38 @@ else — LOBs included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
 column is refused too: cast to `DECIMAL` or text first, because binary floats
 are not exact.
 
+### Session reuse between transactions
+
+Each DuckDB transaction on an attached catalog still gets an Oracle session of
+its own, held until its `COMMIT` or `ROLLBACK`. What changes with
+`oracle_transaction_pool_size` (default 2) is where that session comes from: the
+catalog keeps up to that many idle sessions, and the next transaction takes one
+instead of connecting and authenticating again. The pool belongs to the attached
+catalog, not to a DuckDB connection, so it serves transactions that each run on
+a connection of their own — which is how DuckLake drives its metadata catalog.
+Every session in it was opened from the one secret the catalog resolved at
+`ATTACH`, so two catalogs, users or secrets never share one.
+
+A session goes back only after Oracle acknowledged the transaction's `COMMIT` or
+`ROLLBACK`, and only if it is clean: no statement still open, no cancel pending,
+no exchange that failed, nobody else still holding it, and no stored procedure
+run through `oracle_call_named_transaction` (which can change the session's own
+state). Anything else is closed: a failed statement, a `COMMIT` whose outcome is
+unknown, a rollback that failed. The dictionary reads `ATTACH` makes use the same
+pool and end with a `ROLLBACK` before their session goes back.
+
+Before an idle session is handed out it must answer `SELECT 1 FROM DUAL`. That
+probe is the only thing sent on it before the transaction's own work, so a
+session that died while idle — killed on the server, timed out — is replaced
+without any statement of the transaction having been sent; once the transaction
+has started, a failure is reported, never retried. Idle sessions are closed
+after five minutes, and all of them when the catalog is detached. Each lease
+follows its own caller's interrupt and IO deadline.
+
+Not reset between transactions: package state a function called from a
+`SELECT` may have changed. Statements that change session settings cannot be
+sent through the transaction functions.
+
 ### Through `oracle_execute`
 
 ```sql
@@ -493,10 +525,12 @@ their own shard, so nothing is dropped.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
+| `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
 | `oracle_filter_pushdown` | `false` | See §5. |
 
 Pooling matters more than it looks: opening a session costs a full TNS handshake
-and authentication. Writes and callables always open their own session.
+and authentication. Callables through a secret always open their own session;
+the attached catalog's transactions reuse sessions as §6 describes.
 
 ---
 

@@ -10,6 +10,10 @@
 #include "oracle_scanner/protocol_error.hpp"
 
 namespace oracle_scanner {
+class OracleIoDeadline;
+}
+
+namespace oracle_scanner {
 
 struct OracleError {
     uint32_t code = 0;
@@ -121,6 +125,19 @@ public:
     virtual void Rollback() = 0;
     virtual void Cancel() = 0;
     virtual void Close() = 0;
+    // Whether this session can serve another caller now: open, with no
+    // cancel pending, no failed exchange that may have left a response unread,
+    // and no statement still open. Only a session that answers true, after a
+    // confirmed COMMIT or ROLLBACK, may be handed to the next transaction.
+    virtual bool ReadyForReuse() const {
+        return false;
+    }
+    // Points the session at another caller's IO deadline, or at none. Only a
+    // session opened with a deadline binding can follow a new caller; it
+    // answers false otherwise, and then it must not be reused.
+    virtual bool BindIoDeadline(std::shared_ptr<OracleIoDeadline>) {
+        return false;
+    }
 };
 
 } // namespace oracle_scanner

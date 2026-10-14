@@ -28,6 +28,7 @@
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 
+#include "oracle_scanner/io_deadline_binding.hpp"
 #include "oracle_scanner/session_factory.hpp"
 
 #include <mutex>
@@ -39,6 +40,63 @@ using oracle_scanner::OpenOracleSession;
 
 namespace {
 
+// A session for dictionary reads, outside any DuckDB transaction. With the
+// catalog's transaction pool it is leased from there, and given back only
+// after an acknowledged ROLLBACK ends whatever the reads may have begun; any
+// failure closes it. Without a pool it is a session of its own, as before.
+class OracleMetadataLease {
+public:
+    OracleMetadataLease(const std::shared_ptr<oracle_scanner::OracleTransactionSessionPool> &pool_p,
+                        const ConnectionConfig &config, const std::string &password)
+        : pool(pool_p) {
+        session = pool ? pool->Acquire(nullptr) : std::shared_ptr<OracleSession>(OpenOracleSession(config, password));
+    }
+    ~OracleMetadataLease() {
+        if (!session) {
+            return;
+        }
+        if (pool) {
+            pool->Discard(std::move(session));
+            return;
+        }
+        try {
+            session->Close();
+        } catch (...) {
+        }
+    }
+    OracleMetadataLease(const OracleMetadataLease &) = delete;
+    OracleMetadataLease &operator=(const OracleMetadataLease &) = delete;
+
+    OracleSession *operator->() const {
+        return session.get();
+    }
+
+    // Called once the reads succeeded and their cursors are closed.
+    void Finish() {
+        if (!pool) {
+            auto finished = std::move(session);
+            finished->Close();
+            return;
+        }
+        if (!session->ReadyForReuse()) {
+            // It will be closed anyway, and closing ends whatever it began.
+            pool->Discard(std::move(session));
+            return;
+        }
+        try {
+            session->Rollback();
+        } catch (...) {
+            pool->Discard(std::move(session));
+            return;
+        }
+        pool->Release(std::move(session));
+    }
+
+private:
+    std::shared_ptr<oracle_scanner::OracleTransactionSessionPool> pool;
+    std::shared_ptr<OracleSession> session;
+};
+
 // ATTACH keeps no shared TTC channel. Metadata discovery and every scan open
 // their own native session, matching oracle_query's proven ownership model.
 // This makes the initial catalog explicitly read-only and avoids pretending
@@ -46,6 +104,15 @@ namespace {
 struct OracleAttachedState {
     ConnectionConfig config;
     std::string password;
+    // Idle transaction sessions kept between this catalog's transactions; see
+    // OracleTransactionSessionPool. Null when oracle_transaction_pool_size is 0.
+    std::shared_ptr<oracle_scanner::OracleTransactionSessionPool> transaction_pool;
+
+    ~OracleAttachedState() {
+        if (transaction_pool) {
+            transaction_pool->Close();
+        }
+    }
     // The name the ATTACH resolved, so scans of this catalog share one pool.
     std::string secret_name;
     std::string current_schema;
@@ -65,7 +132,7 @@ struct OracleAttachedState {
     mutable std::unordered_map<std::string, std::vector<std::string>> primary_key_cache;
 
     void ConnectAndDiscoverSchema() {
-        auto session = OpenOracleSession(config, password);
+        OracleMetadataLease session(transaction_pool, config, password);
         auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read the current schema",
                                               [&] { return session->Query("SELECT USER FROM DUAL", {}); });
         const auto batch = TranslatingOracleErrors("Oracle ATTACH could not read the current schema",
@@ -75,7 +142,7 @@ struct OracleAttachedState {
         }
         current_schema.assign(batch.rows[0][0]->begin(), batch.rows[0][0]->end());
         cursor->Close();
-        session->Close();
+        session.Finish();
         if (current_schema.empty()) {
             throw IOException("Oracle ATTACH received an empty current schema");
         }
@@ -91,7 +158,7 @@ struct OracleAttachedState {
             return object_names;
         }
         const auto append_names = [&](const std::string &sql) {
-            auto session = OpenOracleSession(config, password);
+            OracleMetadataLease session(transaction_pool, config, password);
             auto cursor = TranslatingOracleErrors("Oracle ATTACH could not enumerate objects",
                                                   [&] { return session->Query(sql, {}); });
             for (;;) {
@@ -107,7 +174,7 @@ struct OracleAttachedState {
                 }
             }
             cursor->Close();
-            session->Close();
+            session.Finish();
         };
         append_names("SELECT table_name FROM user_tables WHERE ROWNUM <= " + std::to_string(maximum_objects));
         if (object_names.size() < maximum_objects) {
@@ -216,7 +283,7 @@ struct OracleAttachedState {
     void LoadSchemaColumnsOnceLocked() const {
         constexpr size_t maximum_columns = 1U << 16U;
         metadata_loaded = true;
-        auto session = OpenOracleSession(config, password);
+        OracleMetadataLease session(transaction_pool, config, password);
         auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read schema metadata", [&] {
             return session->Query("SELECT table_name, column_name, data_type, data_length, data_precision, "
                                   "data_scale, nullable FROM user_tab_columns ORDER BY table_name, column_id",
@@ -249,7 +316,7 @@ struct OracleAttachedState {
             }
         }
         cursor->Close();
-        session->Close();
+        session.Finish();
         metadata_complete = !truncated;
     }
 
@@ -264,7 +331,7 @@ struct OracleAttachedState {
                 name_literal.push_back('\'');
             }
         }
-        auto session = OpenOracleSession(config, password);
+        OracleMetadataLease session(transaction_pool, config, password);
         const auto metadata_sql = "SELECT column_name, data_type, data_length, data_precision, data_scale, nullable "
                                   "FROM user_tab_columns WHERE table_name = '" +
                                   name_literal + "' ORDER BY column_id";
@@ -282,7 +349,7 @@ struct OracleAttachedState {
             }
         }
         cursor->Close();
-        session->Close();
+        session.Finish();
         return columns;
     }
 
@@ -293,7 +360,7 @@ struct OracleAttachedState {
     void LoadPrimaryKeysLocked() const {
         primary_keys_loaded = true;
         try {
-            auto session = OpenOracleSession(config, password);
+            OracleMetadataLease session(transaction_pool, config, password);
             auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read primary keys", [&] {
                 return session->Query("SELECT c.table_name, k.column_name FROM user_constraints c JOIN "
                                       "user_cons_columns k ON k.constraint_name = c.constraint_name AND "
@@ -317,7 +384,7 @@ struct OracleAttachedState {
                 }
             }
             cursor->Close();
-            session->Close();
+            session.Finish();
         } catch (const std::exception &) {
             // A partial key list would name some columns of a composite key,
             // which is a different and false constraint.
@@ -527,6 +594,7 @@ public:
         target.object_name = object_name;
         target.config = state->config;
         target.password = state->password;
+        target.pool = state->transaction_pool;
         return target;
     }
 
@@ -576,7 +644,12 @@ public:
     }
 
     OracleWriteTarget WriteTarget() {
-        return {static_cast<const std::string &>(GetAttached().GetName()), std::string(), state->config, state->password};
+        OracleWriteTarget target;
+        target.catalog_name = static_cast<const std::string &>(GetAttached().GetName());
+        target.config = state->config;
+        target.password = state->password;
+        target.pool = state->transaction_pool;
+        return target;
     }
 
     PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
@@ -631,6 +704,38 @@ private:
     shared_ptr<OracleAttachedState> state;
 };
 
+constexpr int64_t ORACLE_TRANSACTION_POOL_DEFAULT_SIZE = 2;
+constexpr int64_t ORACLE_TRANSACTION_POOL_MAXIMUM_SIZE = 64;
+
+// The attached catalog's pool of transaction sessions. Sessions are opened from
+// the secret resolved at ATTACH, like every session of this catalog, with the
+// ATTACH context's deadline source replaced by a binding each transaction
+// points at its own caller.
+std::shared_ptr<oracle_scanner::OracleTransactionSessionPool>
+MakeOracleTransactionPool(ClientContext &context, const ConnectionConfig &config, const std::string &password) {
+    Value setting;
+    int64_t size = ORACLE_TRANSACTION_POOL_DEFAULT_SIZE;
+    if (context.TryGetCurrentSetting("oracle_transaction_pool_size", setting) && !setting.IsNull()) {
+        size = setting.GetValue<int64_t>();
+    }
+    if (size < 0 || size > ORACLE_TRANSACTION_POOL_MAXIMUM_SIZE) {
+        throw BinderException("oracle_transaction_pool_size must be between 0 and %lld",
+                              static_cast<long long>(ORACLE_TRANSACTION_POOL_MAXIMUM_SIZE));
+    }
+    if (size == 0) {
+        return nullptr;
+    }
+    auto pooled = config;
+    pooled.io_deadline = nullptr;
+    return std::make_shared<oracle_scanner::OracleTransactionSessionPool>(
+        static_cast<size_t>(size),
+        [pooled, password](std::shared_ptr<oracle_scanner::OracleIoDeadlineBinding> binding) {
+            auto opened = pooled;
+            opened.io_deadline_binding = std::move(binding);
+            return std::shared_ptr<OracleSession>(OpenOracleSession(opened, password));
+        });
+}
+
 unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                                                  AttachedDatabase &db, const string &, AttachInfo &info,
                                                  AttachOptions &options) {
@@ -653,6 +758,7 @@ unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInf
     state->config = ConnectionFromSecret(context, info.path, password);
     state->password = std::move(password);
     state->secret_name = info.path;
+    state->transaction_pool = MakeOracleTransactionPool(context, state->config, state->password);
     // DuckDB's attached-database wrapper owns a local StorageManager even for
     // a custom catalog. Keep that storage in memory: the ATTACH path is a
     // secret name, never a local database file.
@@ -792,6 +898,11 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
                             "Send WHERE predicates on an attached Oracle table to Oracle. Only filters whose Oracle "
                             "meaning is provably identical are translated; anything else raises.",
                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+    DBConfig::GetConfig(loader.GetDatabaseInstance())
+        .AddExtensionOption("oracle_transaction_pool_size",
+                            "How many idle Oracle sessions an attached catalog keeps between its transactions, so a "
+                            "transaction need not connect and authenticate again. Read at ATTACH; 0 disables reuse.",
+                            LogicalType::BIGINT, Value::BIGINT(ORACLE_TRANSACTION_POOL_DEFAULT_SIZE));
     auto extension = make_shared_ptr<StorageExtension>();
     extension->attach = OracleAttachedCatalogAttach;
     extension->create_transaction_manager = OracleAttachedCatalogTransactionManager;

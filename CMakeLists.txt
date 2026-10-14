@@ -99,7 +99,8 @@ set(EXTENSION_SOURCES
     src/statement_registry.cpp
     src/call_registry.cpp
     src/transaction.cpp
-    src/session_pool.cpp)
+    src/session_pool.cpp
+    src/transaction_session_pool.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -178,7 +179,8 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/statement_registry.cpp
                  src/call_registry.cpp
                  src/transaction.cpp
-                 src/session_pool.cpp)
+                 src/session_pool.cpp
+                 src/transaction_session_pool.cpp)
   target_link_libraries(oracle_scanner_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto duckdb_miniz)
   target_include_directories(oracle_scanner_protocol_test PRIVATE src/include ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
   target_compile_features(oracle_scanner_protocol_test PRIVATE cxx_std_17)

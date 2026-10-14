@@ -86,4 +86,12 @@ void ValidatedOracleSession::Close() {
     }
 }
 
+bool ValidatedOracleSession::ReadyForReuse() const {
+    return inner && inner->ReadyForReuse();
+}
+
+bool ValidatedOracleSession::BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) {
+    return inner && inner->BindIoDeadline(std::move(source));
+}
+
 } // namespace oracle_scanner

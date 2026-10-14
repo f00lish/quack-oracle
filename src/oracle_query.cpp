@@ -1670,6 +1670,9 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
     OracleCallerInterruptScope interrupt(context);
     try {
         auto &session = TransactionSession(context, target);
+        // A procedure can change package state, NLS or the current schema of
+        // the session itself; the session ends closed rather than reused.
+        TaintTransactionSession(context, target.catalog_name);
         auto result = session.Call(bind.procedure, bind.arguments);
         if (!result.explicit_cursors.empty() || !result.implicit_cursors.empty()) {
             for (auto &cursor : result.explicit_cursors) { cursor->Close(); }

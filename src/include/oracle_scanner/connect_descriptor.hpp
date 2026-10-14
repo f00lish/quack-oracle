@@ -9,6 +9,8 @@
 
 namespace oracle_scanner {
 
+class OracleIoDeadlineBinding;
+
 enum class TransportProtocol { TCP, TCPS };
 
 // One listener endpoint as the configuration names it. `host` is a DNS name or
@@ -73,6 +75,10 @@ struct ConnectRouting {
 struct ConnectionConfig {
     // Caller-owned IO budget; excluded from secrets, target keys and pooling.
     std::shared_ptr<OracleIoDeadline> io_deadline;
+    // Set instead, for a session reused across callers: the deadline is read
+    // through it, so it can be rebound to each caller in turn. Excluded from
+    // secrets, target keys and pooling like io_deadline.
+    std::shared_ptr<OracleIoDeadlineBinding> io_deadline_binding;
     // The single-address form, kept for HOST/PORT/SERVICE_NAME secrets. When
     // routing.address_lists is non-empty, host is empty and port is unused.
     std::string host;

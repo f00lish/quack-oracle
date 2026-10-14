@@ -4,6 +4,7 @@
 #include "oracle_scanner/connect_error.hpp"
 #include "oracle_scanner/connect_plan.hpp"
 #include "oracle_scanner/descriptor_parser.hpp"
+#include "oracle_scanner/io_deadline_binding.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/transport_factory.hpp"
 
@@ -235,7 +236,10 @@ public:
     ConnectRun(const ConnectionConfig &config_p, const TlsConfiguration &tls_p)
         : config(config_p), tls(tls_p), environment(CurrentOracleConnectEnvironment()) {
         deadline = environment.now() + std::chrono::seconds(EffectiveConnectBudgetSeconds(config));
-        if (config.io_deadline) {
+        if (config.io_deadline_binding) {
+            const auto caller_deadline = config.io_deadline_binding->Get();
+            if (caller_deadline) { deadline = (std::min)(deadline,*caller_deadline); }
+        } else if (config.io_deadline) {
             const auto caller_deadline = config.io_deadline->Get();
             if (caller_deadline) { deadline = (std::min)(deadline,*caller_deadline); }
         }
@@ -379,9 +383,15 @@ private:
             BeforeAttempt();
             std::unique_ptr<ByteStream> stream;
             try {
-                stream = OpenOracleTransport(address, target.port, AttemptTimeoutSeconds(), config.read_timeout_seconds,
+                if (config.io_deadline_binding) {
+                    stream = OpenOracleTransport(address, target.port, AttemptTimeoutSeconds(), config.read_timeout_seconds,
+                                                 target.protocol == TransportProtocol::TCPS, attempt_tls,
+                                                 config.io_deadline_binding->Get(), config.io_deadline_binding);
+                } else {
+                    stream = OpenOracleTransport(address, target.port, AttemptTimeoutSeconds(), config.read_timeout_seconds,
                                              target.protocol == TransportProtocol::TCPS, attempt_tls,
                                              config.io_deadline ? config.io_deadline->Get() : std::nullopt, config.io_deadline);
+                }
             } catch (const OracleConnectError &error) {
                 attempts.AddFailure(target, address, error);
                 remember(error, depth);
@@ -399,7 +409,9 @@ private:
                 remember(unreachable, depth);
                 continue;
             }
-            if (config.io_deadline) {
+            if (config.io_deadline_binding) {
+                stream = std::make_unique<OracleBoundDeadlineStream>(std::move(stream), config.io_deadline_binding);
+            } else if (config.io_deadline) {
                 stream = std::make_unique<OracleDeadlineStream>(std::move(stream),config.io_deadline);
             }
             auto *establishment = new EstablishmentStream(std::move(stream), limits);

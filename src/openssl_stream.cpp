@@ -1,4 +1,5 @@
 #include "oracle_scanner/io_deadline.hpp"
+#include "oracle_scanner/io_deadline_binding.hpp"
 #include <mutex>
 // Before any include. Windows defines min and max as function-like macros, and
 // OpenSSL's own headers pull in <windows.h> on that platform — so defining this
@@ -115,11 +116,14 @@ struct OpenSslByteStream::Impl {
     std::optional<std::chrono::steady_clock::time_point> deadline;
 
     std::shared_ptr<OracleIoDeadline> source;
+    // Read instead of source by a session that can change callers; see
+    // OracleIoDeadlineBinding.
+    std::shared_ptr<OracleIoDeadlineBinding> binding;
     mutable std::mutex deadline_lock;
     std::optional<std::chrono::steady_clock::time_point> EffectiveDeadline() const {
         std::optional<std::chrono::steady_clock::time_point> result;
         { std::lock_guard<std::mutex> guard(deadline_lock); result = deadline; }
-        const auto caller = source ? source->Get() : std::nullopt;
+        const auto caller = binding ? binding->Get() : source ? source->Get() : std::nullopt;
         if (caller && (!result || *caller < *result)) { result = caller; }
         return result;
     }
@@ -322,7 +326,9 @@ static timeval StepTimeout(uint32_t timeout_seconds,
 
 static bool WaitForBio(BIO *bio, uint32_t timeout_seconds,
                        const std::optional<std::chrono::steady_clock::time_point> &deadline,
-                       const std::shared_ptr<OracleIoDeadline> &source) {
+                       const std::shared_ptr<OracleIoDeadline> &source,
+                       const std::shared_ptr<OracleIoDeadlineBinding> &binding) {
+    const bool polled = source || binding;
     int socket_fd = -1;
     if (BIO_get_fd(bio, &socket_fd) < 0 || socket_fd < 0) { return false; }
     const auto want_read = BIO_should_read(bio);
@@ -333,12 +339,12 @@ static bool WaitForBio(BIO *bio, uint32_t timeout_seconds,
     if (deadline && *deadline < limit) { limit = *deadline; }
     while (true) {
         auto effective = limit;
-        const auto caller = source ? source->Get() : std::nullopt;
+        const auto caller = binding ? binding->Get() : source ? source->Get() : std::nullopt;
         if (caller && *caller < effective) { effective = *caller; }
         const auto now = std::chrono::steady_clock::now();
         if (now >= effective) { return false; }
         auto wait = std::chrono::duration_cast<std::chrono::microseconds>(effective - now);
-        if (source) { wait = (std::min)(wait, std::chrono::microseconds(50000)); }
+        if (polled) { wait = (std::min)(wait, std::chrono::microseconds(50000)); }
         fd_set readable, writable;
         FD_ZERO(&readable); FD_ZERO(&writable);
         if (want_read) { FD_SET(socket_fd, &readable); }
@@ -349,7 +355,7 @@ static bool WaitForBio(BIO *bio, uint32_t timeout_seconds,
         const auto ready = select(socket_fd + 1, want_read ? &readable : nullptr,
                                   want_write ? &writable : nullptr, nullptr, &timeout);
         if (ready > 0) { return true; }
-        if (ready < 0 || !source) { return false; }
+        if (ready < 0 || !polled) { return false; }
     }
 }
 
@@ -442,6 +448,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     }
     auto result = std::make_unique<Impl>();
     result->source = OracleTransportIoDeadlineSource();
+    result->binding = OracleTransportIoDeadlineBinding();
     result->read_timeout_seconds = read_timeout_seconds;
     result->use_tls = use_tls;
     const auto endpoint = HostAndPort(host, port);
@@ -713,7 +720,8 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
                 "Oracle TCP read failed (socket error " + std::to_string(socket_error) +
                 ", TLS reason " + std::to_string(ERR_GET_REASON(tls_error)) + ")");
         }
-        if (!WaitForBio(implementation->bio, implementation->read_timeout_seconds, deadline, implementation->source)) {
+        if (!WaitForBio(implementation->bio, implementation->read_timeout_seconds, deadline, implementation->source,
+                        implementation->binding)) {
             ERR_clear_error();
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle TCP read timed out");
         }
@@ -737,7 +745,8 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
             return static_cast<size_t>(count);
         }
         if (!BIO_should_retry(implementation->bio) ||
-            !WaitForBio(implementation->bio, implementation->read_timeout_seconds, deadline, implementation->source)) {
+            !WaitForBio(implementation->bio, implementation->read_timeout_seconds, deadline, implementation->source,
+                        implementation->binding)) {
             ERR_clear_error();
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TCP write failed or timed out");
         }

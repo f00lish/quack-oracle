@@ -9,6 +9,7 @@
 #include "oracle_scanner/session.hpp"
 #include "oracle_scanner/session_pool.hpp"
 #include "oracle_scanner/tns_client.hpp"
+#include "oracle_scanner/transaction_session_pool.hpp"
 #include "oracle_scanner/value_codec.hpp"
 
 #include "duckdb.hpp"
@@ -307,10 +308,16 @@ struct OracleWriteTarget {
     std::string object_name;
     ConnectionConfig config;
     std::string password;
+    // The attached catalog's pool of transaction sessions, or null when the
+    // pool is disabled. Every session in it was opened from config and password.
+    std::shared_ptr<oracle_scanner::OracleTransactionSessionPool> pool;
 };
 
 OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::string &catalog_name);
 void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name);
+// Marks the pinned session as one that must not be reused: the transaction
+// ran something, such as a stored procedure, that can leave session state.
+void TaintTransactionSession(ClientContext &context, const std::string &catalog_name);
 void RollbackOracleTransaction(ClientContext &context, const std::string &catalog_name) noexcept;
 
 //! Converts one DuckDB value into a bind for a specific Oracle column. The

@@ -1,6 +1,7 @@
 #include "oracle_scanner/transport_factory.hpp"
 #include "oracle_scanner/connect_error.hpp"
 #include "oracle_scanner/connect_plan.hpp"
+#include "oracle_scanner/io_deadline_binding.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
 #include <algorithm>
@@ -15,6 +16,11 @@ namespace {
 std::shared_ptr<OracleIoDeadline> &TransportSource() {
     thread_local std::shared_ptr<OracleIoDeadline> source;
     return source;
+}
+
+std::shared_ptr<OracleIoDeadlineBinding> &TransportBinding() {
+    thread_local std::shared_ptr<OracleIoDeadlineBinding> binding;
+    return binding;
 }
 
 std::optional<std::chrono::steady_clock::time_point> &TransportDeadline() {
@@ -43,11 +49,27 @@ std::optional<std::chrono::steady_clock::time_point> OracleTransportConnectDeadl
 
 std::shared_ptr<OracleIoDeadline> OracleTransportIoDeadlineSource() { return TransportSource(); }
 
+std::shared_ptr<OracleIoDeadlineBinding> OracleTransportIoDeadlineBinding() { return TransportBinding(); }
+
 std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_t port,
                                                 uint32_t connect_timeout_seconds, uint32_t read_timeout_seconds,
                                                 bool use_tls, const TlsConfiguration &tls,
                                                 std::optional<std::chrono::steady_clock::time_point> deadline) {
-    return OpenOracleTransport(host, port, connect_timeout_seconds, read_timeout_seconds, use_tls, tls, deadline, nullptr);
+    return OpenOracleTransport(host, port, connect_timeout_seconds, read_timeout_seconds, use_tls, tls, deadline,
+                               std::shared_ptr<OracleIoDeadline>());
+}
+
+std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_t port,
+    uint32_t connect_timeout_seconds, uint32_t read_timeout_seconds, bool use_tls,
+    const TlsConfiguration &tls, std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::shared_ptr<OracleIoDeadlineBinding> binding) {
+    struct RestoreBinding {
+        std::shared_ptr<OracleIoDeadlineBinding> previous = TransportBinding();
+        ~RestoreBinding() { TransportBinding() = std::move(previous); }
+    } restore_binding;
+    TransportBinding() = std::move(binding);
+    return OpenOracleTransport(host, port, connect_timeout_seconds, read_timeout_seconds, use_tls, tls, deadline,
+                               std::shared_ptr<OracleIoDeadline>());
 }
 
 std::unique_ptr<ByteStream> OpenOracleTransport(const std::string &host, uint16_t port,

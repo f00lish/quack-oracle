@@ -52,15 +52,28 @@ using oracle_scanner::OpenOracleSession;
 namespace {
 
 // One pinned session per attached Oracle catalog, for the life of the DuckDB
-// transaction. In autocommit each statement is its own transaction, so this
-// opens and commits one session per statement, which is what the read path
-// already does per scan.
-struct OracleWriteState final : ClientContextState {
-    std::mutex lock;
+// transaction. In autocommit each statement is its own transaction, so each
+// statement pins one session and ends it at its COMMIT; with the attached
+// catalog's transaction pool that session is a reused one rather than a new
+// connect, but it is still one session per transaction, never shared.
+struct PinnedOracleSession {
     // Shared rather than owned outright because a read in the same transaction
     // borrows it, and a write that fails discards it while that read may still
     // hold an open cursor on it. The last user decides when it dies.
-    std::unordered_map<std::string, std::shared_ptr<OracleSession>> pinned;
+    std::shared_ptr<OracleSession> session;
+    // The attached catalog's pool, when the session came from one. Weak, so a
+    // catalog detached mid-transaction leaves this session to be closed.
+    std::weak_ptr<oracle_scanner::OracleTransactionSessionPool> pool;
+    bool pooled = false;
+    // Set once the transaction ran something that can change the session's
+    // own state beyond its transaction, such as a stored procedure. Such a
+    // session ends closed rather than reused.
+    bool tainted = false;
+};
+
+struct OracleWriteState final : ClientContextState {
+    std::mutex lock;
+    std::unordered_map<std::string, PinnedOracleSession> pinned;
     std::unordered_set<std::string> failed;
     std::unordered_map<std::string, OracleTransactionStatus> status;
 
@@ -71,20 +84,78 @@ struct OracleWriteState final : ClientContextState {
         }
         const auto existing = pinned.find(target.catalog_name);
         if (existing != pinned.end()) {
-            return *existing->second;
+            return *existing->second.session;
         }
-        auto session = TranslatingOracleErrors("Oracle write could not open a session", [&] {
-            return std::shared_ptr<OracleSession>(OpenOracleSession(target.config, target.password));
-        });
-        auto &reference = *session;
-        pinned.emplace(target.catalog_name, std::move(session));
+        PinnedOracleSession entry;
+        if (target.pool) {
+            // Leased before any of the transaction's statements; a reused
+            // session has just answered its probe, and one that did not was
+            // replaced without anything of this transaction being sent.
+            entry.session = TranslatingOracleErrors("Oracle write could not open a session", [&] {
+                return target.pool->Acquire(target.config.io_deadline);
+            });
+            entry.pool = target.pool;
+            entry.pooled = true;
+        } else {
+            entry.session = TranslatingOracleErrors("Oracle write could not open a session", [&] {
+                return std::shared_ptr<OracleSession>(OpenOracleSession(target.config, target.password));
+            });
+        }
+        auto &reference = *entry.session;
+        pinned.emplace(target.catalog_name, std::move(entry));
         status[target.catalog_name] = OracleTransactionStatus();
         status[target.catalog_name].connection_state = "active";
         return reference;
     }
 
+    void Taint(const std::string &catalog_name) {
+        std::lock_guard<std::mutex> guard(lock);
+        const auto entry = pinned.find(catalog_name);
+        if (entry != pinned.end()) {
+            entry->second.tainted = true;
+        }
+    }
+
+    // After an acknowledged COMMIT or ROLLBACK only: back to the pool when the
+    // session is clean, closed otherwise.
+    static void End(PinnedOracleSession entry) noexcept {
+        if (entry.pooled && !entry.tainted) {
+            if (auto pool = entry.pool.lock()) {
+                pool->Release(std::move(entry.session));
+                return;
+            }
+        }
+        Close(std::move(entry));
+    }
+
+    // Closed, never reused: poisoned, an unknown COMMIT, a failed rollback.
+    static void Close(PinnedOracleSession entry) noexcept {
+        if (entry.pooled) {
+            if (auto pool = entry.pool.lock()) {
+                pool->Discard(std::move(entry.session));
+                return;
+            }
+        }
+        try {
+            entry.session->Close();
+        } catch (...) {
+        }
+    }
+
+    // Ends one transaction by ROLLBACK. Only an acknowledged rollback lets the
+    // session be reused.
+    static void RollBack(PinnedOracleSession entry) noexcept {
+        try {
+            entry.session->Rollback();
+        } catch (...) {
+            Close(std::move(entry));
+            return;
+        }
+        End(std::move(entry));
+    }
+
     void Discard(const std::string &catalog_name, bool poison = false) noexcept {
-        std::shared_ptr<OracleSession> session;
+        PinnedOracleSession entry;
         {
             std::lock_guard<std::mutex> guard(lock);
             if (poison) {
@@ -96,31 +167,26 @@ struct OracleWriteState final : ClientContextState {
                     status[catalog_name].connection_state = "idle";
                 }
             }
-            const auto entry = pinned.find(catalog_name);
-            if (entry == pinned.end()) {
+            const auto found = pinned.find(catalog_name);
+            if (found == pinned.end()) {
                 return;
             }
-            session = std::move(entry->second);
-            pinned.erase(entry);
+            entry = std::move(found->second);
+            pinned.erase(found);
         }
         // A poisoned exchange may have an unread response. Close it without
         // another transaction operation; disconnect rolls back server state.
         // Normal caller rollback keeps its explicit acknowledgement path.
-        if (!poison) {
-            try {
-                session->Rollback();
-            } catch (...) {
-            }
-        }
-        try {
-            session->Close();
-        } catch (...) {
+        if (poison) {
+            Close(std::move(entry));
+        } else {
+            RollBack(std::move(entry));
         }
     }
 
-    std::vector<std::shared_ptr<OracleSession>> TakeAll() noexcept {
+    std::vector<PinnedOracleSession> TakeAll() noexcept {
         std::lock_guard<std::mutex> guard(lock);
-        std::vector<std::shared_ptr<OracleSession>> sessions;
+        std::vector<PinnedOracleSession> sessions;
         sessions.reserve(pinned.size());
         for (auto &entry : pinned) {
             sessions.push_back(std::move(entry.second));
@@ -133,29 +199,26 @@ struct OracleWriteState final : ClientContextState {
     // DuckDB's local catalog state. A failed statement cannot open a fresh
     // session and accidentally turn a partial transaction into success.
     void Commit(const std::string &catalog_name) {
-        std::shared_ptr<OracleSession> session;
+        PinnedOracleSession entry;
         {
             std::lock_guard<std::mutex> guard(lock);
             if (failed.count(catalog_name)) {
                 throw TransactionException("Oracle transaction failed; ROLLBACK is required");
             }
-            const auto entry = pinned.find(catalog_name);
-            if (entry == pinned.end()) {
+            const auto found = pinned.find(catalog_name);
+            if (found == pinned.end()) {
                 return;
             }
-            session = std::move(entry->second);
-            pinned.erase(entry);
+            entry = std::move(found->second);
+            pinned.erase(found);
         }
         try {
             TranslatingOracleErrors("Oracle COMMIT failed", [&] {
-                session->Commit();
+                entry.session->Commit();
                 return 0;
             });
         } catch (const std::exception &error) {
-            try {
-                session->Close();
-            } catch (...) {
-            }
+            Close(std::move(entry));
             // Without a confirmed rejection, a lost acknowledgement must not
             // invite replay or deletion of files possibly already published.
             auto info = OracleErrorInfo(error);
@@ -175,10 +238,7 @@ struct OracleWriteState final : ClientContextState {
             throw IOException(info, "Oracle COMMIT outcome is unknown; do not replay the transaction or delete its files "
                               "without reconciling the catalog");
         }
-        try {
-            session->Close();
-        } catch (...) {
-        }
+        End(std::move(entry));
         {
             std::lock_guard<std::mutex> guard(lock);
             status[catalog_name].commit_outcome = "committed";
@@ -210,16 +270,8 @@ struct OracleWriteState final : ClientContextState {
                 }
             }
         }
-        auto sessions = TakeAll();
-        for (auto &session : sessions) {
-            try {
-                session->Rollback();
-            } catch (...) {
-            }
-            try {
-                session->Close();
-            } catch (...) {
-            }
+        for (auto &entry : TakeAll()) {
+            RollBack(std::move(entry));
         }
     }
 };
@@ -442,7 +494,11 @@ std::shared_ptr<OracleSession> TryTransactionSession(ClientContext &context, con
     if (pinned == state.pinned.end()) {
         return nullptr;
     }
-    return pinned->second;
+    return pinned->second.session;
+}
+
+void TaintTransactionSession(ClientContext &context, const std::string &catalog_name) {
+    WriteStateFor(context).Taint(catalog_name);
 }
 
 void PoisonTransactionSession(ClientContext &context, const std::string &catalog_name) noexcept {

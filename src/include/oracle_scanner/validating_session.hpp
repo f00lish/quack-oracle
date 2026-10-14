@@ -24,6 +24,8 @@ public:
     void Rollback() override;
     void Cancel() override;
     void Close() override;
+    bool ReadyForReuse() const override;
+    bool BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) override;
 
 private:
     OracleSession &Inner() const;

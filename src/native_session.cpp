@@ -9,6 +9,7 @@
 #include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/lob_reader.hpp"
+#include "oracle_scanner/io_deadline_binding.hpp"
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include "oracle_scanner/value_codec.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
@@ -22,6 +23,9 @@ namespace oracle_scanner {
 
 struct NativeSessionLifetime {
     bool open = true;
+    // Set by any operation or fetch that failed. The exchange may have left a
+    // response unread, so the session is never handed to another caller.
+    bool exchange_failed = false;
     NativeFetchCancellation fetch_cancellation;
 };
 
@@ -171,9 +175,11 @@ public:
         lifetime->fetch_cancellation.CompleteFetch();
         return result;
         } catch (const ProtocolError &error) {
+            lifetime->exchange_failed = true;
             lifetime->fetch_cancellation.ObserveError(error);
             throw;
         } catch (...) {
+            lifetime->exchange_failed = true;
             lifetime->fetch_cancellation.ObserveUnknownError();
             throw;
         }
@@ -247,23 +253,27 @@ std::unique_ptr<NativeOracleSession> NativeOracleSession::Connect(const Connecti
     auto connection = TnsClientConnection::Connect(config, tls);
     connection->Negotiate();
     connection->AuthenticateO5Logon(config.user, password);
-    return std::unique_ptr<NativeOracleSession>(new NativeOracleSession(std::move(connection)));
+    auto session = std::unique_ptr<NativeOracleSession>(new NativeOracleSession(std::move(connection)));
+    session->deadline_binding = config.io_deadline_binding;
+    return session;
 }
 
 // Normal native reader owns the response. This only withholds a result after
 // accepted Cancel and records a genuinely decoded error; no drain or replay.
 template <class Operation>
-static auto RunNativeOperation(NativeFetchCancellation &cancellation, Operation operation)
+static auto RunNativeOperation(NativeSessionLifetime &lifetime, Operation operation)
     -> decltype(operation()) {
     try {
         auto result = operation();
-        cancellation.CompleteOperation();
+        lifetime.fetch_cancellation.CompleteOperation();
         return result;
     } catch (const ProtocolError &error) {
-        cancellation.ObserveError(error);
+        lifetime.exchange_failed = true;
+        lifetime.fetch_cancellation.ObserveError(error);
         throw;
     } catch (...) {
-        cancellation.ObserveUnknownError();
+        lifetime.exchange_failed = true;
+        lifetime.fetch_cancellation.ObserveUnknownError();
         throw;
     }
 }
@@ -286,7 +296,7 @@ void NativeOracleSession::RequireOpen() const {
 std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql, const std::vector<OracleBind> &binds) {
     // Like every other operation: an ORA-01013 answering an accepted Cancel is
     // observed here, which is what makes the session usable again afterwards.
-    return RunNativeOperation(lifetime->fetch_cancellation, [&]() -> std::unique_ptr<OracleCursor> {
+    return RunNativeOperation(*lifetime, [&]() -> std::unique_ptr<OracleCursor> {
         return OpenQuery(sql, binds);
     });
 }
@@ -322,7 +332,7 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
 }
 
 uint64_t NativeOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {
-    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+    return RunNativeOperation(*lifetime, [&]() {
         return ExecuteStatement(sql, binds, OracleSqlKind::DML);
     });
 }
@@ -362,7 +372,7 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
 
 uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) {
     RequireOpen();
-    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+    return RunNativeOperation(*lifetime, [&]() {
         const auto call = channel->LockCall();
         auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::DML);
         // PL/SQL bind variables are stricter than SQL placeholders: begin the
@@ -422,7 +432,7 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
 // request stays a bounded message; the row counts are summed across groups.
 uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::vector<std::vector<OracleBind>> &rows) {
     RequireOpen();
-    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+    return RunNativeOperation(*lifetime, [&]() {
         if (rows.empty()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "native Oracle DML batch cannot be empty");
         }
@@ -470,7 +480,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
 std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string &sql,
                                                               const std::vector<OracleBind> &binds) {
     RequireOpen();
-    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+    return RunNativeOperation(*lifetime, [&]() {
         const auto call = channel->LockCall();
         // The statement already names its own OUT binds — `RETURNING x INTO :y` —
         // so unlike ExecuteWithRowCount nothing is appended to it. Wrapping it in a
@@ -510,7 +520,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
 
 OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
     RequireOpen();
-    return RunNativeOperation(lifetime->fetch_cancellation, [&]() {
+    return RunNativeOperation(*lifetime, [&]() {
         const auto call = channel->LockCall();
         const auto sql = BuildOracleCallBlock(request);
         std::vector<OracleBind> binds;
@@ -584,13 +594,37 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
 void NativeOracleSession::Commit() {
     RequireOpen();
     const auto call = channel->LockCall();
-    (void)connection->Ttc().Commit(NextSequence(),connection->TtcServerFieldVersion());
+    try {
+        (void)connection->Ttc().Commit(NextSequence(),connection->TtcServerFieldVersion());
+    } catch (...) {
+        lifetime->exchange_failed = true;
+        throw;
+    }
 }
 
 void NativeOracleSession::Rollback() {
     RequireOpen();
     const auto call = channel->LockCall();
-    (void)connection->Ttc().Rollback(NextSequence(),connection->TtcServerFieldVersion());
+    try {
+        (void)connection->Ttc().Rollback(NextSequence(),connection->TtcServerFieldVersion());
+    } catch (...) {
+        lifetime->exchange_failed = true;
+        throw;
+    }
+}
+
+bool NativeOracleSession::ReadyForReuse() const {
+    return connection && connection->State() == OracleConnectionState::AUTHENTICATED && lifetime->open &&
+           !lifetime->exchange_failed && lifetime->fetch_cancellation.CanUseConnection() &&
+           statements.OpenCount() == 0 && deadline_binding;
+}
+
+bool NativeOracleSession::BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) {
+    if (!deadline_binding) {
+        return false;
+    }
+    deadline_binding->Bind(std::move(source));
+    return true;
 }
 
 void NativeOracleSession::Cancel() {

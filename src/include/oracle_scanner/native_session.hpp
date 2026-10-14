@@ -35,6 +35,8 @@ public:
     void Rollback() override;
     void Cancel() override;
     void Close() override;
+    bool ReadyForReuse() const override;
+    bool BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) override;
 
 private:
     explicit NativeOracleSession(std::unique_ptr<TnsClientConnection> connection);
@@ -47,6 +49,8 @@ private:
     OracleStatementRegistry statements;
     std::unique_ptr<TtcStatementChannel> channel;
     std::shared_ptr<NativeSessionLifetime> lifetime;
+    // Present when the session was opened to be reused across callers.
+    std::shared_ptr<OracleIoDeadlineBinding> deadline_binding;
     uint8_t next_sequence = 1;
 };
 

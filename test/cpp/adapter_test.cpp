@@ -7,6 +7,7 @@
 #endif
 
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/io_deadline.hpp"
 #include "oracle_scanner/session.hpp"
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/value_codec.hpp"
@@ -171,6 +172,17 @@ struct FakeScript {
     bool batch_should_fail = false;
     bool execute_should_fail = false;
     bool commit_should_fail = false;
+    // The transaction pool: whether a session reports itself ReadyForReuse
+    // (until it fails or closes), and a rollback that fails.
+    bool sessions_reusable = false;
+    bool rollback_should_fail = false;
+    size_t session_closes = 0;
+    // USER of the secret each session was opened from, in opening order, and
+    // the USER of the session each counted execute ran on.
+    std::vector<std::string> session_users;
+    std::vector<std::string> execute_users;
+    // Every deadline source a session was bound to; null when released.
+    std::vector<std::shared_ptr<oracle_scanner::OracleIoDeadline>> bound_sources;
 
     size_t sessions_opened = 0;
     size_t sessions_destroyed = 0;
@@ -296,9 +308,11 @@ private:
 
 class FakeSession final : public OracleSession {
 public:
-    explicit FakeSession(std::shared_ptr<FakeScript> script_p) : script(std::move(script_p)) {
+    explicit FakeSession(std::shared_ptr<FakeScript> script_p, std::string user_p = std::string())
+        : script(std::move(script_p)), user(std::move(user_p)) {
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->sessions_opened++;
+        script->session_users.push_back(user);
     }
 
     ~FakeSession() override {
@@ -330,7 +344,9 @@ public:
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->counted_executes.push_back(sql);
         script->counted_execute_binds.push_back(binds);
+        script->execute_users.push_back(user);
         if (script->execute_should_fail) {
+            failed = true;
             throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
                                                  "localized constraint failure", 1);
         }
@@ -402,6 +418,7 @@ public:
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->commits++;
         if (script->commit_should_fail) {
+            failed = true;
             throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::TRUNCATED, "lost COMMIT response");
         }
     }
@@ -409,21 +426,44 @@ public:
     void Rollback() override {
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->rollbacks++;
+        if (script->rollback_should_fail) {
+            failed = true;
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::TRUNCATED, "lost ROLLBACK response");
+        }
     }
 
     void Cancel() override {
     }
 
     void Close() override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        if (!closed) {
+            closed = true;
+            script->session_closes++;
+        }
+    }
+
+    bool ReadyForReuse() const override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        return script->sessions_reusable && !closed && !failed;
+    }
+
+    bool BindIoDeadline(std::shared_ptr<oracle_scanner::OracleIoDeadline> source) override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        script->bound_sources.push_back(source);
+        return script->sessions_reusable;
     }
 
 private:
     std::shared_ptr<FakeScript> script;
+    std::string user;
+    bool closed = false;
+    bool failed = false;
 };
 
 ScopedOracleSessionFactory InstallFake(const std::shared_ptr<FakeScript> &script) {
-    return ScopedOracleSessionFactory([script](const ConnectionConfig &, const std::string &) {
-        return std::unique_ptr<OracleSession>(new FakeSession(script));
+    return ScopedOracleSessionFactory([script](const ConnectionConfig &config, const std::string &) {
+        return std::unique_ptr<OracleSession>(new FakeSession(script, config.user));
     });
 }
 
@@ -2487,10 +2527,188 @@ void TestRawCatalogTransactionsPinReadsAndWrites() {
     std::cout << "raw catalog reads and writes follow commit/rollback and reject failed transaction reuse" << std::endl;
 }
 
+// The attached catalog's transaction pool, driven the way DuckLake drives it:
+// every transaction on a DuckDB connection of its own, destroyed afterwards, so
+// nothing a ClientContext owns survives from one transaction to the next.
+static std::shared_ptr<FakeScript> PooledScript() {
+    auto script = std::make_shared<FakeScript>();
+    script->sessions_reusable = true;
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"SELECT 1 FROM DUAL", {{Column("1", 2)}, {{Number("1")}}}});
+    script->affected_rows = 1;
+    return script;
+}
+
+static bool RunOn(duckdb::DuckDB &db, const std::vector<std::string> &statements) {
+    duckdb::Connection connection(db);
+    bool ok = true;
+    for (const auto &sql : statements) {
+        ok = !connection.Query(sql)->HasError() && ok;
+    }
+    return ok;
+}
+
+static const std::string POOLED_INSERT = "SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (:1)', [1]);";
+
+void TestTransactionSessionsAreReusedAcrossConnections() {
+    auto script = PooledScript();
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+    // ATTACH read the current schema on a session it then left idle.
+    CHECK(script->sessions_opened == 1 && script->session_closes == 0);
+    const auto rollbacks = script->rollbacks;
+    for (int round = 0; round < 3; round++) {
+        CHECK(RunOn(database.db, {POOLED_INSERT}));
+    }
+    CHECK(script->sessions_opened == 1 && script->commits == 3 && script->counted_executes.size() == 3);
+    // A ROLLBACK the server acknowledged ends a transaction as cleanly.
+    CHECK(RunOn(database.db, {"BEGIN;", POOLED_INSERT, "ROLLBACK;"}));
+    CHECK(script->sessions_opened == 1 && script->rollbacks == rollbacks + 1);
+    CHECK(RunOn(database.db, {POOLED_INSERT}));
+    CHECK(script->sessions_opened == 1 && script->session_closes == 0);
+
+    // Each lease follows its own caller's deadline source, and a session put
+    // back follows nobody's.
+    // The leading entries unbind the dictionary leases ATTACH and the first
+    // catalog lookup took with no caller; from then on every binding to a
+    // caller is followed by an unbind.
+    size_t first = 0;
+    while (first < script->bound_sources.size() && !script->bound_sources[first]) {
+        first++;
+    }
+    CHECK(first > 0 && first < script->bound_sources.size());
+    std::vector<std::shared_ptr<oracle_scanner::OracleIoDeadline>> callers;
+    for (size_t index = first; index < script->bound_sources.size(); index++) {
+        if ((index - first) % 2 == 0) {
+            CHECK(script->bound_sources[index] != nullptr);
+            callers.push_back(script->bound_sources[index]);
+        } else {
+            CHECK(script->bound_sources[index] == nullptr);
+        }
+    }
+    CHECK(callers.size() >= 5);
+    CHECK(callers[1] != callers[2] && callers[2] != callers[3]);
+}
+
+// Nothing that may have left a session in an unknown state goes back: a
+// failed statement, a COMMIT whose outcome is unknown, a rollback that failed,
+// a stored procedure that may have changed the session itself.
+void TestTransactionSessionsThatMustNotBeReused() {
+    auto script = PooledScript();
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+    CHECK(RunOn(database.db, {POOLED_INSERT}));
+    CHECK(script->sessions_opened == 1);
+
+    script->execute_should_fail = true;
+    CHECK(!RunOn(database.db, {POOLED_INSERT}));
+    script->execute_should_fail = false;
+    CHECK(script->session_closes == 1);
+    CHECK(RunOn(database.db, {POOLED_INSERT}));
+    CHECK(script->sessions_opened == 2);
+
+    script->commit_should_fail = true;
+    CHECK(!RunOn(database.db, {POOLED_INSERT}));
+    script->commit_should_fail = false;
+    CHECK(script->session_closes == 2);
+    CHECK(RunOn(database.db, {POOLED_INSERT}));
+    CHECK(script->sessions_opened == 3);
+
+    script->rollback_should_fail = true;
+    (void)RunOn(database.db, {"BEGIN;", POOLED_INSERT, "ROLLBACK;"});
+    script->rollback_should_fail = false;
+    CHECK(script->session_closes == 3);
+    CHECK(RunOn(database.db, {POOLED_INSERT}));
+    CHECK(script->sessions_opened == 4);
+
+    script->call_echo_outputs = true;
+    script->call_output_values["P_TEXT"] = Text("Quack.");
+    CHECK(RunOn(database.db, {"SELECT * FROM oracle_call_named_transaction('tx', 'QUACK_DEMO_MOTTO', "
+                              "[{name:'P_TEXT',direction:'out',type:'varchar',value:NULL::VARCHAR}]);"}));
+    CHECK(script->session_closes == 4);
+    CHECK(RunOn(database.db, {POOLED_INSERT}));
+    CHECK(script->sessions_opened == 5 && script->session_closes == 4);
+}
+
+// The pool is bounded, can be switched off, and gives everything back when the
+// catalog goes; a connection destroyed mid-transaction rolls back first.
+void TestTransactionPoolSizeDetachAndAbandonedTransactions() {
+    {
+        auto script = PooledScript();
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("SET oracle_transaction_pool_size = 0;");
+        database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+        CHECK(RunOn(database.db, {POOLED_INSERT}));
+        const auto opened = script->sessions_opened;
+        CHECK(RunOn(database.db, {POOLED_INSERT}) && RunOn(database.db, {POOLED_INSERT}));
+        // One fresh session per transaction, none of them bound or reused.
+        CHECK(script->sessions_opened == opened + 2 && script->bound_sources.empty());
+        database.Run("SET oracle_transaction_pool_size = 65;");
+        CHECK(database.Query("ATTACH 'ora' AS refused (TYPE oracle_scanner);")->HasError());
+    }
+    auto script = PooledScript();
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("SET oracle_transaction_pool_size = 1;");
+    database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+    {
+        duckdb::Connection first(database.db);
+        duckdb::Connection second(database.db);
+        CHECK(!first.Query("BEGIN;")->HasError() && !first.Query(POOLED_INSERT)->HasError());
+        CHECK(!second.Query("BEGIN;")->HasError() && !second.Query(POOLED_INSERT)->HasError());
+        // Two transactions at once hold two sessions, never one between them.
+        CHECK(script->sessions_opened == 2);
+        CHECK(!first.Query("COMMIT;")->HasError() && !second.Query("COMMIT;")->HasError());
+        // Room for one idle session: the other is closed.
+        CHECK(script->session_closes == 1);
+    }
+    {
+        duckdb::Connection abandoned(database.db);
+        CHECK(!abandoned.Query("BEGIN;")->HasError() && !abandoned.Query(POOLED_INSERT)->HasError());
+    }
+    // Destroying the connection rolled the transaction back, and that
+    // acknowledged rollback let the session go back.
+    CHECK(script->sessions_opened == 2 && script->session_closes == 1);
+    CHECK(RunOn(database.db, {POOLED_INSERT}));
+    CHECK(script->sessions_opened == 2);
+    database.Run("DETACH tx;");
+    CHECK(script->session_closes == 2);
+}
+
+// Two catalogs attached from two secrets keep two pools: each transaction runs
+// on a session opened from its own catalog's secret.
+void TestTransactionPoolsDoNotMixSecrets() {
+    auto script = PooledScript();
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("CREATE SECRET other (TYPE oracle, HOST '127.0.0.1', PORT 1521, SERVICE_NAME 'service', "
+                 "USER 'other_user', PASSWORD 'placeholder');");
+    database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+    database.Run("ATTACH 'other' AS tx_other (TYPE oracle_scanner);");
+    CHECK(script->session_users.size() == 2);
+    const std::string other_insert =
+        "SELECT * FROM oracle_execute_transaction('tx_other', 'INSERT INTO items VALUES (:1)', [1]);";
+    for (int round = 0; round < 2; round++) {
+        CHECK(RunOn(database.db, {POOLED_INSERT}) && RunOn(database.db, {other_insert}));
+    }
+    CHECK(script->sessions_opened == 2);
+    CHECK(script->execute_users.size() == 4);
+    for (size_t index = 0; index < script->execute_users.size(); index++) {
+        CHECK(script->execute_users[index] == (index % 2 == 0 ? "app_user" : "other_user"));
+    }
+}
+
 int main() {
     TestReadOnlyHiddenCatalogGuardsWrites();
 
     TestRawCatalogTransactionsPinReadsAndWrites();
+    TestTransactionSessionsAreReusedAcrossConnections();
+    TestTransactionSessionsThatMustNotBeReused();
+    TestTransactionPoolSizeDetachAndAbandonedTransactions();
+    TestTransactionPoolsDoNotMixSecrets();
     TestQueryTypeMappingAndValues();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();

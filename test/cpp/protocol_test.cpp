@@ -57,6 +57,8 @@
 #include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include "oracle_scanner/lob_prefetch_reader.hpp"
+#include "oracle_scanner/io_deadline_binding.hpp"
+#include "oracle_scanner/transaction_session_pool.hpp"
 #include "oracle_scanner/ttc_describe.hpp"
 #include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_cursor.hpp"
@@ -5830,6 +5832,295 @@ static void TestLobPrefetchScalarBudget() {
     CHECK(refused);
 }
 
+// The attached catalog's pool of transaction sessions. A fake session here
+// records every statement it is sent, so a test can show which ones reached
+// it, and can die while idle, the way a session killed on the server does.
+namespace transaction_pool {
+
+struct Log {
+    std::vector<std::string> statements;
+    size_t closes = 0;
+};
+
+class OneRowCursor final : public OracleCursor {
+public:
+    const std::vector<OracleColumn> &Columns() const override {
+        return columns;
+    }
+    OracleBatch Fetch(size_t) override {
+        OracleBatch batch;
+        batch.rows.push_back({EncodeOracleNumber("1")});
+        batch.exhausted = true;
+        return batch;
+    }
+    void Close() override {
+    }
+    void Cancel() override {
+    }
+
+private:
+    std::vector<OracleColumn> columns;
+};
+
+struct SessionState {
+    int id = 0;
+    bool dead = false;
+    bool reusable = true;
+    bool bindable = true;
+    bool closed = false;
+    std::vector<std::shared_ptr<OracleIoDeadline>> bound;
+};
+
+// Owned only by the pool and the code under test, as a real session is; what a
+// test observes lives in SessionState, so the test holds no extra reference
+// that would make every session look borrowed.
+class PoolSession final : public TestSession {
+public:
+    PoolSession(std::shared_ptr<Log> log_p, std::shared_ptr<SessionState> state_p)
+        : log(std::move(log_p)), state(std::move(state_p)) {
+    }
+    std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &) override {
+        log->statements.push_back(std::to_string(state->id) + ":" + sql);
+        if (state->dead) {
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle TCP connection closed");
+        }
+        return std::make_unique<OneRowCursor>();
+    }
+    uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &) override {
+        log->statements.push_back(std::to_string(state->id) + ":" + sql);
+        if (state->dead) {
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle TCP connection closed");
+        }
+        return 1;
+    }
+    void Close() override {
+        log->closes++;
+        state->closed = true;
+    }
+    bool ReadyForReuse() const override {
+        return state->reusable && !state->closed;
+    }
+    bool BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) override {
+        state->bound.push_back(source);
+        return state->bindable;
+    }
+
+    std::shared_ptr<Log> log;
+    std::shared_ptr<SessionState> state;
+};
+
+int Id(const std::shared_ptr<OracleSession> &session) {
+    return static_cast<PoolSession &>(*session).state->id;
+}
+
+struct Fixture {
+    std::shared_ptr<Log> log = std::make_shared<Log>();
+    std::vector<std::shared_ptr<SessionState>> opened;
+    std::vector<std::shared_ptr<OracleIoDeadlineBinding>> bindings;
+    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    bool fail_open = false;
+
+    std::shared_ptr<OracleTransactionSessionPool> Pool(size_t maximum_idle) {
+        return std::make_shared<OracleTransactionSessionPool>(
+            maximum_idle,
+            [this](std::shared_ptr<OracleIoDeadlineBinding> binding) -> std::shared_ptr<OracleSession> {
+                if (fail_open) {
+                    throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle listener unreachable");
+                }
+                bindings.push_back(binding);
+                auto state = std::make_shared<SessionState>();
+                state->id = static_cast<int>(opened.size());
+                opened.push_back(state);
+                return std::make_shared<PoolSession>(log, state);
+            },
+            OracleTransactionSessionPool::SelectFromDual, std::chrono::seconds(300), [this] { return now; });
+    }
+};
+
+} // namespace transaction_pool
+
+// A session comes back after a confirmed end only, and is then handed to the
+// next transaction instead of a fresh connect.
+static void TestTransactionPoolReusesAfterAConfirmedEnd() {
+    using namespace transaction_pool;
+    Fixture fixture;
+    auto pool = fixture.Pool(2);
+    auto first = pool->Acquire(nullptr);
+    CHECK(fixture.opened.size() == 1);
+    CHECK(pool->Release(std::move(first)));
+    auto second = pool->Acquire(nullptr);
+    CHECK(fixture.opened.size() == 1 && Id(second) == 0);
+    // The probe is the only thing the reused session was sent before it was
+    // handed out: nothing of the next transaction.
+    CHECK(fixture.log->statements.size() == 1 && fixture.log->statements[0] == "0:SELECT 1 FROM DUAL");
+    const auto counters = pool->Counters();
+    CHECK(counters.opened == 1 && counters.reused == 1 && counters.returned == 1 && counters.leased == 1);
+    CHECK(pool->Release(std::move(second)));
+}
+
+// What must never be reused is closed instead: a session that says it is not
+// clean, one somebody else still holds, one that cannot follow a new caller's
+// deadline, and one discarded outright.
+static void TestTransactionPoolClosesWhatIsNotClean() {
+    using namespace transaction_pool;
+    Fixture fixture;
+    auto pool = fixture.Pool(4);
+
+    auto dirty = pool->Acquire(nullptr);
+    fixture.opened.back()->reusable = false;
+    CHECK(!pool->Release(std::move(dirty)));
+    CHECK(fixture.opened[0]->closed);
+
+    auto shared = pool->Acquire(nullptr);
+    const auto borrower = shared;
+    (void)borrower;
+    CHECK(!pool->Release(std::move(shared)));
+    CHECK(fixture.opened[1]->closed);
+
+    auto unbindable = pool->Acquire(nullptr);
+    fixture.opened.back()->bindable = false;
+    CHECK(!pool->Release(std::move(unbindable)));
+    CHECK(fixture.opened[2]->closed);
+
+    auto poisoned = pool->Acquire(nullptr);
+    pool->Discard(std::move(poisoned));
+    CHECK(fixture.opened[3]->closed);
+
+    CHECK(pool->Counters().idle == 0 && pool->Counters().leased == 0);
+    auto fresh = pool->Acquire(nullptr);
+    CHECK(fixture.opened.size() == 5 && pool->Counters().reused == 0);
+    pool->Discard(std::move(fresh));
+}
+
+// A session killed while it sat idle fails its probe and is replaced before
+// the transaction sends anything; the dead session saw the probe and nothing
+// else, so no statement of the transaction can have run twice.
+static void TestTransactionPoolReplacesASessionThatDiedIdle() {
+    using namespace transaction_pool;
+    Fixture fixture;
+    auto pool = fixture.Pool(2);
+    auto first = pool->Acquire(nullptr);
+    CHECK(pool->Release(std::move(first)));
+    fixture.opened[0]->dead = true;
+
+    auto replacement = pool->Acquire(nullptr);
+    CHECK(fixture.opened.size() == 2 && Id(replacement) == 1);
+    CHECK(fixture.opened[0]->closed);
+    CHECK(fixture.log->statements.size() == 1 && fixture.log->statements[0] == "0:SELECT 1 FROM DUAL");
+    CHECK(pool->Counters().probe_failures == 1);
+
+    // Once handed out, a failure is the transaction's: the pool does not
+    // retry anything, it only learns the outcome when the caller discards it.
+    fixture.opened[1]->dead = true;
+    bool failed = false;
+    try {
+        replacement->Execute("INSERT INTO t VALUES (1)", {});
+    } catch (const ProtocolError &error) {
+        failed = error.Kind() == ProtocolErrorKind::TRUNCATED;
+    }
+    CHECK(failed);
+    pool->Discard(std::move(replacement));
+    size_t inserts = 0;
+    for (const auto &statement : fixture.log->statements) {
+        inserts += statement.find("INSERT") != std::string::npos ? 1 : 0;
+    }
+    CHECK(inserts == 1 && fixture.opened.size() == 2);
+
+    // A failure to open is reported, and leaves nothing leased.
+    fixture.fail_open = true;
+    bool refused = false;
+    try {
+        (void)pool->Acquire(nullptr);
+    } catch (const ProtocolError &error) {
+        refused = error.Kind() == ProtocolErrorKind::TRUNCATED;
+    }
+    CHECK(refused && pool->Counters().leased == 0);
+}
+
+// Bounded: never more idle sessions than its size, none idle longer than its
+// limit, and none at all once its owner closes it.
+static void TestTransactionPoolIsBounded() {
+    using namespace transaction_pool;
+    Fixture fixture;
+    auto pool = fixture.Pool(2);
+    auto a = pool->Acquire(nullptr);
+    auto b = pool->Acquire(nullptr);
+    auto c = pool->Acquire(nullptr);
+    CHECK(pool->Counters().leased == 3);
+    CHECK(pool->Release(std::move(a)) && pool->Release(std::move(b)));
+    CHECK(!pool->Release(std::move(c)));
+    CHECK(pool->Counters().idle == 2 && fixture.opened[2]->closed);
+
+    fixture.now += std::chrono::seconds(301);
+    auto after_idle_limit = pool->Acquire(nullptr);
+    CHECK(fixture.opened.size() == 4 && fixture.opened[0]->closed && fixture.opened[1]->closed);
+    CHECK(pool->Release(std::move(after_idle_limit)));
+
+    pool->Close();
+    CHECK(fixture.opened[3]->closed && pool->Counters().idle == 0);
+    auto after_close = pool->Acquire(nullptr);
+    CHECK(!pool->Release(std::move(after_close)));
+    CHECK(fixture.opened.back()->closed);
+
+    auto disabled = fixture.Pool(0);
+    auto only = disabled->Acquire(nullptr);
+    CHECK(!disabled->Release(std::move(only)));
+}
+
+// Each lease follows its own caller's deadline, and a returned session
+// follows nobody's. The binding is what the transport reads, so a deadline set
+// by the current caller reaches the socket, and the previous caller's no
+// longer does.
+static void TestTransactionPoolFollowsEachCallersDeadline() {
+    using namespace transaction_pool;
+    Fixture fixture;
+    auto pool = fixture.Pool(2);
+    auto first_caller = std::make_shared<OracleIoDeadline>();
+    auto second_caller = std::make_shared<OracleIoDeadline>();
+    auto session = pool->Acquire(first_caller);
+    CHECK(fixture.bindings.size() == 1);
+    auto &binding = *fixture.bindings[0];
+    CHECK(binding.Bound());
+    const auto soon = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    first_caller->Set(soon);
+    CHECK(binding.Get() == OracleIoDeadline::Deadline(soon));
+    CHECK(pool->Release(std::move(session)));
+    CHECK(fixture.opened[0]->bound.back() == nullptr);
+
+    auto reused = pool->Acquire(second_caller);
+    CHECK(fixture.opened[0]->bound.back() == second_caller);
+    pool->Discard(std::move(reused));
+
+    // The binding itself: rebinding moves the deadline the stream enforces.
+    auto bound = std::make_shared<OracleIoDeadlineBinding>(first_caller);
+    CHECK(bound->Get() == OracleIoDeadline::Deadline(soon));
+    bound->Bind(second_caller);
+    CHECK(!bound->Get());
+    second_caller->Set(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+    class Sink final : public ByteStream {
+    public:
+        size_t Read(uint8_t *, size_t) override {
+            return 0;
+        }
+        size_t Write(const uint8_t *, size_t size) override {
+            return size;
+        }
+        void Close() override {
+        }
+    };
+    OracleBoundDeadlineStream stream(std::make_unique<Sink>(), bound);
+    const uint8_t byte = 0;
+    bool expired = false;
+    try {
+        (void)stream.Write(&byte, 1);
+    } catch (const ProtocolError &error) {
+        expired = error.Kind() == ProtocolErrorKind::TRUNCATED;
+    }
+    CHECK(expired);
+    bound->Bind(nullptr);
+    CHECK(stream.Write(&byte, 1) == 1);
+}
+
 int main() {
 
     TestUniversalIntegers();
@@ -5949,6 +6240,11 @@ int main() {
     TestSsoWallet();
     TestLobPrefetchMaterializer();
     TestLobPrefetchScalarBudget();
+    TestTransactionPoolReusesAfterAConfirmedEnd();
+    TestTransactionPoolClosesWhatIsNotClean();
+    TestTransactionPoolReplacesASessionThatDiedIdle();
+    TestTransactionPoolIsBounded();
+    TestTransactionPoolFollowsEachCallersDeadline();
     std::cout << "oracle_scanner protocol tests passed\n";
     return 0;
 }

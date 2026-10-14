@@ -15,6 +15,7 @@
 #include <random>
 #include <regex>
 #include <set>
+#include <vector>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -273,48 +274,63 @@ int main() {
         Check(Items(db, "tx", "items") == "4:0", "the UPDATE was not replayed");
         std::cout << "PASS no replay once an operation began\n";
 
-        // 4. A DuckDB interrupt reaches the socket of a reused session: a
-        // batch UPDATE waits on a row lock, on the session the pool handed
-        // out, and the interrupt ends the wait without waiting for the lock.
-        const auto warm = Who(db, "tx", "warm the pool");
-        Run(holding, "BEGIN;", "holder begin");
-        Run(holding, "SELECT * FROM oracle_execute_transaction('holder', 'UPDATE ITEMS SET N = N WHERE ID = 2');",
-            "holder lock");
-        {
+        // 4. A DuckDB interrupt reaches the socket of a reused session on every
+        // transaction path: a SELECT FOR UPDATE opened by
+        // oracle_query_transaction, a scalar UPDATE, a batch UPDATE. Each waits
+        // on a row lock, on the session the pool handed out; the interrupt ends
+        // the wait without waiting for the lock or the read timeout, nothing is
+        // replayed, and the connection begins and commits a new transaction.
+        const std::vector<std::pair<std::string, std::string>> paths = {
+            {"query open", "SELECT * FROM oracle_query_transaction('tx', 'SELECT ID FROM ITEMS WHERE ID = 2 FOR UPDATE');"},
+            {"scalar execute",
+             "SELECT * FROM oracle_execute_transaction('tx', 'UPDATE ITEMS SET N = N + 1 WHERE ID = 2');"},
+            {"batch", "SELECT * FROM oracle_execute_many_transaction('tx', "
+                      "'UPDATE ITEMS SET N = N + 1 WHERE ID = :id', [{id: 2}]);"},
+        };
+        for (const auto &path : paths) {
+            const auto warm = Who(db, "tx", "warm the pool");
+            Run(holding, "BEGIN;", "holder begin");
+            Run(holding, "SELECT * FROM oracle_execute_transaction('holder', 'UPDATE ITEMS SET N = N WHERE ID = 2');",
+                "holder lock");
             Connection con(db);
             std::atomic<bool> interrupted_failed {false};
             std::atomic<bool> returned {false};
             std::chrono::steady_clock::time_point returned_at;
-            JoinedThread runner([&] {
-                auto result = con.Query("SELECT * FROM oracle_execute_many_transaction('tx', "
-                                        "'UPDATE ITEMS SET N = N + 1 WHERE ID = :id', [{id: 2}]);");
-                returned_at = std::chrono::steady_clock::now();
-                interrupted_failed = result->HasError();
-                returned = true;
-            });
-            std::string waiting;
-            for (int attempt = 0; attempt < 100 && waiting.empty(); attempt++) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                auto rows = Run(admin,
-                                "SELECT * FROM oracle_query('admin', 'SELECT AUDSID FROM V$SESSION WHERE USERNAME = ''" +
-                                    user_a + "'' AND BLOCKING_SESSION IS NOT NULL');",
-                                "find waiting");
-                if (rows->RowCount() == 1) {
-                    waiting = rows->GetValue(0, 0).ToString();
+            {
+                JoinedThread runner([&] {
+                    auto result = con.Query(path.second);
+                    returned_at = std::chrono::steady_clock::now();
+                    interrupted_failed = result->HasError();
+                    returned = true;
+                });
+                std::string waiting;
+                for (int attempt = 0; attempt < 100 && waiting.empty(); attempt++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    auto rows = Run(admin,
+                                    "SELECT * FROM oracle_query('admin', 'SELECT AUDSID FROM V$SESSION WHERE USERNAME = ''" +
+                                        user_a + "'' AND BLOCKING_SESSION IS NOT NULL');",
+                                    "find waiting");
+                    if (rows->RowCount() == 1) {
+                        waiting = rows->GetValue(0, 0).ToString();
+                    }
                 }
+                Check(waiting == warm.session_id, path.first + ": waits on the reused session");
+                const auto interrupted_at = std::chrono::steady_clock::now();
+                con.Interrupt();
+                runner.Join();
+                Check(returned && interrupted_failed, path.first + ": the interrupted statement fails");
+                Check(returned_at - interrupted_at < std::chrono::seconds(2), path.first + ": the interrupt ended the wait");
+                std::cout << "PASS interrupt reaches a reused session (" << path.first << "), "
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(returned_at - interrupted_at).count()
+                          << " ms\n";
             }
-            Check(waiting == warm.session_id, "the waiting UPDATE runs on the reused session");
-            const auto interrupted_at = std::chrono::steady_clock::now();
-            con.Interrupt();
-            runner.Join();
-            Check(returned && interrupted_failed, "the interrupted UPDATE fails");
-            Check(returned_at - interrupted_at < std::chrono::seconds(3), "the interrupt ended the wait promptly");
-            std::cout << "PASS interrupt reaches a reused session, "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(returned_at - interrupted_at).count()
-                      << " ms\n";
+            Run(holding, "ROLLBACK;", "holder rollback");
+            Check(Items(db, "tx", "items") == "4:0", path.first + ": nothing replayed");
+            Run(con, "BEGIN;", path.first + ": begin again");
+            Run(con, "SELECT * FROM oracle_query_transaction('tx', 'SELECT N FROM ITEMS WHERE ID = 2');",
+                path.first + ": read again");
+            Run(con, "COMMIT;", path.first + ": commit again");
         }
-        Run(holding, "ROLLBACK;", "holder rollback");
-        Check(Items(db, "tx", "items") == "4:0", "usable after the interrupt, nothing replayed");
         Run(admin, "DETACH holder;", "detach holder");
 
         // 5. Two users, two catalogs, two pools.

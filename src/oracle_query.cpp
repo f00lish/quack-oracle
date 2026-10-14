@@ -571,9 +571,19 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     } else {
         result->session = AcquireOracleReadSession(context, secret_name, std::string(), config, password);
     }
+    // The transactional form describes by running the query, so a SELECT FOR
+    // UPDATE waits on its lock here: the caller's interrupt must reach it.
+    std::unique_ptr<OracleCallerInterruptScope> interrupt;
+    if (transactional) {
+        interrupt = std::make_unique<OracleCallerInterruptScope>(context);
+    }
     try {
         result->cursor = result->session->Query(sql, binds);
     } catch (const std::exception &error) {
+        // Join first, retain the expired caller deadline through cleanup.
+        if (interrupt) {
+            interrupt->Stop();
+        }
         // A pooled session whose statement failed cannot be handed to the next
         // one: the failure may have left the channel mid-message.
         result->session.Poison();
@@ -747,11 +757,15 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionExecuteInit(ClientContext 
     if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
+    OracleCallerInterruptScope interrupt(context);
     try {
         auto &session = TransactionSession(context, target);
         const auto affected_rows = session.ExecuteWithRowCount(bind.sql, bind.binds);
+        interrupt.Check();
         return make_uniq<OracleExecuteGlobalState>(affected_rows);
     } catch (const std::exception &error) {
+        // Join first, retain the expired caller deadline through cleanup.
+        interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
         ThrowOracleAdapterError("oracle_execute_transaction failed", error);
     }
@@ -1973,6 +1987,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         auto session = AcquireOracleReadSession(context, std::string(), target.catalog_name,
                                                 target.config, target.password);
         std::unique_ptr<OracleCursor> cursor;
+        OracleCallerInterruptScope interrupt(context);
         try {
             cursor = session->Query(bind.query_sql, bind.query_binds);
             const auto &columns = cursor->Columns();
@@ -1989,6 +2004,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             state->catalog_name = bind.catalog_name;
             return std::move(state);
         } catch (const std::exception &error) {
+            interrupt.Stop();
             cursor.reset();
             session.Poison();
             PoisonTransactionSession(context, bind.catalog_name);
@@ -2042,10 +2058,18 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
 
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleQueryGlobalState>();
+    // A transaction's fetch obeys the caller's interrupt like its open does.
+    std::unique_ptr<OracleCallerInterruptScope> interrupt;
+    if (!state.catalog_name.empty()) {
+        interrupt = std::make_unique<OracleCallerInterruptScope>(context);
+    }
     const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
         try {
             return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
         } catch (...) {
+            if (interrupt) {
+                interrupt->Stop();
+            }
             // Same rule as at bind: a failed fetch leaves the channel in a
             // state this side cannot describe, so the session is not reused.
             state.session.Poison();

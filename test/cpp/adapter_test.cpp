@@ -32,6 +32,8 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
+#include <chrono>
+#include <thread>
 #include <cassert>
 #include <csignal>
 #include <cstdlib>
@@ -183,6 +185,10 @@ struct FakeScript {
     std::vector<std::string> execute_users;
     // Every deadline source a session was bound to; null when released.
     std::vector<std::shared_ptr<oracle_scanner::OracleIoDeadline>> bound_sources;
+    // A statement containing this fragment waits, the way one waiting on a row
+    // lock does, until the deadline of the caller it is bound to expires.
+    std::string block_until_deadline;
+    size_t blocked_statements = 0;
 
     size_t sessions_opened = 0;
     size_t sessions_destroyed = 0;
@@ -308,8 +314,9 @@ private:
 
 class FakeSession final : public OracleSession {
 public:
-    explicit FakeSession(std::shared_ptr<FakeScript> script_p, std::string user_p = std::string())
-        : script(std::move(script_p)), user(std::move(user_p)) {
+    explicit FakeSession(std::shared_ptr<FakeScript> script_p, std::string user_p = std::string(),
+                         std::shared_ptr<oracle_scanner::OracleIoDeadline> deadline_p = nullptr)
+        : script(std::move(script_p)), user(std::move(user_p)), deadline(std::move(deadline_p)) {
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->sessions_opened++;
         script->session_users.push_back(user);
@@ -321,6 +328,7 @@ public:
     }
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override {
+        WaitIfBlocked(sql);
         {
             std::lock_guard<std::mutex> guard(script->record_lock);
             script->queries.push_back(sql);
@@ -341,6 +349,7 @@ public:
     }
 
     uint64_t ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) override {
+        WaitIfBlocked(sql);
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->counted_executes.push_back(sql);
         script->counted_execute_binds.push_back(binds);
@@ -354,6 +363,7 @@ public:
     }
 
     uint64_t ExecuteBatch(const std::string &sql, const std::vector<std::vector<OracleBind>> &rows) override {
+        WaitIfBlocked(sql);
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->counted_executes.push_back(sql);
         script->batch_rows = rows;
@@ -451,19 +461,48 @@ public:
     bool BindIoDeadline(std::shared_ptr<oracle_scanner::OracleIoDeadline> source) override {
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->bound_sources.push_back(source);
+        deadline = source;
         return script->sessions_reusable;
+    }
+
+    // Outside the record lock: the wait must not stop anything else.
+    void WaitIfBlocked(const std::string &sql) {
+        std::shared_ptr<oracle_scanner::OracleIoDeadline> source;
+        {
+            std::lock_guard<std::mutex> guard(script->record_lock);
+            if (script->block_until_deadline.empty() || sql.find(script->block_until_deadline) == std::string::npos) {
+                return;
+            }
+            script->blocked_statements++;
+            source = deadline;
+        }
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < limit) {
+            const auto current = source ? source->Get() : std::nullopt;
+            if (current && std::chrono::steady_clock::now() >= *current) {
+                std::lock_guard<std::mutex> guard(script->record_lock);
+                failed = true;
+                throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::TRUNCATED,
+                                                    "Oracle publication IO deadline expired");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        failed = true;
+        throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::TRUNCATED, "never interrupted");
     }
 
 private:
     std::shared_ptr<FakeScript> script;
     std::string user;
+    std::shared_ptr<oracle_scanner::OracleIoDeadline> deadline;
     bool closed = false;
     bool failed = false;
 };
 
 ScopedOracleSessionFactory InstallFake(const std::shared_ptr<FakeScript> &script) {
     return ScopedOracleSessionFactory([script](const ConnectionConfig &config, const std::string &) {
-        return std::unique_ptr<OracleSession>(new FakeSession(script, config.user));
+        return std::unique_ptr<OracleSession>(new FakeSession(script, config.user, config.io_deadline));
     });
 }
 
@@ -2701,6 +2740,63 @@ void TestTransactionPoolsDoNotMixSecrets() {
     }
 }
 
+// Connection::Interrupt reaches the IO of every transaction path, on a session
+// the pool handed out: opening a query (a SELECT FOR UPDATE waits on its lock
+// right there, at bind), a scalar statement, and a batch. Each waits until the
+// caller's deadline expires, so only the interrupt can end it; the statement
+// is sent once, the session is not reused, and the connection goes on.
+void TestInterruptReachesEveryTransactionPath() {
+    struct Path {
+        std::string name;
+        std::string fragment;
+        std::string sql;
+    };
+    const std::vector<Path> paths = {
+        {"query open", "FOR UPDATE",
+         "SELECT * FROM oracle_query_transaction('tx', 'SELECT id FROM items WHERE id = 1 FOR UPDATE');"},
+        {"scalar execute", "SET n = n + 1",
+         "SELECT * FROM oracle_execute_transaction('tx', 'UPDATE items SET n = n + 1 WHERE id = 1');"},
+        {"batch", "SET n = n + 2",
+         "SELECT * FROM oracle_execute_many_transaction('tx', 'UPDATE items SET n = n + 2 WHERE id = :id', [{id: 1}]);"},
+    };
+    for (const auto &path : paths) {
+        auto script = PooledScript();
+        script->columns = {Column("ID", 2)};
+        script->rows = {{Number("1")}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+        CHECK(RunOn(database.db, {POOLED_INSERT}));
+        const auto opened = script->sessions_opened;
+        const auto closes = script->session_closes;
+        script->block_until_deadline = path.fragment;
+        duckdb::Connection connection(database.db);
+        bool failed = false;
+        std::chrono::steady_clock::time_point returned;
+        std::thread runner([&] {
+            failed = connection.Query(path.sql)->HasError();
+            returned = std::chrono::steady_clock::now();
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const auto interrupted = std::chrono::steady_clock::now();
+        connection.Interrupt();
+        runner.join();
+        if (!failed || returned - interrupted >= std::chrono::seconds(1)) {
+            std::cerr << "interrupt did not reach " << path.name << "\n";
+        }
+        CHECK(failed && returned - interrupted < std::chrono::seconds(1));
+        // It ran on the session the pool handed out, it was sent once, and
+        // that session, its exchange failed, is closed rather than returned.
+        CHECK(script->sessions_opened == opened && script->blocked_statements == 1);
+        CHECK(script->session_closes == closes + 1);
+        script->block_until_deadline.clear();
+        // The connection goes on: a new transaction begins and commits.
+        CHECK(!connection.Query("BEGIN;")->HasError() && !connection.Query(POOLED_INSERT)->HasError() &&
+              !connection.Query("COMMIT;")->HasError());
+        CHECK(script->blocked_statements == 1);
+    }
+}
+
 int main() {
     TestReadOnlyHiddenCatalogGuardsWrites();
 
@@ -2709,6 +2805,7 @@ int main() {
     TestTransactionSessionsThatMustNotBeReused();
     TestTransactionPoolSizeDetachAndAbandonedTransactions();
     TestTransactionPoolsDoNotMixSecrets();
+    TestInterruptReachesEveryTransactionPath();
     TestQueryTypeMappingAndValues();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();

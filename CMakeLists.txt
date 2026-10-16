@@ -232,6 +232,13 @@ if(ORACLE_SCANNER_BUILD_TESTS)
   link_extension_libraries(oracle_scanner_transaction_pool_live_test PRIVATE)
   target_include_directories(oracle_scanner_transaction_pool_live_test PRIVATE src/include)
   target_compile_features(oracle_scanner_transaction_pool_live_test PRIVATE cxx_std_17)
+
+  # Opt-in live checks of CLOB reads across packet and prefetch boundaries.
+  add_executable(oracle_scanner_clob_boundary_live_test test/cpp/clob_boundary_live_test.cpp)
+  target_link_libraries(oracle_scanner_clob_boundary_live_test PRIVATE duckdb_static)
+  link_extension_libraries(oracle_scanner_clob_boundary_live_test PRIVATE)
+  target_include_directories(oracle_scanner_clob_boundary_live_test PRIVATE src/include)
+  target_compile_features(oracle_scanner_clob_boundary_live_test PRIVATE cxx_std_17)
 endif()
 
 install(

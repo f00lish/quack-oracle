@@ -46,6 +46,13 @@ struct TtcLobResponse {
 // the execute and fetch paths use.
 TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t locator_size);
 
+//! The whole response to one LOB operation: the data, the return parameter and
+//! the end-of-call that closes it. TRUNCATED means more of it has yet to arrive
+//! and nothing else does; a refusal throws INVALID_STATE with Oracle's error
+//! number. bytes_consumed covers the end-of-call too.
+TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, size_t locator_size,
+                                        uint8_t server_field_version);
+
 // A CLOB read comes back as AL16UTF16 — two bytes per BMP character, surrogate
 // pairs above it — whatever the database character set is and whatever the
 // content holds. Live 19c, verified with ASCII and with Cyrillic: ten

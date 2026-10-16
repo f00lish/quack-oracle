@@ -71,53 +71,38 @@ TtcStatementChannel::TtcStatementChannel(TtcChannel &channel_p, OracleStatementR
 TtcLobResponse TtcStatementChannel::LobOperation(const TtcLobRequest &request, uint8_t server_field_version) {
     const auto call = channel.LockCall();
     channel.Send(EncodeTtcLobRequest(request));
-    auto response = channel.Receive();
-    // A refused read answers with the end-of-call and nothing else, so this has
-    // to be looked for before the data is decoded. Decoding first turns the
-    // server's own reason into a complaint about the shape of its refusal.
-    if (IsTtcErrorMessage(response)) {
-        const auto completion = DecodeTtcErrorPrefix(response, server_field_version);
-        throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
-                            completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
-                            completion.error_number);
-    }
-    // A LOB large enough to outgrow one packet arrives as several, and the
-    // return parameter that says how much was served is in the last of them.
-    // Decoding what has arrived so far would read the tail of the data as a
-    // parameter, so an incomplete response is a reason to read more rather
-    // than an error. The bound is the transport's, not a guess: each pass
-    // consumes one message, and a server that stops sending ends the call.
+    // A LOB large enough to outgrow one packet arrives as several, and so can
+    // the end-of-call behind it: a response is complete only when the data,
+    // the return parameter AND the end-of-call all decode. Until then the
+    // decoder answers TRUNCATED, which is the one reason to read another
+    // message; anything else it reports is final. Nothing is resent: a
+    // failure ends the operation, and the caller poisons the session.
     constexpr size_t MAX_LOB_RESPONSE_MESSAGES = 4096;
-    TtcLobResponse decoded;
+    // The largest read is one chunk of data plus a locator and an
+    // end-of-call; a response growing past that is not a LOB response.
+    constexpr size_t MAX_LOB_RESPONSE_BYTES = (16U << 20U) + (64U << 10U);
+    auto response = channel.Receive();
     for (size_t pass = 0;; pass++) {
         try {
-            decoded = DecodeTtcLobResponse(response, request.locator.size());
-            break;
+            return DecodeCompleteTtcLobCall(response, request.locator.size(), server_field_version);
         } catch (const ProtocolError &error) {
-            if (error.Kind() != ProtocolErrorKind::TRUNCATED || pass + 1 >= MAX_LOB_RESPONSE_MESSAGES) {
+            if (error.Kind() != ProtocolErrorKind::TRUNCATED) {
                 throw;
+            }
+            if (pass + 1 >= MAX_LOB_RESPONSE_MESSAGES) {
+                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                    "Oracle LOB response spans more messages than supported");
             }
         }
         const auto more = channel.Receive();
         if (more.empty()) {
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle stopped mid-way through a LOB response");
         }
+        if (response.size() > MAX_LOB_RESPONSE_BYTES || more.size() > MAX_LOB_RESPONSE_BYTES - response.size()) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle LOB response exceeds supported size");
+        }
         response.insert(response.end(), more.begin(), more.end());
     }
-    // Whatever follows the return parameter is the end of the call. An error
-    // there is the server refusing the read — a stale locator, a missing
-    // privilege — and it has to reach the caller rather than be skipped.
-    const std::vector<uint8_t> tail(response.begin() + static_cast<std::ptrdiff_t>(decoded.bytes_consumed),
-                                    response.end());
-    if (!tail.empty() && IsTtcErrorMessage(tail)) {
-        const auto completion = DecodeTtcErrorPrefix(tail, server_field_version);
-        if (completion.error_number != 0) {
-            throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
-                                completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
-                                completion.error_number);
-        }
-    }
-    return decoded;
 }
 
 std::unique_lock<std::recursive_mutex> TtcStatementChannel::LockCall() {

@@ -6121,6 +6121,245 @@ static void TestTransactionPoolFollowsEachCallersDeadline() {
     CHECK(stream.Write(&byte, 1) == 1);
 }
 
+// The whole response to a LOB read: data, return parameter and the end-of-call
+// behind them. A response is complete only with all three, so a response cut
+// anywhere — inside the data, exactly before the end-of-call, inside it —
+// reads as TRUNCATED and never as success. That last case is what a CLOB of
+// 8069 characters met live on 19c and Free: the data and the parameter fit
+// one packet, the end-of-call did not, and its remainder was decoded as if the
+// message had ended.
+namespace lob_completion {
+
+// The live 19c CLOB read of TestLobReadResponseIsUtf16ForAClob: ten Cyrillic
+// characters, the return parameter, and a 19c end-of-call (field version 12).
+std::vector<uint8_t> LiveClobRead() {
+    return {0x0e, 0xfe, 0x01, 0x14, 0x04, 0x3f, 0x04, 0x40, 0x04, 0x38, 0x04, 0x32, 0x04, 0x35, 0x04, 0x42, 0x00, 0x20,
+            0x04, 0x3c, 0x04, 0x38, 0x04, 0x40, 0x00, 0x08, 0x00, 0x70, 0x00, 0x02, 0x02, 0x0c, 0x82, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x7e, 0x3f, 0x00, 0x01, 0x24, 0x91, 0x00, 0x01, 0x24, 0x90,
+            0x00, 0x02, 0x00, 0x02, 0x03, 0x69, 0x6d, 0xb1, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3d, 0x55, 0xbe, 0x13,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x00, 0x22, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0xf6, 0xfe, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x24, 0x90, 0x00, 0x40, 0x86, 0xe9, 0x00, 0x03, 0x01, 0x0a, 0x04, 0x01,
+            0x01, 0x02, 0x32, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+}
+
+// The same response up to and including its return parameter.
+std::vector<uint8_t> LobPart() {
+    const auto whole = LiveClobRead();
+    const auto decoded = DecodeTtcLobResponse(whole, 114);
+    return std::vector<uint8_t>(whole.begin(), whole.begin() + static_cast<std::ptrdiff_t>(decoded.bytes_consumed));
+}
+
+// An end-of-call as a field-version-12 server writes one; nonzero errors carry
+// their text, as in TestTtcErrorCarriesTheFailingIteration.
+std::vector<uint8_t> EndOfCall(uint32_t error_number, const std::string &text = std::string()) {
+    ByteWriter writer;
+    writer.WriteByte(TTC_MESSAGE_ERROR).WriteUB4(error_number ? 2 : 0).WriteUB2(0).WriteUB4(0);
+    writer.WriteUB2(error_number ? 1 : 0).WriteUB2(0).WriteUB2(0).WriteUB4(0).WriteUB4(0);
+    writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0);
+    writer.WriteUB4(0).WriteUB2(0).WriteByte(0).WriteUB4(0).WriteUB2(0);
+    writer.WriteUB4(0);
+    writer.WriteByte(0).WriteByte(0).WriteUB2(0);
+    writer.WriteUB4(0).WriteUB4(0);
+    writer.WriteByte(0).WriteByte(0).WriteByte(0);
+    writer.WriteUB4(error_number).WriteUB8(0);
+    if (error_number) {
+        writer.WriteLengthPrefixed(std::vector<uint8_t>(text.begin(), text.end()));
+    }
+    return writer.Data();
+}
+
+std::vector<uint8_t> Concat(std::vector<uint8_t> left, const std::vector<uint8_t> &right) {
+    left.insert(left.end(), right.begin(), right.end());
+    return left;
+}
+
+void ExpectOracleError(uint32_t code, const std::function<void()> &work) {
+    try {
+        work();
+    } catch (const ProtocolError &error) {
+        CHECK(error.Kind() == ProtocolErrorKind::INVALID_STATE && error.OracleCode() == code);
+        return;
+    }
+    CHECK(false && "expected an Oracle error");
+}
+
+// A server end of the channel: every inbound message as its own TTC message,
+// optionally stopping early; what the client sent is kept to count requests.
+struct ScriptedLobServer {
+    explicit ScriptedLobServer(const std::vector<std::vector<uint8_t>> &messages) {
+        for (const auto &message : messages) {
+            for (const auto &packet : EncodeTnsDataPackets(message, true, 2048)) {
+                wire.insert(wire.end(), packet.begin(), packet.end());
+            }
+        }
+    }
+    size_t Requests(FragmentedStream &stream) const {
+        FragmentedStream sent_stream(stream.output, 7);
+        TnsPacketStream sent_packets(sent_stream, true, 2048);
+        size_t requests = 0;
+        while (sent_stream.read_offset < sent_stream.input.size()) {
+            const auto packet = sent_packets.Receive();
+            requests += packet.type == TnsPacketType::DATA ? 1 : 0;
+        }
+        return requests;
+    }
+    std::vector<uint8_t> wire;
+};
+
+TtcLobRequest ReadRequest() {
+    TtcLobRequest request;
+    request.sequence = 3;
+    request.locator.assign(114, 0x11);
+    request.operation = LOB_OP_READ;
+    request.offset = 1;
+    request.amount = 10;
+    return request;
+}
+
+TtcLobResponse Run(FragmentedStream &stream) {
+    TnsPacketStream packets(stream, true, 2048);
+    TtcChannel channel(packets, 2048);
+    OracleStatementRegistry registry;
+    TtcStatementChannel statements(channel, registry);
+    return statements.LobOperation(ReadRequest(), 12);
+}
+
+} // namespace lob_completion
+
+static void TestLobCallIsCompleteOnlyWithItsEndOfCall() {
+    using namespace lob_completion;
+    const auto whole = LiveClobRead();
+    const auto decoded = DecodeCompleteTtcLobCall(whole, 114, 12);
+    CHECK(decoded.amount == 10 && decoded.data.size() == 20 && decoded.bytes_consumed == whole.size());
+    // Every cut, including exactly at the end of the return parameter, which
+    // the decoder used to accept as the whole response.
+    CHECK(LobPart().size() < whole.size());
+    for (size_t length = 1; length < whole.size(); length++) {
+        const std::vector<uint8_t> partial(whole.begin(), whole.begin() + static_cast<std::ptrdiff_t>(length));
+        ExpectError(ProtocolErrorKind::TRUNCATED, [&] { (void)DecodeCompleteTtcLobCall(partial, 114, 12); });
+    }
+    ExpectError(ProtocolErrorKind::TRUNCATED, [] { (void)DecodeCompleteTtcLobCall({}, 114, 12); });
+    // STATUS and END_OF_REQUEST end a call as they do for fetch and PL/SQL.
+    CHECK(DecodeCompleteTtcLobCall(Concat(LobPart(), {TTC_MESSAGE_STATUS, 0, 0}), 114, 12).amount == 10);
+    CHECK(DecodeCompleteTtcLobCall(Concat(LobPart(), {29}), 114, 12).amount == 10);
+}
+
+static void TestLobCallRefusalsKeepTheirOracleError() {
+    using namespace lob_completion;
+    const auto refusal = EndOfCall(22922, "ORA-22922: nonexistent LOB value\n");
+    CHECK(DecodeTtcErrorPrefix(refusal, 12).error_number == 22922);
+    // A refusal alone, and a refusal after data: the server's own number.
+    ExpectOracleError(22922, [&] { (void)DecodeCompleteTtcLobCall(refusal, 114, 12); });
+    ExpectOracleError(22922, [&] { (void)DecodeCompleteTtcLobCall(Concat(LobPart(), refusal), 114, 12); });
+    // Cut short, either is still only incomplete.
+    for (size_t length = 1; length < refusal.size(); length++) {
+        const std::vector<uint8_t> partial(refusal.begin(), refusal.begin() + static_cast<std::ptrdiff_t>(length));
+        ExpectError(ProtocolErrorKind::TRUNCATED, [&] { (void)DecodeCompleteTtcLobCall(partial, 114, 12); });
+        ExpectError(ProtocolErrorKind::TRUNCATED,
+                    [&] { (void)DecodeCompleteTtcLobCall(Concat(LobPart(), partial), 114, 12); });
+    }
+    // Something other than an end-of-call after the parameter is not a reason
+    // to wait for more: it is not a LOB response.
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)DecodeCompleteTtcLobCall(Concat(LobPart(), {0x63}), 114, 12); });
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { (void)DecodeCompleteTtcLobCall(Concat(LobPart(), {TTC_MESSAGE_LOB_DATA, 0}), 114, 12); });
+}
+
+static void TestLobOperationReadsTheWholeResponse() {
+    using namespace lob_completion;
+    const auto lob = LobPart();
+    const auto end = EndOfCall(0);
+    // The end-of-call in a message of its own, and then split in two: the
+    // operation reads on, and sends its request exactly once.
+    for (const auto &messages : std::vector<std::vector<std::vector<uint8_t>>> {
+             {lob, end},
+             {lob, std::vector<uint8_t>(end.begin(), end.begin() + 9), std::vector<uint8_t>(end.begin() + 9, end.end())},
+             {std::vector<uint8_t>(lob.begin(), lob.begin() + 30), std::vector<uint8_t>(lob.begin() + 30, lob.end()), end},
+             // The 8069-character case: data, parameter and the start of the
+             // end-of-call in one message, the rest of it in the next.
+             {Concat(lob, std::vector<uint8_t>(end.begin(), end.begin() + 9)), std::vector<uint8_t>(end.begin() + 9, end.end())}}) {
+        ScriptedLobServer server(messages);
+        FragmentedStream stream(server.wire, 5);
+        const auto decoded = Run(stream);
+        CHECK(decoded.amount == 10 && DecodeUtf16BeToUtf8(decoded.data).size() == 19);
+        CHECK(server.Requests(stream) == 1);
+        // And the end-of-call was read: nothing of this call is left in the
+        // channel for the next one to trip over.
+        CHECK(stream.read_offset == stream.input.size());
+    }
+    // A refusal in its own message keeps its number.
+    {
+        ScriptedLobServer server({lob, EndOfCall(22922, "ORA-22922: nonexistent LOB value\n")});
+        FragmentedStream stream(server.wire, 5);
+        ExpectOracleError(22922, [&] { (void)Run(stream); });
+        CHECK(server.Requests(stream) == 1);
+    }
+    // The transport ends before the end-of-call: an error, not a success and
+    // not a second request.
+    {
+        ScriptedLobServer server({lob});
+        FragmentedStream stream(server.wire, 5);
+        ExpectError(ProtocolErrorKind::TRUNCATED, [&] { (void)Run(stream); });
+        CHECK(server.Requests(stream) == 1);
+    }
+    // A response that never completes is bounded by the message limit.
+    {
+        std::vector<std::vector<uint8_t>> messages = {{TTC_MESSAGE_LOB_DATA, 0xfe}};
+        for (size_t index = 0; index < 4100; index++) {
+            std::vector<uint8_t> chunk = {0x01, 0x14};
+            chunk.insert(chunk.end(), 20, 0x00);
+            messages.push_back(chunk);
+        }
+        ScriptedLobServer server(messages);
+        FragmentedStream stream(server.wire, 4096);
+        ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)Run(stream); });
+        CHECK(server.Requests(stream) == 1);
+    }
+}
+
+// The caller's deadline expiring while the end-of-call is still to come ends
+// the operation with that error; nothing is sent again.
+static void TestLobOperationObeysTheDeadlineMidResponse() {
+    using namespace lob_completion;
+    class ExpiringStream final : public FragmentedStream {
+    public:
+        ExpiringStream(std::vector<uint8_t> wire, size_t first_message, std::shared_ptr<OracleIoDeadline> source_p)
+            : FragmentedStream(std::move(wire), 5), boundary(first_message), source(std::move(source_p)) {
+        }
+        size_t Read(uint8_t *destination, size_t maximum_size) override {
+            if (read_offset >= boundary) {
+                source->Set(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+            }
+            return FragmentedStream::Read(destination, maximum_size);
+        }
+        size_t boundary;
+        std::shared_ptr<OracleIoDeadline> source;
+    };
+    const auto lob = LobPart();
+    ScriptedLobServer first({lob});
+    ScriptedLobServer server({lob, EndOfCall(0)});
+    auto source = std::make_shared<OracleIoDeadline>();
+    auto inner = std::make_unique<ExpiringStream>(server.wire, first.wire.size(), source);
+    auto &raw = *inner;
+    OracleBoundDeadlineStream stream(std::move(inner), std::make_shared<OracleIoDeadlineBinding>(source));
+    TnsPacketStream packets(stream, true, 2048);
+    TtcChannel channel(packets, 2048);
+    OracleStatementRegistry registry;
+    TtcStatementChannel statements(channel, registry);
+    bool expired = false;
+    try {
+        (void)statements.LobOperation(ReadRequest(), 12);
+    } catch (const ProtocolError &error) {
+        expired = error.Kind() == ProtocolErrorKind::TRUNCATED &&
+                  std::string(error.what()).find("deadline expired") != std::string::npos;
+    }
+    CHECK(expired);
+    CHECK(server.Requests(raw) == 1);
+}
+
 int main() {
 
     TestUniversalIntegers();
@@ -6245,6 +6484,10 @@ int main() {
     TestTransactionPoolReplacesASessionThatDiedIdle();
     TestTransactionPoolIsBounded();
     TestTransactionPoolFollowsEachCallersDeadline();
+    TestLobCallIsCompleteOnlyWithItsEndOfCall();
+    TestLobCallRefusalsKeepTheirOracleError();
+    TestLobOperationReadsTheWholeResponse();
+    TestLobOperationObeysTheDeadlineMidResponse();
     std::cout << "oracle_scanner protocol tests passed\n";
     return 0;
 }

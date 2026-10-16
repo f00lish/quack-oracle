@@ -2,6 +2,8 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_error.hpp"
+#include "oracle_scanner/ttc_transaction.hpp"
 #include "oracle_scanner/ttc_auth.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
 
@@ -11,6 +13,7 @@ namespace {
 
 constexpr size_t MAX_LOCATOR_BYTES = 4096;
 constexpr size_t MAX_LOB_CHUNK_BYTES = 16U << 20U;
+constexpr uint8_t TTC_MESSAGE_LOB_END_OF_REQUEST = 29;
 
 } // namespace
 
@@ -74,6 +77,69 @@ TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t 
     result.amount = reader.ReadUB8();
     result.bytes_consumed = reader.Position();
     return result;
+}
+
+TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, size_t locator_size,
+                                        uint8_t server_field_version) {
+    if (response.empty()) {
+        throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC LOB response is empty");
+    }
+    // A refused read answers with the end-of-call and nothing else, so this has
+    // to be looked for before the data is decoded. Decoding first turns the
+    // server's own reason into a complaint about the shape of its refusal. An
+    // end-of-call cut short reads as TRUNCATED from the decoder itself.
+    if (IsTtcErrorMessage(response)) {
+        const auto completion = DecodeTtcErrorPrefix(response, server_field_version);
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
+                            completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
+                            completion.error_number);
+    }
+    auto decoded = DecodeTtcLobResponse(response, locator_size);
+    // The return parameter is not the end of the call: an end-of-call follows
+    // it, and only a whole one says the server is done. Nothing after the
+    // parameter, or part of an end-of-call, means more of the response is
+    // still to come — not that it ended.
+    size_t offset = decoded.bytes_consumed;
+    bool completed = false;
+    while (offset < response.size()) {
+        const std::vector<uint8_t> tail(response.begin() + static_cast<std::ptrdiff_t>(offset), response.end());
+        switch (tail.front()) {
+        case TTC_MESSAGE_ERROR: {
+            // An error there is the server refusing the read — a stale locator,
+            // a missing privilege — and it has to reach the caller.
+            const auto completion = DecodeTtcErrorPrefix(tail, server_field_version);
+            if (completion.error_number != 0) {
+                throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
+                                    completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
+                                    completion.error_number);
+            }
+            offset += completion.bytes_consumed;
+            completed = true;
+            break;
+        }
+        case TTC_MESSAGE_STATUS: {
+            ByteReader reader(tail);
+            reader.ReadByte();
+            reader.ReadUB4();
+            reader.ReadUB2();
+            offset += reader.Position();
+            completed = true;
+            break;
+        }
+        case TTC_MESSAGE_LOB_END_OF_REQUEST:
+            offset++;
+            completed = true;
+            break;
+        default:
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                "unknown TTC message " + std::to_string(tail.front()) + " after a LOB return parameter");
+        }
+    }
+    if (!completed) {
+        throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC LOB response has no end-of-call yet");
+    }
+    decoded.bytes_consumed = offset;
+    return decoded;
 }
 
 std::vector<uint8_t> DecodeUtf16BeToUtf8(const std::vector<uint8_t> &utf16) {

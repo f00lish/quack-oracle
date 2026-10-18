@@ -7,6 +7,8 @@
 // theirs is left. Nothing is printed but stage names and Oracle error codes.
 #include "duckdb.hpp"
 #include "oracle_scanner_extension.hpp"
+#include "core_functions_extension.hpp"
+#include "live_query_result.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -68,8 +70,8 @@ void Check(bool condition, const std::string &stage) {
     }
 }
 
-unique_ptr<MaterializedQueryResult> Run(Connection &con, const std::string &sql, const std::string &stage) {
-    auto result = con.Query(sql);
+unique_ptr<LiveQueryResult> Run(Connection &con, const std::string &sql, const std::string &stage) {
+    auto result = make_uniq<LiveQueryResult>(con.Query(sql));
     if (result->HasError()) {
         Fail(stage, result->GetError());
     }
@@ -165,6 +167,7 @@ std::string Items(DuckDB &db, const std::string &catalog, const std::string &sta
 
 int main() {
     DuckDB db(nullptr);
+    db.LoadStaticExtension<CoreFunctionsExtension>();
     db.LoadStaticExtension<OracleScannerExtension>();
     Connection admin(db);
     const auto suffix = Random(8);

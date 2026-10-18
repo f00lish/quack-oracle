@@ -7,6 +7,8 @@
 // error codes are printed.
 #include "duckdb.hpp"
 #include "oracle_scanner_extension.hpp"
+#include "core_functions_extension.hpp"
+#include "live_query_result.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -72,8 +74,8 @@ void Check(bool condition, const std::string &stage) {
     }
 }
 
-unique_ptr<MaterializedQueryResult> Run(Connection &con, const std::string &sql, const std::string &stage) {
-    auto result = con.Query(sql);
+unique_ptr<LiveQueryResult> Run(Connection &con, const std::string &sql, const std::string &stage) {
+    auto result = make_uniq<LiveQueryResult>(con.Query(sql));
     if (result->HasError()) {
         Fail(stage, result->GetError());
     }
@@ -127,6 +129,7 @@ std::vector<int> Join(std::initializer_list<std::vector<int>> parts) {
 
 int main() {
     DuckDB db(nullptr);
+    db.LoadStaticExtension<CoreFunctionsExtension>();
     db.LoadStaticExtension<OracleScannerExtension>();
     Connection admin(db);
     const auto user = "QO_CLOB_" + Random(8);

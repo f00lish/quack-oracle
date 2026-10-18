@@ -179,6 +179,10 @@ struct OracleQueryBindData final : TableFunctionData {
     std::vector<OracleColumn> columns;
     std::vector<LogicalType> types;
     bool transactional_query = false;
+    // oracle_query_transaction_typed: the columns were declared by the caller,
+    // not described by Oracle, so bind ran nothing and init checks the
+    // statement's describe against them by name as well as by type.
+    bool declared_schema = false;
     std::string query_sql;
     std::vector<oracle_scanner::OracleBind> query_binds;
 

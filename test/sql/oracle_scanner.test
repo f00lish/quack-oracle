@@ -332,7 +332,7 @@ ATTACH 'missing_oracle_secret' AS missing_oracle (TYPE oracle_scanner);
 Binder Error: Oracle secret 'missing_oracle_secret' was not found
 
 # Every SQL function carries documentation in duckdb_functions(): the exact
-# list of twenty-seven, their kinds, argument names in place of col0..colN, and the
+# list of twenty-nine, their kinds, argument names in place of col0..colN, and the
 # argument types, varargs and named parameters exactly as they were before the
 # documentation was added.
 query TTTTT
@@ -359,17 +359,19 @@ oracle_close_call	table	[cursor_handle]	[VARCHAR]	NULL
 oracle_cursor	table	[cursor_handle]	[VARCHAR]	NULL
 oracle_execute	table	[secret_name, sql]	[VARCHAR, VARCHAR]	ANY
 oracle_execute_admin	table	[secret_name, sql]	[VARCHAR, VARCHAR]	NULL
+oracle_execute_composite_transaction	table	[catalog_name, statements, params, expected_row_counts]	[VARCHAR, 'VARCHAR[]', ANY, 'BIGINT[]']	NULL
 oracle_execute_many	table	[secret_name, sql, rows]	[VARCHAR, VARCHAR, ANY]	NULL
 oracle_execute_many_transaction	table	[catalog_name, sql, rows, exact_counts]	[VARCHAR, VARCHAR, ANY, BOOLEAN]	NULL
 oracle_execute_transaction	table	[catalog_name, sql]	[VARCHAR, VARCHAR]	ANY
 oracle_query	table	[secret_name, sql]	[VARCHAR, VARCHAR]	ANY
 oracle_query_transaction	table	[catalog_name, sql]	[VARCHAR, VARCHAR]	ANY
+oracle_query_transaction_typed	table	[catalog_name, sql, column_names, column_types]	[VARCHAR, VARCHAR, 'VARCHAR[]', 'VARCHAR[]']	ANY
 oracle_scan_parallel	table	[secret_name, table_name, key_column, shards]	[VARCHAR, VARCHAR, VARCHAR, BIGINT]	NULL
 oracle_scanner_io_deadline_version	scalar	[]	[]	NULL
 oracle_scanner_version	scalar	[]	[]	NULL
 oracle_transaction_status	table	[catalog_name]	[VARCHAR]	NULL
 
-# One scalar and nineteen table functions, and no function whose documentation
+# Two scalar and twenty-seven table functions, and no function whose documentation
 # is missing: a non-empty one-sentence description, exactly one non-empty
 # example, one or two categories starting with 'oracle', and no placeholder
 # argument names.
@@ -378,7 +380,7 @@ SELECT count(*) FILTER (WHERE function_type = 'scalar'), count(*) FILTER (WHERE 
 FROM duckdb_functions()
 WHERE starts_with(function_name, 'oracle_');
 ----
-2	25
+2	27
 
 query I
 SELECT count(*)

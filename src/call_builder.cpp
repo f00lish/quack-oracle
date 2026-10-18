@@ -1,10 +1,12 @@
 #include "oracle_scanner/call_builder.hpp"
 #include "oracle_scanner/bind_validation.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/sql_statement.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <set>
+#include <unordered_map>
 
 namespace oracle_scanner {
 
@@ -199,8 +201,79 @@ std::string BuildOracleFunctionCallBlock(const std::string &qualified_name, cons
     return result;
 }
 
+std::string BuildOracleDmlCompositeBlock(const std::vector<OracleDmlOperation> &operations,
+                                         const std::vector<OracleBind> &arguments) {
+    if (operations.empty()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML composite needs at least one statement");
+    }
+    if (operations.size() > ORACLE_DML_COMPOSITE_MAX_OPERATIONS) {
+        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle DML composite has more than 16 statements");
+    }
+    if (arguments.size() > ORACLE_DML_COMPOSITE_MAX_BINDS) {
+        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle DML composite has more than 256 binds");
+    }
+    // Input-only and unique by name, which is what lets one value serve every
+    // statement that names it.
+    ValidateOracleBinds(arguments, OracleBindUse::DML);
+    std::unordered_map<std::string, const OracleBind *> by_name;
+    size_t payload_bytes = 0;
+    for (const auto &bind : arguments) {
+        payload_bytes += bind.value ? bind.value->size() : 0;
+        by_name.emplace(CanonicalOracleBindName(bind.name), &bind);
+    }
+    if (payload_bytes > ORACLE_DML_COMPOSITE_MAX_PAYLOAD_BYTES) {
+        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle DML composite bind values exceed 8 MiB");
+    }
+    std::string block = "BEGIN\n";
+    size_t sql_bytes = 0;
+    for (size_t index = 0; index < operations.size(); index++) {
+        const auto &operation = operations[index];
+        sql_bytes += operation.sql.size();
+        if (sql_bytes > ORACLE_DML_COMPOSITE_MAX_SQL_BYTES) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle DML composite SQL exceeds 64 KiB");
+        }
+        if (operation.expected_rows > ORACLE_DML_COMPOSITE_MAX_EXPECTED_ROWS) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                "Oracle DML composite expects more than 1000000 rows from one statement");
+        }
+        std::vector<OracleBind> statement_binds;
+        for (const auto &placeholder : ExtractOracleBindPlaceholders(operation.sql)) {
+            const auto found = by_name.find(placeholder);
+            if (found == by_name.end()) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                    "Oracle DML composite statement " + std::to_string(index + 1) +
+                                        " has a placeholder with no bind");
+            }
+            statement_binds.push_back(*found->second);
+        }
+        // One INSERT, UPDATE or DELETE with no terminator outside a literal or
+        // comment: no statement can end early and put PL/SQL of its own, a
+        // COMMIT or DDL into the block.
+        ValidateOracleDml(operation.sql, statement_binds);
+        // The newline ends a trailing `--` comment before the terminator.
+        block += operation.sql + "\n;\nIF SQL%ROWCOUNT <> " + std::to_string(operation.expected_rows) +
+                 " THEN RAISE_APPLICATION_ERROR(" + std::to_string(ORACLE_DML_COMPOSITE_ROW_COUNT_ERROR) +
+                 ", 'DML composite operation " + std::to_string(index + 1) +
+                 " affected row count mismatch'); END IF;\n";
+    }
+    block += "END;";
+    // Every bind is used by some statement: a value nothing names is refused
+    // rather than sent.
+    ValidateOracleStatementBinds(block, arguments, OracleBindUse::CALL);
+    return block;
+}
+
 std::string BuildOracleCallBlock(const OracleCallRequest &request) {
+    if (request.kind != OracleCallableKind::DML_COMPOSITE && !request.dml_operations.empty()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle callable request must not carry DML statements");
+    }
     switch (request.kind) {
+    case OracleCallableKind::DML_COMPOSITE:
+        if (!request.qualified_name.empty() || request.return_bind.has_value()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                "Oracle DML composite request must not name a callable or a return bind");
+        }
+        return BuildOracleDmlCompositeBlock(request.dml_operations, request.arguments);
     case OracleCallableKind::PROCEDURE:
         if (request.return_bind.has_value()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle procedure request must not include a return bind");

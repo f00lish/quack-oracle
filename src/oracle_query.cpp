@@ -624,6 +624,99 @@ unique_ptr<FunctionData> OracleTransactionQueryBind(ClientContext &context, Tabl
     return OracleQueryBindCommon(context, input, return_types, names, true);
 }
 
+// Oracle allows at most 1000 columns in a select list.
+constexpr idx_t ORACLE_DECLARED_COLUMNS_LIMIT = 1000;
+
+// A declared column type has to be one an Oracle column can map to, or no
+// describe could ever match it. DECIMAL keeps its width and scale; the others
+// are plain types, so a collation or a nested type is refused here.
+LogicalType DeclaredColumnType(ClientContext &context, const std::string &text) {
+    LogicalType type;
+    try {
+        type = TransformStringToLogicalType(text, context);
+    } catch (const std::exception &) {
+        throw BinderException("oracle_query_transaction_typed column type \"%s\" is not a DuckDB type", text);
+    }
+    switch (type.id()) {
+    case LogicalTypeId::DECIMAL:
+        return type;
+    case LogicalTypeId::VARCHAR:
+    case LogicalTypeId::BIGINT:
+    case LogicalTypeId::BLOB:
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+    case LogicalTypeId::TIMESTAMP:
+    case LogicalTypeId::TIMESTAMP_NS:
+        if (type == LogicalType(type.id())) {
+            return type;
+        }
+        break;
+    default:
+        break;
+    }
+    throw BinderException("oracle_query_transaction_typed column type %s is not one an Oracle column maps to; use "
+                          "VARCHAR, BIGINT, DECIMAL(p,s), DOUBLE, FLOAT, BLOB, TIMESTAMP or TIMESTAMP_NS",
+                          type.ToString());
+}
+
+// The caller states the result columns, so bind needs Oracle for nothing: it
+// opens no session, takes no lock and runs no statement, and a PREPAREd plan
+// carries only the SQL, its binds and the declared columns. Init runs the
+// statement once, in whichever transaction is current then, and refuses a
+// describe that does not match the declaration.
+unique_ptr<FunctionData> OracleTransactionTypedQueryBind(ClientContext &context, TableFunctionBindInput &input,
+                                                         vector<LogicalType> &return_types,
+                                                         vector<Identifier> &names) {
+    if (input.inputs.size() > 5) {
+        throw BinderException("oracle_query_transaction_typed accepts at most one params argument");
+    }
+    for (idx_t index = 0; index < 4; index++) {
+        if (input.inputs[index].IsNull()) {
+            throw BinderException("oracle_query_transaction_typed catalog, SQL, column names and column types "
+                                  "cannot be NULL");
+        }
+    }
+    auto result = make_uniq<OracleQueryBindData>();
+    result->transactional_query = true;
+    result->declared_schema = true;
+    result->query_sql = input.inputs[1].GetValue<std::string>();
+    if (input.inputs.size() == 5) {
+        result->query_binds = input.inputs[4].type().id() == LogicalTypeId::STRUCT
+                                  ? NamedBinds(input.inputs[4], "oracle_query_transaction_typed")
+                                  : PositionalBinds(input.inputs[4], "oracle_query_transaction_typed");
+    }
+    oracle_scanner::ValidateOracleQuery(result->query_sql, result->query_binds);
+    const auto &declared_names = ListValue::GetChildren(input.inputs[2]);
+    const auto &declared_types = ListValue::GetChildren(input.inputs[3]);
+    if (declared_names.empty() || declared_names.size() != declared_types.size()) {
+        throw BinderException("oracle_query_transaction_typed needs as many column types as column names, and at "
+                              "least one of each");
+    }
+    if (declared_names.size() > ORACLE_DECLARED_COLUMNS_LIMIT) {
+        throw BinderException("oracle_query_transaction_typed declares more than 1000 columns");
+    }
+    case_insensitive_set_t used_names;
+    for (idx_t index = 0; index < declared_names.size(); index++) {
+        if (declared_names[index].IsNull() || declared_types[index].IsNull()) {
+            throw BinderException("oracle_query_transaction_typed column names and types cannot contain NULL");
+        }
+        auto name = declared_names[index].GetValue<std::string>();
+        if (name.empty() || name.find('\0') != std::string::npos || !used_names.insert(name).second) {
+            throw BinderException("oracle_query_transaction_typed column names must be non-empty and unique");
+        }
+        const auto type = DeclaredColumnType(context, declared_types[index].GetValue<std::string>());
+        OracleColumn column;
+        column.name = name;
+        result->columns.push_back(std::move(column));
+        result->types.push_back(type);
+        names.push_back(Identifier(std::move(name)));
+        return_types.push_back(type);
+    }
+    // Resolving the catalog reads the attached database's own state only.
+    result->catalog_name = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>()).catalog_name;
+    return std::move(result);
+}
+
 unique_ptr<FunctionData> OracleTransactionExecuteBind(ClientContext &context, TableFunctionBindInput &input,
                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
@@ -1627,6 +1720,104 @@ void OracleTransactionManyFunction(ClientContext &, TableFunctionInput &input, D
     state.next += count;
 }
 
+struct OracleCompositeBindData final : TableFunctionData {
+    std::string catalog_name;
+    oracle_scanner::OracleCallRequest request;
+    // The sum of the expected counts. The block raises unless every statement
+    // affected exactly its count, so a block that returns affected this many.
+    uint64_t affected_rows = 0;
+};
+
+unique_ptr<FunctionData> OracleCompositeBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
+    for (const auto &value : input.inputs) {
+        if (value.IsNull()) {
+            throw BinderException("oracle_execute_composite_transaction arguments cannot be NULL");
+        }
+    }
+    const auto params_type = input.inputs[2].type().id();
+    if (params_type != LogicalTypeId::STRUCT && params_type != LogicalTypeId::LIST) {
+        throw BinderException("oracle_execute_composite_transaction params must be a STRUCT of named binds or a LIST "
+                              "of positional ones");
+    }
+    const auto &statements = ListValue::GetChildren(input.inputs[1]);
+    const auto &counts = ListValue::GetChildren(input.inputs[3]);
+    if (statements.empty() || statements.size() > oracle_scanner::ORACLE_DML_COMPOSITE_MAX_OPERATIONS) {
+        throw BinderException("oracle_execute_composite_transaction needs 1..16 statements");
+    }
+    if (statements.size() != counts.size()) {
+        throw BinderException("oracle_execute_composite_transaction needs one expected row count per statement");
+    }
+    auto result = make_uniq<OracleCompositeBindData>();
+    result->request.kind = oracle_scanner::OracleCallableKind::DML_COMPOSITE;
+    result->request.arguments = params_type == LogicalTypeId::STRUCT
+                                    ? NamedBinds(input.inputs[2], "oracle_execute_composite_transaction")
+                                    : PositionalBinds(input.inputs[2], "oracle_execute_composite_transaction");
+    for (idx_t index = 0; index < statements.size(); index++) {
+        if (statements[index].IsNull() || counts[index].IsNull()) {
+            throw BinderException("oracle_execute_composite_transaction statement %llu or its count is NULL",
+                                  index + 1);
+        }
+        const auto count = counts[index].GetValue<int64_t>();
+        if (count < 0 || static_cast<uint64_t>(count) > oracle_scanner::ORACLE_DML_COMPOSITE_MAX_EXPECTED_ROWS) {
+            throw BinderException("oracle_execute_composite_transaction expected row count %lld of statement %llu is "
+                                  "outside 0..1000000",
+                                  count, index + 1);
+        }
+        result->request.dml_operations.push_back({statements[index].GetValue<std::string>(),
+                                                  static_cast<uint64_t>(count)});
+        result->affected_rows += static_cast<uint64_t>(count);
+    }
+    // The whole block is built here once, so every refusal it can make is made
+    // before a session is touched.
+    try {
+        oracle_scanner::BuildOracleCallBlock(result->request);
+    } catch (const std::exception &error) {
+        throw BinderException("oracle_execute_composite_transaction statements are invalid: %s", error.what());
+    }
+    auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot write to an attached read-only Oracle catalog");
+    }
+    result->catalog_name = target.catalog_name;
+    names.push_back(Identifier("affected_rows"));
+    return_types.push_back(LogicalType::UBIGINT);
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OracleCompositeInit(ClientContext &context, TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OracleCompositeBindData>();
+    auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot write to an attached read-only Oracle catalog");
+    }
+    OracleCallerInterruptScope interrupt(context);
+    try {
+        auto &session = TransactionSession(context, target);
+        // Sent once. A block that failed is never retried: the statements
+        // before the failing one ran, and only the transaction's rollback
+        // takes them back.
+        auto result = session.Call(bind.request);
+        if (!result.outputs.empty() || !result.explicit_cursors.empty() || !result.implicit_cursors.empty()) {
+            for (auto &cursor : result.explicit_cursors) {
+                cursor->Close();
+            }
+            for (auto &cursor : result.implicit_cursors) {
+                cursor->Close();
+            }
+            throw IOException("oracle_execute_composite_transaction received results it did not ask for");
+        }
+        interrupt.Check();
+        return make_uniq<OracleExecuteGlobalState>(bind.affected_rows);
+    } catch (const std::exception &error) {
+        // Join first, retain the expired caller deadline through cleanup.
+        // Rollback cannot wait for a reply on the interrupted exchange.
+        interrupt.Stop();
+        PoisonTransactionSession(context, target.catalog_name);
+        ThrowOracleAdapterError("oracle_execute_composite_transaction failed", error);
+    }
+}
+
 struct OracleTransactionCallBindData final : TableFunctionData {
     std::string catalog_name;
     std::string procedure;
@@ -1991,7 +2182,25 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         try {
             cursor = session->Query(bind.query_sql, bind.query_binds);
             const auto &columns = cursor->Columns();
-            if (columns.size() != bind.columns.size()) {
+            if (bind.declared_schema) {
+                // The declaration is the plan's contract: Oracle's describe has
+                // to match it column for column, by name and by mapped type.
+                if (columns.size() != bind.columns.size()) {
+                    throw IOException("Oracle returned %llu columns where the declaration has %llu", columns.size(),
+                                      bind.columns.size());
+                }
+                for (idx_t i = 0; i < columns.size(); i++) {
+                    if (!StringUtil::CIEquals(columns[i].name, bind.columns[i].name)) {
+                        throw IOException("Oracle column %llu is %s where %s was declared", i + 1, columns[i].name,
+                                          bind.columns[i].name);
+                    }
+                    const auto type = TypeFor(columns[i]);
+                    if (type != bind.types[i]) {
+                        throw IOException("Oracle column %s maps to %s where %s was declared", columns[i].name,
+                                          type.ToString(), bind.types[i].ToString());
+                    }
+                }
+            } else if (columns.size() != bind.columns.size()) {
                 throw IOException("Oracle query describe changed; prepare the query again");
             }
             for (idx_t i = 0; i < columns.size(); i++) {
@@ -2008,7 +2217,9 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             cursor.reset();
             session.Poison();
             PoisonTransactionSession(context, bind.catalog_name);
-            ThrowOracleAdapterError("oracle_query_transaction failed", error);
+            ThrowOracleAdapterError(bind.declared_schema ? "oracle_query_transaction_typed failed"
+                                                         : "oracle_query_transaction failed",
+                                    error);
         }
     }
     for (const auto column_id : input.column_ids) {
@@ -2176,6 +2387,34 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
         {{"catalog_name", "sql", "params"},
          "Reads through the attached Oracle catalog's current transaction, pinning one session until COMMIT or ROLLBACK.",
          "SELECT * FROM oracle_query_transaction('ora', 'SELECT 1 FROM dual');",
+         {"oracle", "transaction"}}));
+
+    TableFunction typed_query("oracle_query_transaction_typed",
+                              {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR),
+                               LogicalType::LIST(LogicalType::VARCHAR)},
+                              OracleQueryFunction, OracleTransactionTypedQueryBind, OracleQueryInit);
+    typed_query.GetSignature().AddArgs("params", LogicalType::ANY);
+    infos.push_back(DocumentedTableFunctionInfo(
+        std::move(typed_query),
+        {{"catalog_name", "sql", "column_names", "column_types", "params"},
+         "Reads through the attached Oracle catalog's current transaction with caller-declared result columns, so "
+         "binding runs nothing in Oracle and the query runs once against a describe that must match them.",
+         "SELECT * FROM oracle_query_transaction_typed('ora', "
+         "'SELECT DEPARTMENT_ID, DEPARTMENT_NAME FROM QUACK_DEMO_DEPARTMENTS ORDER BY DEPARTMENT_ID', "
+         "['DEPARTMENT_ID', 'DEPARTMENT_NAME'], ['BIGINT', 'VARCHAR']);",
+         {"oracle", "transaction"}}));
+
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_execute_composite_transaction",
+                      {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), LogicalType::ANY,
+                       LogicalType::LIST(LogicalType::BIGINT)},
+                      OracleExecuteFunction, OracleCompositeBind, OracleCompositeInit),
+        {{"catalog_name", "statements", "params", "expected_row_counts"},
+         "Runs up to 16 INSERT, UPDATE or DELETE statements in one round trip on the attached Oracle catalog's "
+         "transaction, with Oracle checking each statement's exact row count and no COMMIT.",
+         "SELECT * FROM oracle_execute_composite_transaction('ora', "
+         "['INSERT INTO QUACK_DEMO_LOG (LABEL) VALUES (:label)', 'DELETE FROM QUACK_DEMO_LOG WHERE LABEL = :label'], "
+         "{'label': 'composite example'}, [1, 1]);",
          {"oracle", "transaction"}}));
 
     TableFunction transaction_execute("oracle_execute_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},

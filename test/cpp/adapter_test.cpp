@@ -166,6 +166,9 @@ struct FakeScript {
     // does not have to restate the request it is checking.
     bool call_echo_outputs = false;
     std::map<std::string, WireValue> call_output_values;
+    // A call that fails the way a composite's row-count check does: Oracle's
+    // ORA-20906 after the statements before the failing one have run.
+    bool call_should_fail = false;
 
     // Set to make the scripted cursor fail mid-stream, which is how a protocol
     // failure reaches the adapter after the bind has already succeeded.
@@ -393,8 +396,17 @@ public:
     }
 
     OracleCallResult Call(const OracleCallRequest &request) override {
+        for (const auto &operation : request.dml_operations) {
+            WaitIfBlocked(operation.sql);
+        }
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->calls.push_back(request);
+        if (script->call_should_fail) {
+            failed = true;
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                                "ORA-20906: DML composite operation 2 affected row count mismatch",
+                                                20906);
+        }
         OracleCallResult result;
         result.outputs = script->call_outputs;
         if (script->call_echo_outputs) {
@@ -2037,6 +2049,33 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
             CHECK(script.queries.back() == "SELECT 1 FROM dual");
             CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "1");
         }};
+    cases["oracle_query_transaction_typed"] = {
+        [departments](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            departments(script);
+        },
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
+        [](FakeScript &script, MaterializedQueryResult &result) {
+            const std::string sql =
+                "SELECT DEPARTMENT_ID, DEPARTMENT_NAME FROM QUACK_DEMO_DEPARTMENTS ORDER BY DEPARTMENT_ID";
+            CHECK(std::count(script.queries.begin(), script.queries.end(), sql) == 1);
+            CHECK(result.RowCount() == 4 && result.GetValue(0, 0).GetValue<int64_t>() == 10 &&
+                  result.GetValue(1, 3).ToString() == "OPERATIONS");
+            CHECK(result.GetTypes()[0] == duckdb::LogicalType::BIGINT);
+        }};
+    cases["oracle_execute_composite_transaction"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+        },
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::DML_COMPOSITE && call.qualified_name.empty());
+            CHECK(call.dml_operations.size() == 2 && call.dml_operations[0].expected_rows == 1 &&
+                  call.dml_operations[1].expected_rows == 1);
+            CHECK(call.arguments.size() == 1 && call.arguments[0].name == "label");
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).GetValue<int64_t>() == 2);
+        }};
     cases["oracle_execute_transaction"] = {
         [](FakeScript &script) {
             script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
@@ -2327,7 +2366,7 @@ void TestFunctionExamplesRun() {
     auto cases = FunctionExampleCases();
     // The same set on both sides: a function added without an executable
     // example, or a case left for a function that is gone, fails here.
-    CHECK(examples.size() == cases.size() && examples.size() == 27);
+    CHECK(examples.size() == cases.size() && examples.size() == 29);
     for (const auto &example : examples) {
         const auto found = cases.find(example.first);
         if (found == cases.end()) {
@@ -2395,7 +2434,7 @@ void TestFunctionExamplesRun() {
 // bare RegisterFunction overloads set. Loading the extension twice would not
 // show it — DuckDB may skip the second load — and registering the same
 // signature again fails under either mode, so the infos the extension
-// registers are inspected directly, all twenty-seven of them.
+// registers are inspected directly, all twenty-nine of them.
 void TestDocumentedRegistrationsAlterOnConflict() {
     std::vector<std::string> names;
     const auto check = [&](const duckdb::CreateFunctionInfo &info, const duckdb::Identifier &name) {
@@ -2413,7 +2452,7 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     }
     const auto parallel = duckdb::OracleParallelScanFunctionInfo();
     check(parallel, parallel.functions.name);
-    CHECK(names.size() == 27);
+    CHECK(names.size() == 29);
 
     // And what that mode means on a database that already has the functions:
     // an extra overload under an existing name is added to it, where
@@ -2758,6 +2797,12 @@ void TestInterruptReachesEveryTransactionPath() {
          "SELECT * FROM oracle_execute_transaction('tx', 'UPDATE items SET n = n + 1 WHERE id = 1');"},
         {"batch", "SET n = n + 2",
          "SELECT * FROM oracle_execute_many_transaction('tx', 'UPDATE items SET n = n + 2 WHERE id = :id', [{id: 1}]);"},
+        {"composite", "SET n = n + 3",
+         "SELECT * FROM oracle_execute_composite_transaction('tx', "
+         "['UPDATE items SET n = n + 3 WHERE id = :id'], {id: 1}, [1]);"},
+        {"typed query open", "FOR UPDATE NOWAIT",
+         "SELECT * FROM oracle_query_transaction_typed('tx', 'SELECT id FROM items WHERE id = 1 FOR UPDATE NOWAIT', "
+         "['ID'], ['VARCHAR']);"},
     };
     for (const auto &path : paths) {
         auto script = PooledScript();
@@ -2797,7 +2842,220 @@ void TestInterruptReachesEveryTransactionPath() {
     }
 }
 
+static size_t CountQueries(const FakeScript &script, const std::string &sql) {
+    return static_cast<size_t>(std::count(script.queries.begin(), script.queries.end(), sql));
+}
+
+// oracle_query_transaction_typed: binding sends nothing to Oracle, every
+// execution sends the statement exactly once in the transaction current then,
+// and a describe that does not match the declaration is an error, never a
+// silently different result.
+void TestTypedTransactionQuery() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"FROM ITEMS", {{Column("ID", 2, 10, 0), Column("LABEL", 1), Column("PRICE", 2, 10, 2)},
+                                              {{Number("7"), Text("seven"), Number("12.5")}}}});
+    script->routes.push_back({"FROM WIDE", {{Column("ID", 2, 10, 0), Column("LABEL", 1), Column("EXTRA", 1)}, {}}});
+    script->routes.push_back({"FROM RENAMED", {{Column("ID", 2, 10, 0), Column("TITLE", 1)}, {}}});
+    script->routes.push_back({"FROM RETYPED", {{Column("ID", 1), Column("LABEL", 1)}, {}}});
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+
+    const std::string sql = "SELECT ID, LABEL, PRICE FROM ITEMS WHERE ID = :id";
+    const std::string call = "oracle_query_transaction_typed('tx', '" + sql +
+                             "', ['id', 'LABEL', 'price'], ['BIGINT', 'varchar', 'DECIMAL(10,2)'], {id: 7})";
+    const auto opened = script->sessions_opened;
+    const auto sent = script->queries.size();
+    database.Run("PREPARE typed AS SELECT * FROM " + call + ";");
+    CHECK(script->sessions_opened == opened && script->queries.size() == sent);
+
+    auto first = database.Query("EXECUTE typed;");
+    CHECK(!first->HasError() && first->RowCount() == 1);
+    CHECK(first->GetNames() == std::vector<std::string>({"id", "LABEL", "price"}));
+    CHECK(first->GetTypes()[0] == duckdb::LogicalType::BIGINT && first->GetTypes()[1] == duckdb::LogicalType::VARCHAR &&
+          first->GetTypes()[2] == duckdb::LogicalType::DECIMAL(10, 2));
+    CHECK(first->GetValue(0, 0).GetValue<int64_t>() == 7 && first->GetValue(1, 0).ToString() == "seven" &&
+          first->GetValue(2, 0).ToString() == "12.50");
+    CHECK(CountQueries(*script, sql) == 1);
+    CHECK(script->query_binds.back().size() == 1 && script->query_binds.back()[0].name == "id");
+
+    // Inside a transaction both executions ride its one session; after COMMIT
+    // the same plan runs on the next transaction's, never on a cursor or a
+    // session left over from the last.
+    database.Run("BEGIN;");
+    const auto in_transaction = script->sessions_opened;
+    CHECK(!database.Query("EXECUTE typed;")->HasError() && !database.Query("EXECUTE typed;")->HasError());
+    CHECK(script->sessions_opened == in_transaction + 1 && CountQueries(*script, sql) == 3);
+    database.Run("COMMIT;");
+    database.Run("BEGIN;");
+    CHECK(database.Query("EXECUTE typed;")->GetValue(1, 0).ToString() == "seven");
+    CHECK(script->sessions_opened == in_transaction + 2 && CountQueries(*script, sql) == 4);
+    database.Run("ROLLBACK;");
+    // Positional binds work as well.
+    CHECK(!database.Query("SELECT * FROM oracle_query_transaction_typed('tx', 'SELECT ID, LABEL, PRICE FROM ITEMS "
+                          "WHERE ID = :1', ['ID', 'LABEL', 'PRICE'], ['BIGINT', 'VARCHAR', 'DECIMAL(10,2)'], [7]);")
+               ->HasError());
+
+    // Each kind of mismatch, reported for what it is; the statement ran once.
+    const auto mismatch = [&](const std::string &table, const std::string &expected) {
+        const auto statement = "SELECT * FROM oracle_query_transaction_typed('tx', 'SELECT * FROM " + table +
+                               "', ['ID', 'LABEL'], ['BIGINT', 'VARCHAR']);";
+        auto refused = database.Query(statement);
+        if (!refused->HasError() || refused->GetError().find(expected) == std::string::npos) {
+            std::cerr << "typed mismatch for " << table << ": " << refused->GetError() << "\n";
+        }
+        CHECK(refused->HasError() && refused->GetError().find(expected) != std::string::npos);
+        CHECK(CountQueries(*script, "SELECT * FROM " + table) == 1);
+    };
+    mismatch("WIDE", "Oracle returned 3 columns where the declaration has 2");
+    mismatch("RENAMED", "Oracle column 2 is TITLE where LABEL was declared");
+    mismatch("RETYPED", "Oracle column ID maps to VARCHAR where BIGINT was declared");
+    // A table that changes under a prepared plan is caught the same way.
+    script->routes[1].second.columns[2] = Column("PRICE", 101);
+    auto changed = database.Query("EXECUTE typed;");
+    CHECK(changed->HasError() &&
+          changed->GetError().find("PRICE maps to DOUBLE where DECIMAL(10,2) was declared") != std::string::npos);
+    // ... and a mismatch inside a transaction ends it, without a rollback that
+    // would wait on the session.
+    database.Run("BEGIN;");
+    const auto rollbacks = script->rollbacks;
+    CHECK(database.Query("EXECUTE typed;")->HasError());
+    CHECK(database.Query("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM ITEMS')")->HasError());
+    database.Run("ROLLBACK;");
+    CHECK(script->rollbacks == rollbacks);
+
+    // Every refusal at bind happens before a session or a statement.
+    const auto refused_at_bind = [&](const std::string &arguments, const std::string &expected) {
+        const auto before_sessions = script->sessions_opened;
+        const auto before_queries = script->queries.size();
+        auto refused = database.Query("SELECT * FROM oracle_query_transaction_typed(" + arguments + ");");
+        if (!refused->HasError() || refused->GetError().find(expected) == std::string::npos) {
+            std::cerr << "typed bind for " << arguments << ": " << refused->GetError() << "\n";
+        }
+        CHECK(refused->HasError() && refused->GetError().find(expected) != std::string::npos);
+        CHECK(script->sessions_opened == before_sessions && script->queries.size() == before_queries);
+    };
+    refused_at_bind("'tx', 'SELECT D FROM ITEMS', ['D'], ['DATE']", "is not one an Oracle column maps to");
+    refused_at_bind("'tx', 'SELECT N FROM ITEMS', ['N'], ['INTEGER']", "is not one an Oracle column maps to");
+    refused_at_bind("'tx', 'SELECT N FROM ITEMS', ['N'], ['NOT_A_TYPE']", "is not a DuckDB type");
+    refused_at_bind("'tx', 'SELECT A, B FROM ITEMS', ['A', 'a'], ['VARCHAR', 'VARCHAR']", "non-empty and unique");
+    refused_at_bind("'tx', 'SELECT A FROM ITEMS', [''], ['VARCHAR']", "non-empty and unique");
+    refused_at_bind("'tx', 'SELECT A FROM ITEMS', ['A'], ['VARCHAR', 'BIGINT']", "as many column types");
+    refused_at_bind("'tx', 'SELECT A FROM ITEMS', []::VARCHAR[], []::VARCHAR[]", "at least one");
+    refused_at_bind("'tx', 'SELECT A FROM ITEMS', ['A', NULL], ['VARCHAR', 'VARCHAR']", "cannot contain NULL");
+    refused_at_bind("'tx', NULL, ['A'], ['VARCHAR']", "cannot be NULL");
+    refused_at_bind("'tx', 'DELETE FROM ITEMS', ['A'], ['VARCHAR']", "only SELECT or WITH");
+    refused_at_bind("'tx', 'SELECT A FROM ITEMS WHERE ID = :id', ['A'], ['VARCHAR']", "do not match");
+    refused_at_bind("'tx', 'SELECT A FROM ITEMS', ['A'], ['VARCHAR'], [1], [2]", "at most one params");
+    refused_at_bind("'memory', 'SELECT A FROM ITEMS', ['A'], ['VARCHAR']", "attached oracle_scanner catalog");
+    std::cout << "typed transaction query binds locally, runs once per execution and refuses a different describe"
+              << std::endl;
+}
+
+static const std::string COMPOSITE_INSERT_AND_UPDATE =
+    "SELECT * FROM oracle_execute_composite_transaction('tx', "
+    "['INSERT INTO ITEMS (ID, LABEL) VALUES (:id, :label)', 'UPDATE ITEMS SET N = N + 1 WHERE ID = :id'], "
+    "{label: 'x', id: 1}, [1, 1]);";
+
+// oracle_execute_composite_transaction: one request with every statement, its
+// expected count and each bind once; no COMMIT of its own; every refusal
+// before a session; and a failure that ends the transaction instead of being
+// retried or rolled back on a session that may still be answering.
+void TestCompositeTransactionDml() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS tx (TYPE oracle_scanner);");
+    database.Run("ATTACH 'ora' AS ro (TYPE oracle_scanner, READ_ONLY);");
+
+    database.Run("BEGIN;");
+    const auto commits = script->commits;
+    auto result = database.Query(COMPOSITE_INSERT_AND_UPDATE);
+    CHECK(!result->HasError() && result->RowCount() == 1 && result->GetValue(0, 0).GetValue<int64_t>() == 2);
+    CHECK(script->calls.size() == 1 && script->commits == commits);
+    const auto &call = script->calls[0];
+    CHECK(call.kind == oracle_scanner::OracleCallableKind::DML_COMPOSITE && call.qualified_name.empty() &&
+          !call.return_bind);
+    CHECK(call.dml_operations.size() == 2 &&
+          call.dml_operations[0].sql == "INSERT INTO ITEMS (ID, LABEL) VALUES (:id, :label)" &&
+          call.dml_operations[1].sql == "UPDATE ITEMS SET N = N + 1 WHERE ID = :id");
+    CHECK(call.dml_operations[0].expected_rows == 1 && call.dml_operations[1].expected_rows == 1);
+    // :id is used twice and bound once.
+    CHECK(call.arguments.size() == 2);
+    // It rides the transaction: a later statement in it uses the same session,
+    // and only DuckDB's COMMIT commits.
+    const auto opened = script->sessions_opened;
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM ITEMS WHERE ID = 2');");
+    CHECK(script->sessions_opened == opened && script->commits == commits);
+    database.Run("COMMIT;");
+    CHECK(script->commits == commits + 1);
+
+    // Positional binds, and a statement with no binds at all.
+    CHECK(!database.Query("SELECT * FROM oracle_execute_composite_transaction('tx', "
+                          "['DELETE FROM ITEMS WHERE ID = :1', 'UPDATE ITEMS SET N = :2 WHERE ID = :1', "
+                          "'DELETE FROM ITEMS WHERE ID < 0'], [3, 4], [1, 0, 0]);")
+               ->HasError());
+    CHECK(script->calls.back().arguments.size() == 2 && script->calls.back().dml_operations.size() == 3);
+
+    // Every refusal is made at bind, before a session or a call.
+    const auto refused_at_bind = [&](const std::string &arguments, const std::string &expected) {
+        const auto before_sessions = script->sessions_opened;
+        const auto before_calls = script->calls.size();
+        auto refused = database.Query("SELECT * FROM oracle_execute_composite_transaction(" + arguments + ");");
+        if (!refused->HasError() || refused->GetError().find(expected) == std::string::npos) {
+            std::cerr << "composite bind for " << arguments << ": " << refused->GetError() << "\n";
+        }
+        CHECK(refused->HasError() && refused->GetError().find(expected) != std::string::npos);
+        CHECK(script->sessions_opened == before_sessions && script->calls.size() == before_calls);
+    };
+    refused_at_bind("'tx', ['CREATE TABLE T2 (ID NUMBER)'], [], [0]", "only INSERT, UPDATE, or DELETE");
+    refused_at_bind("'tx', ['BEGIN NULL; END;'], [], [0]", "statement terminators");
+    refused_at_bind("'tx', ['COMMIT'], [], [0]", "only INSERT, UPDATE, or DELETE");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS; COMMIT'], [], [0]", "statement terminators");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS WHERE ID = :id'], [], [0]", "has a placeholder with no bind");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS'], {id: 1}, [0]", "do not match");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS'], 42, [0]", "params must be a STRUCT");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS'], [], [0, 1]", "one expected row count per statement");
+    refused_at_bind("'tx', []::VARCHAR[], [], []::BIGINT[]", "needs 1..16 statements");
+    refused_at_bind("'tx', list_transform(range(17), lambda i: 'DELETE FROM ITEMS'), [], "
+                    "list_transform(range(17), lambda i: 0)",
+                    "needs 1..16 statements");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS'], [], [-1]", "outside 0..1000000");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS'], [], [1000001]", "outside 0..1000000");
+    refused_at_bind("'tx', [NULL::VARCHAR], [], [0]", "statement 1 or its count is NULL");
+    refused_at_bind("'tx', ['DELETE FROM ITEMS'], NULL, [0]", "cannot be NULL");
+    refused_at_bind("'memory', ['DELETE FROM ITEMS'], [], [0]", "attached oracle_scanner catalog");
+    refused_at_bind("'ro', ['DELETE FROM ITEMS'], [], [0]", "read-only");
+
+    // A failed block: Oracle's error and code reach the caller, the block is
+    // not sent again, no rollback is attempted on the failed session, and the
+    // transaction cannot go on.
+    database.Run("BEGIN;");
+    database.Run("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM ITEMS WHERE ID = 9');");
+    const auto rollbacks = script->rollbacks;
+    const auto calls = script->calls.size();
+    script->call_should_fail = true;
+    auto failed = database.Query(COMPOSITE_INSERT_AND_UPDATE);
+    script->call_should_fail = false;
+    CHECK(failed->HasError() && failed->GetError().find("affected row count mismatch") != std::string::npos);
+    CHECK(failed->GetErrorObject().ExtraInfo().count("oracle_error_code") == 1 &&
+          failed->GetErrorObject().ExtraInfo().at("oracle_error_code") == "20906");
+    CHECK(script->calls.size() == calls + 1 && script->rollbacks == rollbacks);
+    const auto after_failure = script->sessions_opened;
+    CHECK(database.Query("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM ITEMS WHERE ID = 10');")
+              ->HasError());
+    CHECK(script->sessions_opened == after_failure);
+    database.Run("ROLLBACK;");
+    CHECK(!database.Query(COMPOSITE_INSERT_AND_UPDATE)->HasError());
+    std::cout << "composite transaction DML is one validated request with exact counts and no COMMIT of its own"
+              << std::endl;
+}
+
 int main() {
+    TestTypedTransactionQuery();
+    TestCompositeTransactionDml();
     TestReadOnlyHiddenCatalogGuardsWrites();
 
     TestRawCatalogTransactionsPinReadsAndWrites();

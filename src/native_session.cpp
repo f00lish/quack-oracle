@@ -528,6 +528,12 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
             binds.push_back(*request.return_bind);
         }
         binds.insert(binds.end(), request.arguments.begin(), request.arguments.end());
+        if (request.kind == OracleCallableKind::DML_COMPOSITE) {
+            // A procedure block names its binds in argument order; a composite
+            // names them in whatever order its statements do, and PL/SQL binds
+            // by first occurrence, so the values follow the block.
+            binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::CALL);
+        }
         ValidateOracleBinds(binds, OracleBindUse::CALL);
 
         const auto handle = statements.Open(OracleSqlKind::PLSQL);

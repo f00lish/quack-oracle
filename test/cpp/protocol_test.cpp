@@ -1992,7 +1992,7 @@ static void TestProcedureCallBuilder() {
     OracleBind return_bind {"return_value", 0, BindDirection::BIND_OUT, std::nullopt};
     CHECK(BuildOracleFunctionCallBlock("app.billing.invoice_total", return_bind, arguments) ==
            "BEGIN :return_value := app.billing.invoice_total(p_id => :p_id, p_result => :p_result); END;");
-    OracleCallRequest function_request {OracleCallableKind::FUNCTION, "app.answer", return_bind, {}};
+    OracleCallRequest function_request {OracleCallableKind::FUNCTION, "app.answer", return_bind, {}, {}};
     CHECK(BuildOracleCallBlock(function_request) == "BEGIN :return_value := app.answer; END;");
     function_request.return_bind.reset();
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildOracleCallBlock(function_request); });
@@ -2005,6 +2005,102 @@ static void TestProcedureCallBuilder() {
     return_bind.direction = BindDirection::BIND_IN;
     ExpectError(ProtocolErrorKind::MALFORMED,
                 [&] { BuildOracleFunctionCallBlock("app.answer", return_bind, {}); });
+}
+
+// A composite is a sequence of validated DML statements in one anonymous
+// block. What has to hold: the statements in order, each followed by its own
+// exact row-count check; no transaction control anywhere in the block; one
+// bind per name however many statements use it, sent in the block's
+// first-occurrence order; and nothing that is not one plain DML statement.
+static void TestDmlCompositeBlock() {
+    const std::vector<OracleBind> arguments = {{"b", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'x'}},
+                                               {"a", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'y'}}};
+    OracleCallRequest request;
+    request.kind = OracleCallableKind::DML_COMPOSITE;
+    request.arguments = arguments;
+    request.dml_operations = {{"INSERT INTO T (V) VALUES (:a)", 1}, {"UPDATE T SET V = :b WHERE V = :a -- tail", 0}};
+    const auto block = BuildOracleCallBlock(request);
+    CHECK(block == "BEGIN\n"
+                   "INSERT INTO T (V) VALUES (:a)\n;\n"
+                   "IF SQL%ROWCOUNT <> 1 THEN RAISE_APPLICATION_ERROR(-20906, "
+                   "'DML composite operation 1 affected row count mismatch'); END IF;\n"
+                   "UPDATE T SET V = :b WHERE V = :a -- tail\n;\n"
+                   "IF SQL%ROWCOUNT <> 0 THEN RAISE_APPLICATION_ERROR(-20906, "
+                   "'DML composite operation 2 affected row count mismatch'); END IF;\n"
+                   "END;");
+    // :a first, though the caller listed b first: PL/SQL binds by first use.
+    const auto ordered = OrderOracleStatementBinds(block, arguments, OracleBindUse::CALL);
+    CHECK(ordered.size() == 2 && ordered[0].name == "a" && ordered[1].name == "b");
+    // Positional binds name themselves 1, 2, ... and work the same way.
+    OracleCallRequest positional = request;
+    positional.arguments = {{"1", 2, BindDirection::BIND_IN, std::vector<uint8_t> {0xc1, 0x02}}};
+    positional.dml_operations = {{"DELETE FROM T WHERE ID = :1", 1}, {"UPDATE U SET N = N + 1 WHERE ID = :1", 1}};
+    CHECK(BuildOracleCallBlock(positional).find("WHERE ID = :1\n;\n") != std::string::npos);
+
+    const auto refused = [&](ProtocolErrorKind kind, const std::function<void(OracleCallRequest &)> &change) {
+        auto bad = request;
+        change(bad);
+        ExpectError(kind, [&] { BuildOracleCallBlock(bad); });
+    };
+    // Not one plain DML statement: transaction control, DDL, PL/SQL, a query,
+    // a second statement after a terminator, MERGE.
+    for (const auto *sql : {"COMMIT", "ROLLBACK", "SAVEPOINT s", "CREATE TABLE T2 (ID NUMBER)", "BEGIN NULL; END;",
+                            "SELECT * FROM T", "UPDATE T SET V = :a; COMMIT", "UPDATE T SET V = :a;",
+                            "MERGE INTO T USING DUAL ON (1 = 1) WHEN MATCHED THEN UPDATE SET V = :a",
+                            "UPDATE T SET V = :a /* unterminated", "UPDATE T SET V = 'unterminated"}) {
+        refused(ProtocolErrorKind::MALFORMED, [&](OracleCallRequest &bad) { bad.dml_operations[0].sql = sql; });
+    }
+    // A placeholder nothing binds, and a bind nothing uses.
+    refused(ProtocolErrorKind::MALFORMED,
+            [](OracleCallRequest &bad) { bad.dml_operations[0].sql = "UPDATE T SET V = :missing"; });
+    refused(ProtocolErrorKind::MALFORMED, [](OracleCallRequest &bad) {
+        bad.arguments.push_back({"unused", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'z'}});
+    });
+    // Input binds only, each name once.
+    refused(ProtocolErrorKind::MALFORMED,
+            [](OracleCallRequest &bad) { bad.arguments[0].direction = BindDirection::BIND_OUT; });
+    refused(ProtocolErrorKind::MALFORMED, [](OracleCallRequest &bad) { bad.arguments[1].name = "B"; });
+    // A composite names no callable and returns nothing; a callable carries no DML.
+    refused(ProtocolErrorKind::MALFORMED, [](OracleCallRequest &bad) { bad.qualified_name = "APP.PROC"; });
+    refused(ProtocolErrorKind::MALFORMED, [](OracleCallRequest &bad) {
+        bad.return_bind = OracleBind {"r", 2, BindDirection::BIND_OUT, std::nullopt};
+    });
+    refused(ProtocolErrorKind::MALFORMED, [](OracleCallRequest &bad) { bad.dml_operations.clear(); });
+    refused(ProtocolErrorKind::MALFORMED, [](OracleCallRequest &bad) {
+        bad.kind = OracleCallableKind::PROCEDURE;
+        bad.qualified_name = "APP.PROC";
+        bad.arguments.clear();
+    });
+    // The bounds, each just past its limit.
+    refused(ProtocolErrorKind::LIMIT_EXCEEDED, [](OracleCallRequest &bad) {
+        bad.dml_operations.resize(ORACLE_DML_COMPOSITE_MAX_OPERATIONS + 1, bad.dml_operations[0]);
+    });
+    refused(ProtocolErrorKind::LIMIT_EXCEEDED, [](OracleCallRequest &bad) {
+        bad.dml_operations[0].expected_rows = ORACLE_DML_COMPOSITE_MAX_EXPECTED_ROWS + 1;
+    });
+    refused(ProtocolErrorKind::LIMIT_EXCEEDED, [](OracleCallRequest &bad) {
+        bad.dml_operations[0].sql = "UPDATE T SET V = :a WHERE '" +
+                                    std::string(ORACLE_DML_COMPOSITE_MAX_SQL_BYTES, 'x') + "' IS NOT NULL";
+    });
+    refused(ProtocolErrorKind::LIMIT_EXCEEDED, [](OracleCallRequest &bad) {
+        bad.arguments[0].value = std::vector<uint8_t>(ORACLE_DML_COMPOSITE_MAX_PAYLOAD_BYTES, 'x');
+    });
+    refused(ProtocolErrorKind::LIMIT_EXCEEDED, [](OracleCallRequest &bad) {
+        bad.arguments.clear();
+        std::string sql = "INSERT INTO T VALUES (";
+        for (size_t index = 0; index <= ORACLE_DML_COMPOSITE_MAX_BINDS; index++) {
+            const auto name = "p" + std::to_string(index);
+            bad.arguments.push_back({name, 1, BindDirection::BIND_IN, std::vector<uint8_t> {'v'}});
+            sql += (index == 0 ? ":" : ", :") + name;
+        }
+        bad.dml_operations = {{sql + ")", 1}};
+    });
+    // Exactly at the limits is accepted.
+    auto at_limit = request;
+    at_limit.dml_operations.resize(ORACLE_DML_COMPOSITE_MAX_OPERATIONS, request.dml_operations[0]);
+    at_limit.dml_operations.back().expected_rows = ORACLE_DML_COMPOSITE_MAX_EXPECTED_ROWS;
+    at_limit.dml_operations.back().sql = "UPDATE T SET V = :b WHERE V = :a";
+    (void)BuildOracleCallBlock(at_limit);
 }
 
 static void TestBindValidation() {
@@ -2149,11 +2245,20 @@ static void TestValidatedSession() {
     session.Query("select * from invoices where id = :id", binds);
     session.Execute("delete from invoices where id = :id", binds);
     session.ExecuteBatch("update invoices set id = :id", {binds});
-    OracleCallRequest call {OracleCallableKind::PROCEDURE, "app.ping", std::nullopt, {}};
+    OracleCallRequest call {OracleCallableKind::PROCEDURE, "app.ping", std::nullopt, {}, {}};
     session.Call(call);
     CHECK(inner->queries == 1 && inner->executes == 1 && inner->batches == 1 && inner->calls == 1);
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { session.Execute("select * from invoices where id = :id", binds); });
     CHECK(inner->executes == 1);
+    // A composite reaches the session only as a block it would build itself.
+    OracleCallRequest composite;
+    composite.kind = OracleCallableKind::DML_COMPOSITE;
+    composite.arguments = binds;
+    composite.dml_operations = {{"delete from invoices where id = :id", 1}};
+    session.Call(composite);
+    composite.dml_operations.push_back({"commit", 0});
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { session.Call(composite); });
+    CHECK(inner->calls == 2);
     session.Close();
     ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { session.Commit(); });
 }
@@ -6410,6 +6515,7 @@ int main() {
     TestAuthCrypto();
     TestCallRegistry();
     TestProcedureCallBuilder();
+    TestDmlCompositeBlock();
     TestBindValidation();
     TestSqlBindExtraction();
     TestSqlStatementValidation();

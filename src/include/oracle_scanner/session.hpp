@@ -81,13 +81,25 @@ struct OracleCallResult {
     std::vector<std::unique_ptr<OracleCursor>> implicit_cursors;
 };
 
-enum class OracleCallableKind { PROCEDURE, FUNCTION };
+// DML_COMPOSITE is not a stored callable: it is a bounded sequence of
+// validated INSERT, UPDATE and DELETE statements run as one anonymous block,
+// each followed by a server-side check of its exact row count.
+enum class OracleCallableKind { PROCEDURE, FUNCTION, DML_COMPOSITE };
+
+// One statement of a DML_COMPOSITE request and the SQL%ROWCOUNT it must report.
+struct OracleDmlOperation {
+    std::string sql;
+    uint64_t expected_rows = 0;
+};
 
 struct OracleCallRequest {
     OracleCallableKind kind = OracleCallableKind::PROCEDURE;
     std::string qualified_name;
     std::optional<OracleBind> return_bind;
     std::vector<OracleBind> arguments;
+    // DML_COMPOSITE only. The arguments are then the binds of every statement,
+    // each name once, however many statements use it.
+    std::vector<OracleDmlOperation> dml_operations;
 };
 
 class OracleSession {

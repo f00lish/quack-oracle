@@ -1,16 +1,16 @@
 #
-# Does the duckdb-2.0 branch still compile against DuckDB's main branch?
+# Does this tree still compile against DuckDB's main branch?
 #
-# DuckDB 2.0 has no tag, no branch and no ci-tools track yet: it is `main`, and
-# its API moves. A trial build against it found 52 distinct errors in 6 adapter files,
-# all in the DuckDB-facing layer and none in the protocol code. That number
-# will change under us until 2.0 ships, and a port started between two readings
-# of it is stale before it lands.
+# main targets DuckDB 2.0 (the v2.0-cyanoptera line), and DuckDB's own main has
+# moved on past it. Its API moves, and the next port is cheaper started from a
+# measured gap than from a surprise: before the 2.0 port, a trial build against
+# main found 52 distinct errors in 6 adapter files, all in the DuckDB-facing
+# layer and none in the protocol code.
 #
 # So this watches. One Linux build, weekly and on demand, that never fails the
 # repository: it compiles against `main` with `make -k` so every error is seen,
 # counts them per file, and writes the count to the job summary. The first job
-# that matters for 2.0 is knowing the size of the gap, not closing it.
+# that matters for the next DuckDB is knowing the size of the gap, not closing it.
 #
 # It is deliberately not the distribution matrix. That would cost five
 # platforms to answer a question one answers, and the reusable workflow
@@ -31,15 +31,12 @@ jobs:
   compile-against-main:
     name: Compile against DuckDB main
     runs-on: ubuntu-latest
-    # Informational by construction: a red mark here says "2.0 moved", not
+    # Informational by construction: a red mark here says "DuckDB main moved", not
     # "the repository is broken", and the two must not look alike.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
-          # The port lives on its own branch; measuring main would report the
-          # unported tree's 98 errors every week and tell nobody anything.
-          ref: duckdb-2.0
           submodules: true
 
       - name: Install build dependencies
@@ -115,6 +112,6 @@ jobs:
       - name: Report
         run: |
           echo "DuckDB main ${DUCKDB_MAIN_SHA} (${DUCKDB_MAIN_DATE}): ${{ steps.count.outputs.total }} errors in this project's sources"
-          # Non-zero so the run shows as failed-but-tolerated when 2.0 has moved;
+          # Non-zero so the run shows as failed-but-tolerated when main has moved;
           # continue-on-error keeps it from failing the workflow.
           test "${{ steps.count.outputs.total }}" = "0"

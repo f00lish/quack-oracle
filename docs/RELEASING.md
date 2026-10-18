@@ -11,11 +11,14 @@ tag rather than a tag alone:
 2. Tag the commit `v<version>`, matching what `EXTENSION_VERSION` now says.
 3. Set `EXTENSION_VERSION` back to the next `-dev` version.
 
-The DuckDB version an artifact is built against is pinned in three places that
-must agree: the `duckdb` submodule, `duckdb_version` in
+The DuckDB version an artifact is built against is pinned in places that must
+agree: the `duckdb` submodule, `duckdb_version` and `duckdb_tag` in
 [the workflow](../.github/workflows/MainDistributionPipeline.yml), and the
 `extension-ci-tools` branch the workflow reuses. `docs/UPDATING.md` covers
-moving all three.
+moving them. While DuckDB 2.0 is a pre-release they are not a tag but whatever
+Community Extensions' own `build.yml` builds a descriptor's `ref` against — a
+commit, the version tag it stamps (`v2.0.0-alpha46057` at 0.5.0) and a ci-tools
+branch — so read them there before a release, and move all of them together.
 
 ## Never publish a locally built artifact
 
@@ -65,6 +68,12 @@ fork of their repository, with no editing. Nothing in this repository reads it. 
 field names were checked against a published descriptor. `requires_toolchains:
 vcpkg` is required, not optional: OpenSSL comes from vcpkg through `vcpkg.json`,
 and without the toolchain their build has nothing to resolve it with.
+
+Since Community moved to DuckDB 2.0 (October 2026) the descriptor names two
+commits: `repo.ref`, built against the DuckDB that Community builds for — 2.0 —
+and `repo.variegata`, built only when a maintainer starts a DuckDB 1.5.6 build
+by hand. This project builds for 2.0 only, so `variegata` stays at the v0.4.0
+commit, the last 1.5.6 release, and only `ref` moves. `ref_next` is gone.
 
 Before submitting, three things have to be true:
 

@@ -20,6 +20,10 @@ A wrong number is worse than an error, so the boundary is drawn at proof.
 Native builds: **Linux, macOS, Windows**. Those are what the live lanes and the
 clean-machine gate exercise.
 
+DuckDB: releases from 0.5.0 on are built for **DuckDB 2.0** only, against the
+2.0 commit Community Extensions builds against; an extension loads only into
+the DuckDB it was built for. 0.4.0 is the last release for DuckDB 1.5.6.
+
 **A WebAssembly build cannot connect to Oracle.** Not "is untested" — it is
 refused, by name, at connect:
 
@@ -170,8 +174,9 @@ Every SQL string handed to this extension goes through one gate:
 | --- | --- | --- |
 | `oracle_query` | queries only | `SELECT`, `WITH` |
 | `oracle_execute`, `oracle_execute_many` | DML only | `INSERT`, `UPDATE`, `DELETE` |
-| `oracle_query_transaction` | queries only | `SELECT`, `WITH` |
+| `oracle_query_transaction`, `oracle_query_transaction_typed` | queries only | `SELECT`, `WITH` |
 | `oracle_execute_transaction`, `oracle_execute_many_transaction` | DML only | `INSERT`, `UPDATE`, `DELETE` |
+| `oracle_execute_composite_transaction` | 1 to 16 DML statements, each checked as above | `INSERT`, `UPDATE`, `DELETE` |
 | `oracle_execute_admin` | one DDL command | `CREATE`, `ALTER`, `DROP`, `GRANT`, `REVOKE`, `COMMENT`, `TRUNCATE` |
 
 And, in **all** cases:
@@ -184,7 +189,9 @@ The consequences are concrete and worth stating plainly:
 - **Anonymous PL/SQL blocks cannot be run at all.** `BEGIN … END;` fails twice
   over: `BEGIN` is not an accepted first keyword for either function, and the
   `;` that PL/SQL itself requires is refused. There is no third function that
-  takes a block.
+  takes a block. `oracle_execute_composite_transaction` does send one, but a
+  block it builds itself from statements that each passed the DML gate, with
+  nothing of the caller's between them.
 - **DDL goes only through `oracle_execute_admin`.** The query and DML
   functions refuse `CREATE`, `DROP`, `ALTER` and `TRUNCATE`. `oracle_execute_admin`
   takes one such command, on a session of its own and never inside an explicit
@@ -447,25 +454,38 @@ iteration, not one round trip per row. A row that fails reports its position.
 
 ### Raw SQL inside the attached transaction
 
-For SQL the `ATTACH` path cannot express, five functions take the attached
+For SQL the `ATTACH` path cannot express, seven functions take the attached
 catalog's name instead of a secret and run on the session pinned to the DuckDB
 transaction, so their work commits and rolls back with it:
 
 - `oracle_query_transaction` — a query; it sees the transaction's own
-  uncommitted rows.
+  uncommitted rows. It learns its columns by running the query at bind, so a
+  read runs it twice.
+- `oracle_query_transaction_typed` — the same, with the result columns declared
+  by the caller: bind sends nothing to Oracle, each execution runs the query
+  once, and a describe that differs from the declaration in count, name or
+  mapped type is an error. Declarable: `VARCHAR`, `BIGINT`, `DECIMAL(p,s)`,
+  `DOUBLE`, `FLOAT`, `BLOB`, `TIMESTAMP`, `TIMESTAMP_NS`.
 - `oracle_execute_transaction` — one `INSERT`, `UPDATE` or `DELETE`.
 - `oracle_execute_many_transaction` — 1 to 2048 bind rows. Exact per-row counts
   by default, one execution per row; `exact_counts := false` sends array DML in
   groups of up to 1024 rows and returns one aggregate count.
+- `oracle_execute_composite_transaction` — 1 to 16 `INSERT`, `UPDATE` or
+  `DELETE` statements in one round trip, each with an exact expected row count
+  that Oracle checks after it runs (`ORA-20906` on the first mismatch). Named or
+  positional binds shared by all of them, each used; at most 256 binds, 64 KiB
+  of SQL, 8 MiB of bind values, 1,000,000 expected rows per statement. A
+  failure leaves the earlier statements applied in the transaction, which then
+  needs `ROLLBACK`.
 - `oracle_call_named_transaction` — a procedure with up to 64 `NUMBER` or
   `VARCHAR` arguments, `IN`, `OUT` or `IN OUT`, NULL included. No cursors, LOBs
   or objects. The procedure must not commit, run DDL or use an autonomous
   transaction.
 - `oracle_transaction_status` — the outcome of the current or last transaction
   (`commit_outcome`, `connection_state`, `oracle_error_code`,
-  `protocol_error_kind`), read locally without opening a session. DuckDB 1.5.6
-  drops the extra error fields when it wraps a failed `COMMIT`, so this is where
-  they are.
+  `protocol_error_kind`), read locally without opening a session. DuckDB drops
+  the extra error fields when it wraps a failed `COMMIT` (1.5.6 did), so this is
+  where they are.
 
 None of them commits. A `READ_ONLY` catalog refuses the writing ones. A bind
 that fails local validation is refused at bind time and leaves the transaction

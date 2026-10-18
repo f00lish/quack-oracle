@@ -13,10 +13,10 @@ CREATE SECRET ora (TYPE oracle, HOST 'db.example.com', PORT 1521,
 SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 ```
 
-> **Status:** version 0.2.0, published to DuckDB Community Extensions — one
-> `INSTALL` and you are done, see [Install](#1-install). Reads, writes,
-> procedure calls and TLS are verified against live Oracle 19c, Oracle Free
-> 23ai, and OCI Autonomous Database.
+> **Status:** version 0.5.0, for DuckDB 2.0, published to DuckDB Community
+> Extensions — one `INSTALL` and you are done, see [Install](#1-install).
+> Reads, writes, procedure calls and TLS are verified against live Oracle 19c,
+> Oracle Free 23ai, and OCI Autonomous Database.
 
 ---
 
@@ -95,9 +95,12 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.4.0 targets **DuckDB v1.5.6**, which is the DuckDB version that will
-load it. On DuckDB v1.5.5 the same command still installs 0.2.2, the last
-release built for it.
+Version 0.5.0 targets **DuckDB 2.0**, and new releases are built for DuckDB 2.0
+only. The 2.0 line is still a pre-release: Community Extensions builds it
+against one DuckDB 2.0 commit, currently the one that reports itself as
+`v2.0.0-alpha46057`, and an extension loads only into the DuckDB it was built
+for. On **DuckDB v1.5.6** the same command installs 0.4.0, the last release
+built for it; on v1.5.5, 0.2.2.
 
 Prefer to build from source — to hack on it, or to run against a DuckDB you
 built yourself? That path still works:
@@ -499,8 +502,8 @@ COMMIT failures report an unknown outcome; reconcile the database before replay
 or file cleanup. Atomic commit across multiple catalogs is not guaranteed.
 
 Statement/fetch errors expose numeric `oracle_error_code` and
-`oracle_connection_state` in DuckDB's `ErrorData::ExtraInfo()`. DuckDB 1.5.6
-discards extra fields while wrapping COMMIT errors, so immediately inspect
+`oracle_connection_state` in DuckDB's `ErrorData::ExtraInfo()`. DuckDB discards
+extra fields while wrapping COMMIT errors (1.5.6 did), so immediately inspect
 `SELECT * FROM oracle_transaction_status('o')` after a failed COMMIT. It opens
 no Oracle session and returns `commit_outcome`, `connection_state`, nullable
 `oracle_error_code` and `protocol_error_kind`. A new remote transaction resets
@@ -522,9 +525,44 @@ After schema changes, refresh dictionary entries outside transactions using
 prepare dependent statements again. In-place cache refresh is not supported.
 
 Prepared transactional SELECTs acquire the current transaction at each execution.
-Describe currently executes a SELECT at bind time, then execution opens it again;
-account for that extra round trip and for locks taken by a blocking SELECT.
-Use the ordinary functions below for their existing autocommit behavior.
+`oracle_query_transaction` learns its result columns from Oracle, so it runs the
+SELECT once while binding and again when it executes; account for that extra
+round trip and for the locks a blocking SELECT takes. When you know the
+columns, declare them with
+[`oracle_query_transaction_typed`](#reading-with-declared-columns) and the SELECT
+runs once. Use the ordinary functions below for their existing autocommit
+behavior.
+
+### Reading with declared columns
+
+```sql
+PREPARE by_location AS
+SELECT * FROM oracle_query_transaction_typed('o',
+    'SELECT DEPARTMENT_ID, DEPARTMENT_NAME FROM QUACK_DEMO_DEPARTMENTS WHERE LOCATION = :loc',
+    ['DEPARTMENT_ID', 'DEPARTMENT_NAME'], ['BIGINT', 'VARCHAR'], {loc: 'DALLAS'});
+
+BEGIN;
+EXECUTE by_location;
+COMMIT;
+```
+
+The third and fourth arguments name the result columns and give their DuckDB
+types; an optional fifth takes binds, as a LIST (positional) or a STRUCT
+(named). Binding checks the SQL, the binds and the declaration locally and sends
+nothing to Oracle, so `PREPARE` neither connects nor waits on a lock. Each
+execution runs the statement exactly once, on the transaction current at that
+moment — after a `COMMIT` or `ROLLBACK`, the next one — and compares Oracle's
+describe with the declaration: the same number of columns, the same names
+(case-insensitively), and each column mapping to the declared type under the
+[type table](#9-which-oracle-types-work). A difference is an error naming the
+column, never a quietly different result, and like any failure from Oracle it
+invalidates the transaction.
+
+The declarable types are the ones that table maps Oracle columns to: `VARCHAR`,
+`BIGINT`, `DECIMAL(p,s)`, `DOUBLE`, `FLOAT`, `BLOB`, `TIMESTAMP` and
+`TIMESTAMP_NS`. Declare what the mapping gives, not the type you want: a
+`NUMBER(19)` or an unconstrained `NUMBER` is `VARCHAR`, a `DATE` is `TIMESTAMP`.
+Cast around the function in DuckDB for anything else.
 
 ### Batches and procedure calls in the attached transaction
 
@@ -561,6 +599,44 @@ Both refuse on a `READ_ONLY` catalog. A bind that fails local validation is
 refused at bind time and leaves the transaction as it was. A failure from
 Oracle invalidates the remote transaction, as for `oracle_execute_transaction`:
 `ROLLBACK` before going on. Nothing is retried or replayed automatically.
+
+### Several statements in one round trip
+
+```sql
+BEGIN;
+SELECT * FROM oracle_execute_composite_transaction('o',
+    ['INSERT INTO ITEMS (ID, LABEL) VALUES (:id, :label)',
+     'UPDATE ITEM_TOTALS SET N = N + 1 WHERE KIND = :kind',
+     'DELETE FROM ITEM_DRAFTS WHERE ID = :id'],
+    {id: 7, label: 'VII', kind: 'roman'},
+    [1, 1, 0]);
+COMMIT;
+```
+
+`oracle_execute_composite_transaction` takes up to 16 `INSERT`, `UPDATE` or
+`DELETE` statements, each validated the way `oracle_execute_transaction`
+validates one, and sends them as one anonymous block that the extension builds
+itself. After each statement Oracle compares its row count with the count at the
+same position in the fourth argument, and the first mismatch fails the call with
+`ORA-20906: DML composite operation N affected row count mismatch`. On success
+it returns one row, `affected_rows`, the sum of the expected counts — exactly
+what ran, since anything else would have failed.
+
+The binds are one STRUCT of named binds or one LIST of positional ones, for all
+the statements together: a name that several statements use is bound once, with
+one value. Every placeholder needs a bind and every bind must be used. The
+limits are 16 statements, 256 binds, 64 KiB of SQL in total, 8 MiB of bind
+values, and 0 to 1,000,000 expected rows per statement. DDL, PL/SQL, `COMMIT`,
+`ROLLBACK`, `MERGE`, a `;`, and a missing or unused bind are refused at bind,
+before any session is opened.
+
+It never commits or rolls back. When it fails — a count check, a constraint, an
+interrupt, `READ_TIMEOUT` — the statements of the block before the failing one
+have run inside the Oracle transaction, so the transaction is invalidated:
+`ROLLBACK`, which takes back everything the transaction did. Nothing is retried.
+It saves round trips — one call instead of one per statement — which matters
+most on a slow link; it does no less work in Oracle, and measurements of small
+transactions on a local database were mixed.
 
 ### One statement at a time
 
@@ -670,7 +746,10 @@ The `oracle_execute` and `oracle_execute_many` examples write to
 
 The `*_transaction` functions and `oracle_transaction_status` take an
 attached catalog rather than a secret; their examples assume
-`ATTACH 'demo' AS ora (TYPE oracle_scanner)`. The `oracle_execute_admin`
+`ATTACH 'demo' AS ora (TYPE oracle_scanner)`. The
+`oracle_execute_composite_transaction` example inserts one `QUACK_DEMO_LOG` row
+and deletes it again, so its counts `[1, 1]` hold as long as no row is already
+labelled `composite example`. The `oracle_execute_admin`
 example creates a table, `QUACK_DEMO_SCRATCH`, and Oracle commits DDL at once;
 drop it afterwards.
 
@@ -793,11 +872,14 @@ you need it. Writing a LOB is not supported.
 
 ## 10. Troubleshooting
 
-### `The file was built specifically for DuckDB version 'v1.5.6'`
+### `The file was built specifically for DuckDB version '…'`
 
-Your DuckDB is a different version. Install DuckDB v1.5.6 and run
-`INSTALL oracle_scanner FROM community` again, or, if you built from source,
-use the shell this project produced (`./build/release/duckdb`).
+Your DuckDB is a different version from the one the file was built for. An
+extension loads only into the exact DuckDB it was built against; during the
+2.0 pre-release that means the same 2.0 build, not just any 2.0. Run
+`INSTALL oracle_scanner FROM community` from the DuckDB you use — it fetches the
+build for that version if one exists — or, if you built from source, use the
+shell this project produced (`./build/release/duckdb`).
 
 ### DuckDB refuses the extension as unsigned
 
@@ -826,6 +908,21 @@ SELECT * FROM oracle_call_auto('ora', 'DBMS_UTILITY.EXEC_DDL_STATEMENT',
 
 The same route runs anything that is a single procedure call. Anonymous PL/SQL
 blocks (`BEGIN ... END;`) cannot be run at all.
+
+### `ORA-20906: DML composite operation N affected row count mismatch`
+
+Statement N of an `oracle_execute_composite_transaction` call changed a
+different number of rows from the count you gave for it. The statements before
+it did run, so `ROLLBACK` the transaction, find out why the count differed, and
+start again.
+
+### `Oracle column … where … was declared`
+
+`oracle_query_transaction_typed` found a describe that differs from the
+declared columns — a renamed or retyped column, one more or one fewer, often
+after DDL on the table. The message names the column. Correct the declaration
+(`DESCRIBE`-ing the query with `oracle_query` shows what Oracle returns), then
+`PREPARE` again; `ROLLBACK` first if it happened inside a transaction.
 
 ### `oracle_execute cannot run inside an explicit DuckDB transaction`
 

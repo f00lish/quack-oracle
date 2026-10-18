@@ -149,6 +149,9 @@ bool OracleTransactionSessionPool::Release(std::shared_ptr<OracleSession> sessio
     return kept;
 }
 
+// By value on purpose: the pool takes the caller's reference, so the session
+// is destroyed here, after it is closed, not whenever the caller's goes.
+// NOLINTNEXTLINE(performance-unnecessary-value-param)
 void OracleTransactionSessionPool::Discard(std::shared_ptr<OracleSession> session) noexcept {
     if (!session) {
         return;

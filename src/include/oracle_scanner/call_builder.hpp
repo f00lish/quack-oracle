@@ -32,8 +32,8 @@ std::string BuildOracleFunctionCallBlock(const std::string &qualified_name, cons
 // wire work, and the adapter reports them by these names.
 constexpr size_t ORACLE_DML_COMPOSITE_MAX_OPERATIONS = 16;
 constexpr size_t ORACLE_DML_COMPOSITE_MAX_BINDS = 256;
-constexpr size_t ORACLE_DML_COMPOSITE_MAX_SQL_BYTES = 64U * 1024U;
-constexpr size_t ORACLE_DML_COMPOSITE_MAX_PAYLOAD_BYTES = 8U * 1024U * 1024U;
+constexpr size_t ORACLE_DML_COMPOSITE_MAX_SQL_BYTES = size_t {64} * 1024U;
+constexpr size_t ORACLE_DML_COMPOSITE_MAX_PAYLOAD_BYTES = size_t {8} * 1024U * 1024U;
 constexpr uint64_t ORACLE_DML_COMPOSITE_MAX_EXPECTED_ROWS = 1000000;
 
 // The Oracle error a DML_COMPOSITE block raises when a statement's

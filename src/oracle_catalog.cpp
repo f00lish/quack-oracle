@@ -720,7 +720,7 @@ MakeOracleTransactionPool(ClientContext &context, const ConnectionConfig &config
     }
     if (size < 0 || size > ORACLE_TRANSACTION_POOL_MAXIMUM_SIZE) {
         throw BinderException("oracle_transaction_pool_size must be between 0 and %lld",
-                              static_cast<long long>(ORACLE_TRANSACTION_POOL_MAXIMUM_SIZE));
+                              static_cast<int64_t>(ORACLE_TRANSACTION_POOL_MAXIMUM_SIZE));
     }
     if (size == 0) {
         return nullptr;

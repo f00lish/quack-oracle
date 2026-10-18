@@ -146,7 +146,9 @@ public:
     }
     // Points the session at another caller's IO deadline, or at none. Only a
     // session opened with a deadline binding can follow a new caller; it
-    // answers false otherwise, and then it must not be reused.
+    // answers false otherwise, and then it must not be reused. The source is
+    // taken by value because an override keeps it.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
     virtual bool BindIoDeadline(std::shared_ptr<OracleIoDeadline>) {
         return false;
     }

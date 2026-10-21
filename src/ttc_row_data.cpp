@@ -11,10 +11,15 @@ constexpr size_t MAX_LOB_LOCATOR_BYTES = 4096;
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, const std::vector<bool> &is_lob,
                                         size_t maximum_value_bytes) {
+    return DecodeTtcRowDataPrefix(message.data(), message.size(), is_lob, maximum_value_bytes);
+}
+
+TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const std::vector<bool> &is_lob,
+                                        size_t maximum_value_bytes) {
     if (is_lob.empty() || is_lob.size() > 4096 || maximum_value_bytes == 0 || maximum_value_bytes > (16U << 20U)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC row-data decoder bounds are invalid");
     }
-    ByteReader reader(message);
+    ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ROW_DATA message");
     }

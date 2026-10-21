@@ -24,8 +24,8 @@ struct TtcRowHeaderPrefix {
     size_t bytes_consumed = 0;
 };
 
-TtcRowHeaderPrefix DecodeRowHeaderPrefix(const std::vector<uint8_t> &message, size_t column_count) {
-    ByteReader reader(message);
+TtcRowHeaderPrefix DecodeRowHeaderPrefix(const uint8_t *data, size_t size, size_t column_count) {
+    ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_HEADER) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ROW_HEADER message");
     }
@@ -76,8 +76,8 @@ struct TtcRowContinuationPrefix {
     size_t bytes_consumed = 0;
 };
 
-TtcRowContinuationPrefix DecodeRowContinuationPrefix(const std::vector<uint8_t> &message, size_t column_count) {
-    ByteReader reader(message);
+TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t size, size_t column_count) {
+    ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_CONTINUATION) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC row continuation marker");
     }
@@ -111,7 +111,7 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const std::vector<uint8_t> 
         return *decoded;
     }
 
-    ByteReader universal_reader(message);
+    ByteReader universal_reader(data, size);
     universal_reader.ReadByte();
     const auto universal_count = universal_reader.ReadUB2();
     if (const auto decoded = decode(universal_reader, universal_count)) {
@@ -122,7 +122,7 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const std::vector<uint8_t> 
                             " described columns");
 }
 
-TtcRowDataPrefix DecodePartialRowDataPrefix(const std::vector<uint8_t> &message,
+TtcRowDataPrefix DecodePartialRowDataPrefix(const uint8_t *data, size_t size,
                                              const std::vector<size_t> &present_columns,
                                              const std::vector<bool> &is_lob) {
     if (is_lob.size() != present_columns.size()) {
@@ -131,7 +131,7 @@ TtcRowDataPrefix DecodePartialRowDataPrefix(const std::vector<uint8_t> &message,
     if (present_columns.empty()) {
         // A bit vector that selects nothing says the row repeats the previous
         // one, and ROW_DATA is then its message byte and nothing else.
-        ByteReader reader(message);
+        ByteReader reader(data, size);
         if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ROW_DATA after row continuation");
         }
@@ -141,7 +141,7 @@ TtcRowDataPrefix DecodePartialRowDataPrefix(const std::vector<uint8_t> &message,
     // locators included. Reading them as ordinary length-prefixed values costs
     // nothing on the first row of a fetch and desynchronizes every row after
     // the first bit vector, which is why this shares the full decoder.
-    return DecodeTtcRowDataPrefix(message, is_lob, 16U << 20U);
+    return DecodeTtcRowDataPrefix(data, size, is_lob, 16U << 20U);
 }
 
 TtcRowData MergeChangedColumns(const TtcRowData &previous_row, const std::vector<size_t> &present_columns,
@@ -201,21 +201,55 @@ TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_co
 
 } // namespace
 
-TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, const std::vector<OracleColumn> &columns,
-                                        uint8_t ttc_field_version, const std::optional<TtcRowData> &preceding_row) {
-
+TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns_p, uint8_t ttc_field_version_p,
+                                                 const std::optional<TtcRowData> &preceding_row_p)
+    : columns(columns_p), ttc_field_version(ttc_field_version_p), preceding_row(preceding_row_p) {
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
-    TtcFetchResponse result;
-    std::optional<TtcRowData> previous_row = preceding_row;
+}
+
+const TtcRowData *TtcFetchResponseDecoder::PreviousRow() const {
+    if (!result.rows.empty()) {
+        return &result.rows.back();
+    }
+    return preceding_row ? &*preceding_row : nullptr;
+}
+
+bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
+    if (message.size() < resume_offset) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "TTC fetch response is shorter than what was decoded");
+    }
+    // Only the rows before resume_offset are kept between calls. Everything
+    // after them — a row header waiting for its ROW_DATA, the rows that header
+    // was still waiting over, the end-of-call and whether it ends the response
+    // — is decided again from the bytes as they now stand, exactly as one pass
+    // over the joined response would decide it.
+    result.rows.erase(result.rows.begin() + static_cast<std::ptrdiff_t>(kept_rows), result.rows.end());
+    result.used_row_header_selection = kept_row_header_selection;
+    result.used_row_continuation = kept_row_continuation;
+    result.completion.reset();
+    result.exhausted = false;
+    result.completed = false;
     std::optional<std::vector<size_t>> row_header_present_columns;
-    size_t offset = 0;
+    size_t offset = resume_offset;
+    // Each message is read in place. Copying what was left of the response
+    // for every message made a fetch quadratic in its own size.
+    const auto keep_row = [&](TtcRowData row) {
+        result.rows.push_back(std::move(row));
+        if (!row_header_present_columns) {
+            resume_offset = offset;
+            kept_rows = result.rows.size();
+            kept_row_header_selection = result.used_row_header_selection;
+            kept_row_continuation = result.used_row_continuation;
+        }
+    };
     while (offset < message.size() && !result.completed) {
-        const auto tail = Tail(message, offset);
-        switch (tail.front()) {
+        const auto *at = message.data() + offset;
+        const auto remaining = message.size() - offset;
+        switch (*at) {
         case TTC_MESSAGE_ROW_HEADER: {
-            const auto row_header = DecodeRowHeaderPrefix(tail, columns.size());
+            const auto row_header = DecodeRowHeaderPrefix(at, remaining, columns.size());
             offset += row_header.bytes_consumed;
             row_header_present_columns = row_header.present_columns;
             break;
@@ -233,33 +267,34 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
                 for (const auto index : wire_columns) {
                     is_lob.push_back(IsOracleLobType(columns[index].oracle_type));
                 }
-                auto row = DecodeTtcRowDataPrefix(tail, is_lob);
+                auto row = DecodeTtcRowDataPrefix(at, remaining, is_lob);
                 values = std::move(row.values);
                 offset += row.bytes_consumed;
             }
             if (row_header_present_columns) {
-                if (!previous_row) {
+                const auto *previous_row = PreviousRow();
+                if (previous_row == nullptr) {
                     throw ProtocolError(ProtocolErrorKind::MALFORMED,
                                         "TTC ROW_HEADER selected columns before a complete row");
                 }
                 // Selected zero-width columns keep the previous row's value,
                 // which is already NULL for them.
-                result.rows.push_back(MergeChangedColumns(*previous_row, wire_columns, values, columns.size()));
+                auto merged = MergeChangedColumns(*previous_row, wire_columns, values, columns.size());
                 result.used_row_header_selection = true;
                 row_header_present_columns.reset();
+                keep_row(std::move(merged));
             } else {
-                result.rows.push_back(ExpandWireRow(columns.size(), wire_columns, values));
+                keep_row(ExpandWireRow(columns.size(), wire_columns, values));
             }
-            previous_row = result.rows.back();
             break;
         }
         case TTC_MESSAGE_ROW_CONTINUATION: {
-            if (!previous_row) {
+            const auto *previous_row = PreviousRow();
+            if (previous_row == nullptr) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED,
                                     "TTC row continuation appeared before a complete row");
             }
-            const auto continuation = DecodeRowContinuationPrefix(tail, columns.size());
-            offset += continuation.bytes_consumed;
+            const auto continuation = DecodeRowContinuationPrefix(at, remaining, columns.size());
             // Zero-width columns carry no bytes here either, so they are
             // dropped from the selection before the values are read.
             const auto wire_columns = WireCarryingColumns(columns, continuation.present_columns);
@@ -268,15 +303,17 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
             for (const auto index : wire_columns) {
                 partial_is_lob.push_back(IsOracleLobType(columns[index].oracle_type));
             }
-            const auto partial = DecodePartialRowDataPrefix(Tail(message, offset), wire_columns, partial_is_lob);
-            offset += partial.bytes_consumed;
-            result.rows.push_back(MergeChangedColumns(*previous_row, wire_columns, partial.values, columns.size()));
+            const auto partial = DecodePartialRowDataPrefix(at + continuation.bytes_consumed,
+                                                            remaining - continuation.bytes_consumed, wire_columns,
+                                                            partial_is_lob);
+            offset += continuation.bytes_consumed + partial.bytes_consumed;
+            auto merged = MergeChangedColumns(*previous_row, wire_columns, partial.values, columns.size());
             result.used_row_continuation = true;
-            previous_row = result.rows.back();
+            keep_row(std::move(merged));
             break;
         }
         case TTC_MESSAGE_PARAMETER: {
-            const auto parameter = DecodeTtcReturnParameterPrefix(tail);
+            const auto parameter = DecodeTtcReturnParameterPrefix(Tail(message, offset));
             offset += parameter.bytes_consumed;
             break;
         }
@@ -285,7 +322,7 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
             // failure to do so is a real disagreement with the server rather
             // than something to paper over by swallowing the rest of the
             // message.
-            const auto completion = DecodeTtcErrorPrefix(tail, ttc_field_version);
+            const auto completion = DecodeTtcErrorPrefix(Tail(message, offset), ttc_field_version);
             result.exhausted = completion.error_number == 1403;
             result.completion = completion;
             if (completion.error_number != 0 && !result.exhausted) {
@@ -299,11 +336,11 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
             // and the version-gated trailer read correctly, a terminal
             // end-of-call consumes its message exactly.
             offset += completion.bytes_consumed;
-            result.completed = result.exhausted || completion.bytes_consumed == tail.size();
+            result.completed = result.exhausted || completion.bytes_consumed == remaining;
             break;
         }
         case TTC_MESSAGE_STATUS: {
-            ByteReader reader(tail);
+            ByteReader reader(at, remaining);
             reader.ReadByte();
             reader.ReadUB4();
             reader.ReadUB2();
@@ -317,12 +354,27 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
             break;
         default:
             throw ProtocolError(ProtocolErrorKind::MALFORMED,
-                                "unknown TTC message " + std::to_string(tail.front()) + " in fetch response");
+                                "unknown TTC message " + std::to_string(*at) + " in fetch response");
         }
     }
     result.bytes_consumed = offset;
-    result.last_row = previous_row;
-    return result;
+    return result.completed;
+}
+
+TtcFetchResponse TtcFetchResponseDecoder::Take() {
+    if (const auto *last = PreviousRow()) {
+        result.last_row = *last;
+    } else {
+        result.last_row.reset();
+    }
+    return std::move(result);
+}
+
+TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, const std::vector<OracleColumn> &columns,
+                                        uint8_t ttc_field_version, const std::optional<TtcRowData> &preceding_row) {
+    TtcFetchResponseDecoder decoder(columns, ttc_field_version, preceding_row);
+    decoder.Decode(message);
+    return decoder.Take();
 }
 
 } // namespace oracle_scanner

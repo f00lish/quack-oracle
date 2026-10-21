@@ -312,25 +312,27 @@ TtcFetchResponse TtcStatementChannel::ReceiveDecodedFetchResponse(OracleStatemen
         // another only when the decode says it ran out — either by reporting
         // TRUNCATED or by finishing the buffer without a terminator.
         auto accumulated = channel.Receive();
+        // A fetch of a few thousand rows spans dozens of fragments, so the
+        // decoder resumes after the last row it finished instead of decoding
+        // the whole response again for each one. A fragment can split any
+        // field, but never a row that has already decoded completely.
+        TtcFetchResponseDecoder decoder(columns, server_field_version, preceding_row);
         for (size_t fragments = 1;; fragments++) {
-            std::optional<TtcFetchResponse> decoded;
+            bool complete = false;
             try {
-                decoded = DecodeTtcFetchResponse(accumulated, columns, server_field_version, preceding_row);
+                complete = decoder.Decode(accumulated);
             } catch (const ProtocolError &error) {
                 if (error.Kind() != ProtocolErrorKind::TRUNCATED) {
                     throw;
                 }
             }
-            if (decoded && decoded->completed) {
-                return std::move(*decoded);
+            if (complete) {
+                return decoder.Take();
             }
             if (fragments == MAX_RESPONSE_FRAGMENTS) {
                 throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
                                     "Oracle response spans more fragments than this client will join");
             }
-            // The whole accumulated buffer is decoded again rather than resumed
-            // from an offset: a fragment can split any field, so there is no
-            // safe point to resume from, and a response is a handful of packets.
             const auto next = channel.Receive();
             if (accumulated.size() > MAX_RESPONSE_BYTES - next.size()) {
                 throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,

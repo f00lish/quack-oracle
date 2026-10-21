@@ -995,6 +995,101 @@ static void TestTtcFetchResponse() {
            wide_continued.rows[0][8].value() == std::vector<uint8_t> {'x'});
 }
 
+// The fragment loop hands the decoder a growing response and expects it to
+// resume after the last row it finished. Whatever the split points, the result
+// must be exactly what one pass over the joined response produces.
+static void TestFetchResponseDecoderResumes() {
+    const std::vector<OracleColumn> columns = {{"A", 1, 16, 0, 0, true}, {"B", 1, 16, 0, 0, true},
+                                               {"C", 1, 16, 0, 0, true}};
+    const TtcRowData preceding = {std::vector<uint8_t> {'p'}, std::vector<uint8_t> {'q'}, std::nullopt};
+    ByteWriter response;
+    // A row header selecting column A, its ROW_DATA, then full rows,
+    // continuations in both captured count forms.
+    response.WriteByte(6).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteUB4(0).WriteUB2(0);
+    response.WriteUB4(1).WriteLengthPrefixed(std::vector<uint8_t> {0x01}).WriteUB4(0);
+    response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'a', '0'});
+    for (uint8_t row = 1; row <= 6; row++) {
+        response.WriteByte(TTC_MESSAGE_ROW_DATA)
+            .WriteLengthPrefixed(std::vector<uint8_t> {'a', static_cast<uint8_t>('0' + row)})
+            .WriteLengthPrefixed(std::vector<uint8_t>(row, 'b'))
+            .WriteLengthPrefixed(std::nullopt);
+        response.WriteByte(21).WriteUInt16LE(1).WriteByte(0x04);
+        response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'c', row});
+        response.WriteByte(21).WriteUB2(2).WriteByte(0x03);
+        response.WriteByte(TTC_MESSAGE_ROW_DATA)
+            .WriteLengthPrefixed(std::vector<uint8_t> {'x'})
+            .WriteLengthPrefixed(std::nullopt);
+    }
+    // An all-zero bit vector: the next row repeats the previous one.
+    response.WriteByte(6).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteUB4(0).WriteUB2(0);
+    response.WriteUB4(1).WriteLengthPrefixed(std::vector<uint8_t> {0x00}).WriteUB4(0);
+    response.WriteByte(TTC_MESSAGE_ROW_DATA);
+    // A row header still waiting for its ROW_DATA while a continuation row
+    // decodes: the rows in between are not kept until the header is answered.
+    response.WriteByte(6).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteUB4(0).WriteUB2(0);
+    response.WriteUB4(1).WriteLengthPrefixed(std::vector<uint8_t> {0x02}).WriteUB4(0);
+    response.WriteByte(21).WriteUInt16LE(1).WriteByte(0x01);
+    response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'h'});
+    response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'s'});
+    response.WriteByte(9).WriteUB4(0).WriteUB2(0);
+    const auto &bytes = response.Data();
+
+    const auto expected = DecodeTtcFetchResponse(bytes, columns, 6, preceding);
+    CHECK(expected.completed && expected.bytes_consumed == bytes.size() && expected.rows.size() == 22 &&
+           expected.used_row_header_selection && expected.used_row_continuation);
+    CHECK(expected.rows[0][0].value() == std::vector<uint8_t>({'a', '0'}) &&
+           expected.rows[0][1].value() == std::vector<uint8_t>({'q'}) && !expected.rows[0][2]);
+    CHECK(expected.rows[19] == expected.rows[18] && expected.rows[18][0].value() == std::vector<uint8_t>({'x'}));
+    CHECK(expected.rows[20][0].value() == std::vector<uint8_t>({'h'}) && !expected.rows[20][1] &&
+           expected.rows[21][1].value() == std::vector<uint8_t>({'s'}) &&
+           expected.rows[21][2].value() == std::vector<uint8_t>({'c', 6}));
+
+    for (size_t step = 1; step <= 17; step++) {
+        TtcFetchResponseDecoder decoder(columns, 6, preceding);
+        bool complete = false;
+        for (size_t size = (std::min)(step, bytes.size());; size = (std::min)(size + step, bytes.size())) {
+            const std::vector<uint8_t> received(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
+            try {
+                complete = decoder.Decode(received);
+            } catch (const ProtocolError &error) {
+                CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+            }
+            if (complete || size == bytes.size()) {
+                break;
+            }
+        }
+        CHECK(complete);
+        const auto resumed = decoder.Take();
+        CHECK(resumed.rows == expected.rows && resumed.last_row == expected.last_row &&
+               resumed.bytes_consumed == expected.bytes_consumed && resumed.completed &&
+               resumed.exhausted == expected.exhausted &&
+               resumed.used_row_header_selection == expected.used_row_header_selection &&
+               resumed.used_row_continuation == expected.used_row_continuation);
+    }
+
+    // A response cannot become shorter than what was already decoded from it.
+    TtcFetchResponseDecoder shrinking(columns, 6, preceding);
+    const std::vector<uint8_t> most(bytes.begin(), bytes.end() - 1);
+    try {
+        (void)shrinking.Decode(most);
+    } catch (const ProtocolError &error) {
+        CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+    }
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { (void)shrinking.Decode({bytes.front()}); });
+
+    // Bytes that are wrong after a kept row are still wrong, not truncated.
+    ByteWriter unknown;
+    unknown.WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(std::vector<uint8_t> {'k'})
+        .WriteLengthPrefixed(std::nullopt)
+        .WriteLengthPrefixed(std::nullopt);
+    unknown.WriteByte(0xEE);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] {
+        TtcFetchResponseDecoder decoder(columns, 6, preceding);
+        (void)decoder.Decode(unknown.Data());
+    });
+}
+
 static void TestTtcIoVector() {
     ByteWriter writer;
     writer.WriteByte(TTC_MESSAGE_IO_VECTOR).WriteByte(0).WriteUB2(2).WriteUB4(0).WriteUB4(1).WriteUB2(0);
@@ -6488,6 +6583,7 @@ int main() {
     TestTtcAuthEncoding();
     TestTtcFetchCodec();
     TestTtcFetchResponse();
+    TestFetchResponseDecoderResumes();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();
     TestTtcImplicitResultSet();

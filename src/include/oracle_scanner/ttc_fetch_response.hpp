@@ -31,4 +31,44 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
                                         uint8_t ttc_field_version = 12,
                                         const std::optional<TtcRowData> &preceding_row = std::nullopt);
 
+// Decodes one fetch response as it arrives in DATA fragments, without decoding
+// any row twice. Each call to Decode is given the whole response received so
+// far, which must begin with what the previous call was given. A row is kept
+// once it has been decoded completely, and the next call starts after the last
+// kept row, so only part of one row and the few bytes that end a response are
+// ever read again. Decoding is strictly left to right and nothing a row
+// decodes to depends on the bytes after it, which is what makes the result the
+// same as one DecodeTtcFetchResponse over the joined response.
+//
+// The columns are held by reference and must outlive the decoder.
+class TtcFetchResponseDecoder {
+public:
+    TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
+                            const std::optional<TtcRowData> &preceding_row);
+
+    // True once the response is complete. Throws TRUNCATED, as
+    // DecodeTtcFetchResponse does, when the bytes end inside a message, and
+    // leaves every row kept so far in place for the next call.
+    bool Decode(const std::vector<uint8_t> &message);
+    TtcFetchResponse Take();
+
+private:
+    // The row a continuation would change: the last decoded row, or the one
+    // that preceded this response, or null when there is neither. It points
+    // into the decoded rows, so it is valid only until the next row is added.
+    const TtcRowData *PreviousRow() const;
+
+    const std::vector<OracleColumn> &columns;
+    uint8_t ttc_field_version;
+    std::optional<TtcRowData> preceding_row;
+    TtcFetchResponse result;
+    // What is kept between calls: the rows decoded before resume_offset, and
+    // whether any of them needed a row header or a continuation. Rows after it
+    // were decoded with a row header still waiting, and are decoded again.
+    size_t resume_offset = 0;
+    size_t kept_rows = 0;
+    bool kept_row_header_selection = false;
+    bool kept_row_continuation = false;
+};
+
 } // namespace oracle_scanner

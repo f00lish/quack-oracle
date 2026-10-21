@@ -34,6 +34,10 @@ inline bool IsOracleLobType(uint16_t oracle_type) {
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, const std::vector<bool> &is_lob,
                                         size_t maximum_value_bytes = (1U << 20U));
+// The same, reading from a position inside a larger response rather than from
+// a copy of what is left of it.
+TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const std::vector<bool> &is_lob,
+                                        size_t maximum_value_bytes = (1U << 20U));
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, size_t column_count,
                                         size_t maximum_value_bytes = 16U << 20U);

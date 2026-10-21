@@ -354,7 +354,10 @@ int main() {
                 (void)Run(*con, "SELECT * FROM oracle_query_transaction('tx', 'SELECT 1 AS X FROM DUAL');",
                           "concurrent read");
             }
-            Check(Sessions(admin, user_a) == 3, "three transactions hold three sessions");
+            // Eventually, because the session stage 3 killed can linger in
+            // V$SESSION as KILLED for a moment on a busy server: Free 23ai
+            // showed four rows, one of them KILLED, and three a moment later.
+            Check(SessionsEventually(admin, user_a, 3) == 3, "three transactions hold three sessions");
             for (auto *con : {&c1, &c2, &c3}) {
                 Run(*con, "COMMIT;", "commit concurrent");
             }

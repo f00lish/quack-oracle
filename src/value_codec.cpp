@@ -327,4 +327,59 @@ std::string DecodeOracleNumber(const std::vector<uint8_t> &wire) {
     return negative ? "-" + result : result;
 }
 
+std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire) {
+    // The checks are DecodeOracleNumber's, answered with "no" rather than
+    // an error so that the error stays where it was.
+    if (wire.empty() || wire.size() > 21) {
+        return std::nullopt;
+    }
+    if (wire.size() == 1 && wire[0] == 0x80) {
+        return 0;
+    }
+    const bool negative = wire[0] < 0x80;
+    const int64_t exponent_100 = negative ? 62 - wire[0] : static_cast<int64_t>(wire[0]) - 193;
+    if (exponent_100 < -65 || exponent_100 > 62 || wire.size() == 1) {
+        return std::nullopt;
+    }
+    size_t end = wire.size();
+    if (negative && wire.back() == 102) {
+        end--;
+    }
+    if (end == 1) {
+        return std::nullopt;
+    }
+    // The first base-100 digit is worth 100^exponent_100 and the last one is
+    // never zero, so the value is whole exactly when the last digit is not
+    // below the units place.
+    const auto digit_count = static_cast<int64_t>(end - 1);
+    if (exponent_100 < digit_count - 1) {
+        return std::nullopt;
+    }
+    constexpr uint64_t limit = uint64_t {1} << 63U;
+    uint64_t magnitude = 0;
+    for (size_t index = 1; index < end; index++) {
+        const int value = negative ? 101 - wire[index] : wire[index] - 1;
+        if (value < 0 || value > 99 || (index + 1 == end && value == 0)) {
+            return std::nullopt;
+        }
+        if (magnitude > (limit - static_cast<uint64_t>(value)) / 100U) {
+            return std::nullopt;
+        }
+        magnitude = magnitude * 100U + static_cast<uint64_t>(value);
+    }
+    for (int64_t scale = digit_count - 1; scale < exponent_100; scale++) {
+        if (magnitude > limit / 100U) {
+            return std::nullopt;
+        }
+        magnitude *= 100U;
+    }
+    if (negative) {
+        return magnitude == limit ? (std::numeric_limits<int64_t>::min)() : -static_cast<int64_t>(magnitude);
+    }
+    if (magnitude == limit) {
+        return std::nullopt;
+    }
+    return static_cast<int64_t>(magnitude);
+}
+
 } // namespace oracle_scanner

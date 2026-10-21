@@ -145,13 +145,13 @@ TtcRowDataPrefix DecodePartialRowDataPrefix(const uint8_t *data, size_t size,
 }
 
 TtcRowData MergeChangedColumns(const TtcRowData &previous_row, const std::vector<size_t> &present_columns,
-                               const TtcRowData &values, size_t column_count) {
+                               TtcRowData values, size_t column_count) {
     if (previous_row.size() != column_count || present_columns.size() != values.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC partial row disagrees with cursor columns");
     }
     auto row = previous_row;
     for (size_t index = 0; index < present_columns.size(); index++) {
-        row[present_columns[index]] = values[index];
+        row[present_columns[index]] = std::move(values[index]);
     }
     return row;
 }
@@ -186,15 +186,30 @@ std::vector<size_t> WireCarryingColumns(const std::vector<OracleColumn> &columns
     return result;
 }
 
+// Which of the given columns are LOBs, whose values are framed as locators.
+std::vector<bool> LobColumns(const std::vector<OracleColumn> &columns, const std::vector<size_t> &wire_columns) {
+    std::vector<bool> is_lob;
+    is_lob.reserve(wire_columns.size());
+    for (const auto index : wire_columns) {
+        is_lob.push_back(IsOracleLobType(columns[index].oracle_type));
+    }
+    return is_lob;
+}
+
 // Places the values that were on the wire at their described column positions
 // and leaves every omitted zero-width column as SQL NULL.
-TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_columns, const TtcRowData &values) {
+TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_columns, TtcRowData values) {
     if (wire_columns.size() != values.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC row disagrees with the columns that carry values");
     }
+    // Wire columns ascend without repeats, so as many as there are columns
+    // means every column, already in place.
+    if (values.size() == column_count) {
+        return values;
+    }
     TtcRowData row(column_count);
     for (size_t index = 0; index < wire_columns.size(); index++) {
-        row[wire_columns[index]] = values[index];
+        row[wire_columns[index]] = std::move(values[index]);
     }
     return row;
 }
@@ -207,6 +222,8 @@ TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn>
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
+    row_columns = WireCarryingColumns(columns, std::nullopt);
+    row_is_lob = LobColumns(columns, row_columns);
 }
 
 const TtcRowData *TtcFetchResponseDecoder::PreviousRow() const {
@@ -255,18 +272,22 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
             break;
         }
         case TTC_MESSAGE_ROW_DATA: {
-            const auto wire_columns = WireCarryingColumns(columns, row_header_present_columns);
+            // A row without a row header carries every column that carries
+            // bytes at all, the same for each row, so that set is worked out once.
+            std::vector<size_t> selected_columns;
+            std::vector<bool> selected_is_lob;
+            if (row_header_present_columns) {
+                selected_columns = WireCarryingColumns(columns, row_header_present_columns);
+                selected_is_lob = LobColumns(columns, selected_columns);
+            }
+            const auto &wire_columns = row_header_present_columns ? selected_columns : row_columns;
+            const auto &is_lob = row_header_present_columns ? selected_is_lob : row_is_lob;
             TtcRowData values;
             if (wire_columns.empty()) {
                 // Every column this row would carry is zero-width, so ROW_DATA
                 // is its message byte and nothing else.
                 offset += 1;
             } else {
-                std::vector<bool> is_lob;
-                is_lob.reserve(wire_columns.size());
-                for (const auto index : wire_columns) {
-                    is_lob.push_back(IsOracleLobType(columns[index].oracle_type));
-                }
                 auto row = DecodeTtcRowDataPrefix(at, remaining, is_lob);
                 values = std::move(row.values);
                 offset += row.bytes_consumed;
@@ -279,12 +300,12 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
                 }
                 // Selected zero-width columns keep the previous row's value,
                 // which is already NULL for them.
-                auto merged = MergeChangedColumns(*previous_row, wire_columns, values, columns.size());
+                auto merged = MergeChangedColumns(*previous_row, wire_columns, std::move(values), columns.size());
                 result.used_row_header_selection = true;
                 row_header_present_columns.reset();
                 keep_row(std::move(merged));
             } else {
-                keep_row(ExpandWireRow(columns.size(), wire_columns, values));
+                keep_row(ExpandWireRow(columns.size(), wire_columns, std::move(values)));
             }
             break;
         }
@@ -298,16 +319,12 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
             // Zero-width columns carry no bytes here either, so they are
             // dropped from the selection before the values are read.
             const auto wire_columns = WireCarryingColumns(columns, continuation.present_columns);
-            std::vector<bool> partial_is_lob;
-            partial_is_lob.reserve(wire_columns.size());
-            for (const auto index : wire_columns) {
-                partial_is_lob.push_back(IsOracleLobType(columns[index].oracle_type));
-            }
-            const auto partial = DecodePartialRowDataPrefix(at + continuation.bytes_consumed,
+            const auto partial_is_lob = LobColumns(columns, wire_columns);
+            auto partial = DecodePartialRowDataPrefix(at + continuation.bytes_consumed,
                                                             remaining - continuation.bytes_consumed, wire_columns,
                                                             partial_is_lob);
             offset += continuation.bytes_consumed + partial.bytes_consumed;
-            auto merged = MergeChangedColumns(*previous_row, wire_columns, partial.values, columns.size());
+            auto merged = MergeChangedColumns(*previous_row, wire_columns, std::move(partial.values), columns.size());
             result.used_row_continuation = true;
             keep_row(std::move(merged));
             break;

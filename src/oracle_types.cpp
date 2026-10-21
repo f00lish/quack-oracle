@@ -241,6 +241,12 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
     case 2:
         if (type.id() == LogicalTypeId::BIGINT && column.scale == 0 && column.precision >= 1 &&
             column.precision <= 18) {
+            // Most values are whole numbers that fit, and need no text at all.
+            if (const auto integer = oracle_scanner::TryDecodeOracleInteger(*wire)) {
+                FlatVector::SetNull(vector, row, false);
+                FlatVector::GetDataMutable<int64_t>(vector)[row] = *integer;
+                return;
+            }
             int64_t value = 0;
             try {
                 value = std::stoll(oracle_scanner::DecodeOracleNumber(*wire));

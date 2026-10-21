@@ -97,6 +97,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -993,6 +994,51 @@ static void TestTtcFetchResponse() {
     CHECK(wide_continued.used_row_continuation && wide_continued.rows.size() == 1 &&
            wide_continued.rows[0][0].value() == std::vector<uint8_t> {'z'} &&
            wide_continued.rows[0][8].value() == std::vector<uint8_t> {'x'});
+}
+
+// A BIGINT column is read with TryDecodeOracleInteger and falls back to the
+// decimal text only when that says no. Wherever it answers, the answer must be
+// what parsing the text gives; wherever the text is not a whole int64, or the
+// wire form is malformed, it must not answer at all.
+static void TestOracleIntegerMatchesDecimalText() {
+    const auto compare = [](const std::vector<uint8_t> &wire) {
+        const auto direct = TryDecodeOracleInteger(wire);
+        std::optional<int64_t> parsed;
+        try {
+            const auto text = DecodeOracleNumber(wire);
+            if (text.find('.') == std::string::npos) {
+                parsed = std::stoll(text);
+            }
+        } catch (const std::exception &) {
+        }
+        CHECK(direct == parsed);
+    };
+    for (const auto *text : {"0", "1", "-1", "99", "100", "-100", "101", "9999999999", "10000000000",
+                             "123456789012345678", "9223372036854775807", "-9223372036854775808",
+                             "9223372036854775808", "-9223372036854775809", "1e18", "1e19", "-1e18", "1e30",
+                             "-1e30", "1.5", "-1.5", "0.5", "-0.5", "100.01", "12345678901234567890123",
+                             "9223372036854775800", "-9223372036854775700", "1e-30"}) {
+        compare(EncodeOracleNumber(text));
+    }
+    std::mt19937_64 random(20261021);
+    for (size_t index = 0; index < 200000; index++) {
+        const auto bits = random();
+        const auto shift = static_cast<unsigned>(random() % 64U);
+        auto value = static_cast<int64_t>(bits >> shift);
+        if ((random() & 1U) != 0) {
+            value = -value;
+        }
+        compare(EncodeOracleNumber(std::to_string(value)));
+        if (index % 4 == 0) {
+            compare(EncodeOracleNumber(std::to_string(value) + "." + std::to_string(random() % 1000U + 1U)));
+        }
+    }
+    // Malformed forms: the string path reports them, so this must not answer.
+    for (const auto &wire : std::vector<std::vector<uint8_t>> {
+             {}, {0xC1}, {0xC1, 0x00}, {0xC1, 0x65}, {0xC1, 0x02, 0x01}, {0x3E, 0x66}, std::vector<uint8_t>(22, 0xC1)}) {
+        CHECK(!TryDecodeOracleInteger(wire));
+        compare(wire);
+    }
 }
 
 // The fragment loop hands the decoder a growing response and expects it to
@@ -6694,6 +6740,7 @@ int main() {
     TestTtcFetchCodec();
     TestTtcFetchResponse();
     TestFetchResponseDecoderResumes();
+    TestOracleIntegerMatchesDecimalText();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();
     TestTtcImplicitResultSet();

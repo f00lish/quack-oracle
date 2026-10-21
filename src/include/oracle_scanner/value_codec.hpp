@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,5 +34,11 @@ double DecodeOracleBinaryDouble(const std::vector<uint8_t> &wire);
 // scientific decimal notation and emits the canonical base-100 wire form.
 std::vector<uint8_t> EncodeOracleNumber(const std::string &decimal);
 std::string DecodeOracleNumber(const std::vector<uint8_t> &wire);
+
+// The same value as an integer, without the text: present only when the wire
+// form is well formed, holds a whole number and fits int64_t. A caller falls
+// back to DecodeOracleNumber for everything else, which is also where a
+// malformed value is reported.
+std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire);
 
 } // namespace oracle_scanner

@@ -677,6 +677,81 @@ void TestQueryTypeMappingAndValues() {
     CHECK(script->sessions_opened == 1);
 }
 
+// A scan stores values with WriteOracleValue rather than SetValue(ValueFor(...)).
+// For every mapped type, and for the values each must refuse, the two have to
+// store the same thing or raise the same error.
+void TestWriteOracleValueMatchesValueFor() {
+    using Wire = std::optional<std::vector<uint8_t>>;
+    auto timestamp_column = Column("ts", 180);
+    timestamp_column.scale = 9;
+    oracle_scanner::OracleDateTime moment;
+    moment.year = 2026;
+    moment.month = 10;
+    moment.day = 21;
+    moment.hour = 13;
+    moment.second = 5;
+    moment.nanosecond = 123456789;
+    auto micro_moment = moment;
+    micro_moment.nanosecond = 123456000;
+    const std::vector<std::pair<OracleColumn, std::vector<Wire>>> cases = {
+        {Column("id", 2, 10, 0),
+         {std::nullopt, Number("0"), Number("-1"), Number("9999999999"), Number("100000000000000000000")}},
+        {Column("small", 2, 4, 2), {Number("12.34"), Number("-0.01"), Number("123.45"), Number("1.005")}},
+        {Column("medium", 2, 9, 3), {Number("123456.789"), Number("-0.5")}},
+        {Column("amount", 2, 12, 2), {Number("1000122856.29"), Number("0.1"), Number("-99999999.99")}},
+        {Column("wide", 2, 38, 10),
+         {Number("1234567890123456789012345678.0123456789"), Number("-0.0000000001"),
+          Number("1234567890123456789012345678901")}},
+        {Column("unbounded", 2), {Number("123456789012345678901234567890"), Number("-0.000000000000000000000000000015")}},
+        {Column("label", 1), {Text(""), Text("plain"), Text("\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82"),
+                              std::vector<uint8_t> {'o', 'k', 0xFF}, std::vector<uint8_t> {0xC3}}},
+        {Column("fixed", 96), {Text("ab  ")}},
+        {Column("doc", 112), {Text("a clob value")}},
+        {Column("payload", 23), {std::vector<uint8_t> {}, std::vector<uint8_t> {0x00, 0xFF, 0x10}}},
+        {Column("image", 113), {std::vector<uint8_t> {0xDE, 0xAD, 0xBE, 0xEF}}},
+        {Column("ratio", 100), {oracle_scanner::EncodeOracleBinaryFloat(0.25F)}},
+        {Column("score", 101), {oracle_scanner::EncodeOracleBinaryDouble(-1.0 / 3.0)}},
+        {Column("day", 12), {oracle_scanner::EncodeOracleDate(moment)}},
+        {timestamp_column, {oracle_scanner::EncodeOracleTimestamp(moment, false)}},
+        {Column("ts_us", 180), {oracle_scanner::EncodeOracleTimestamp(micro_moment, false),
+                                oracle_scanner::EncodeOracleTimestamp(moment, false)}},
+    };
+    const auto store = [](const auto &write) -> std::string {
+        try {
+            write();
+            return "";
+        } catch (const std::exception &error) {
+            const auto message = std::string(error.what());
+            return message.empty() ? std::string("<empty error>") : message;
+        }
+    };
+    size_t refusals = 0;
+    for (const auto &entry : cases) {
+        const auto &column = entry.first;
+        const auto type = duckdb::TypeFor(column);
+        for (const auto &wire : entry.second) {
+            for (const duckdb::idx_t row : {duckdb::idx_t {0}, duckdb::idx_t {7}}) {
+                duckdb::Vector expected(type, STANDARD_VECTOR_SIZE);
+                duckdb::Vector written(type, STANDARD_VECTOR_SIZE);
+                const auto expected_error =
+                    store([&] { expected.SetValue(row, duckdb::ValueFor(column, wire)); });
+                const auto written_error =
+                    store([&] { duckdb::WriteOracleValue(written, row, column, wire); });
+                CHECK(expected_error == written_error);
+                if (!expected_error.empty()) {
+                    refusals++;
+                    continue;
+                }
+                CHECK(duckdb::Value::NotDistinctFrom(expected.GetValue(row), written.GetValue(row)));
+            }
+        }
+    }
+    // The cases include refusals, so the comparison above covers errors too:
+    // an out-of-range BIGINT, two DECIMAL overflows, two strings that are not
+    // UTF-8 and a timestamp finer than its column, each at two rows.
+    CHECK(refusals == 2 * 6);
+}
+
 // Projecting a subset of the columns must emit exactly the requested ones, in
 // the requested order, with every row initialized.
 void TestProjectedColumns() {
@@ -3065,6 +3140,7 @@ int main() {
     TestTransactionPoolsDoNotMixSecrets();
     TestInterruptReachesEveryTransactionPath();
     TestQueryTypeMappingAndValues();
+    TestWriteOracleValueMatchesValueFor();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();
     TestUnsupportedColumnTypesAreRefusedAtBind();

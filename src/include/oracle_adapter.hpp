@@ -86,6 +86,11 @@ LogicalType TypeFor(const OracleColumn &column);
 LogicalType MappedType(const OracleColumn &column);
 //! Converts one wire value using the column's Oracle type; absent means NULL.
 Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8_t>> &wire);
+//! Stores one wire value in row `row` of a vector of the column's type: the
+//! same result as `vector.SetValue(row, ValueFor(column, wire))`, without
+//! building the Value in between.
+void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
+                      const std::optional<std::vector<uint8_t>> &wire);
 //! A unique DuckDB output name for a described column.
 std::string OutputName(const OracleColumn &column, idx_t index, std::unordered_set<std::string> &used);
 //! Renders one scalar OUT bind value as text for the callable surface.

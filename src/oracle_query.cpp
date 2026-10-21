@@ -2305,10 +2305,11 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             throw InternalException("oracle_query row has a different column count from its describe metadata");
         }
         for (idx_t vector_index = 0; vector_index < state.chunk_columns; vector_index++) {
-            output.data[vector_index].SetValue(row_index,
-                            TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
-                                return ValueFor(state.columns[vector_index], row[vector_index]);
-                            }));
+            TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
+                WriteOracleValue(output.data[vector_index], row_index, state.columns[vector_index],
+                                 row[vector_index]);
+                return true;
+            });
         }
     }
     // SetChildCardinality, not SetCardinality. In DuckDB 2.0 every vector

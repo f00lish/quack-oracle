@@ -6,6 +6,7 @@
 #include "oracle_adapter.hpp"
 
 #include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/operator/decimal_cast_operators.hpp"
 #include "duckdb/common/types/time.hpp"
 
 #include <cstdlib>
@@ -209,6 +210,142 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
     default:
         return Value(std::string(wire->begin(), wire->end()));
     }
+}
+
+// A scan used to store each fetched value as SetValue(ValueFor(...)): a Value
+// built per cell — a heap string for text, a string-to-DECIMAL cast through
+// the generic cast machinery for DECIMAL — and then copied into the vector.
+// That boxing was the larger part of a scan's client CPU. This stores the same
+// bytes the same way SetValue does (the validity bit, the slot, AddBlob for
+// strings) without the Value. Whatever it does not handle — a vector that is
+// not flat, a type it does not cover, and every value that would be refused —
+// takes the SetValue(ValueFor(...)) path itself, so a refusal raises exactly
+// the error it always did.
+void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
+                      const std::optional<std::vector<uint8_t>> &wire) {
+    const auto through_value = [&] { vector.SetValue(row, ValueFor(column, wire)); };
+    if (vector.GetVectorType() != VectorType::FLAT_VECTOR) {
+        through_value();
+        return;
+    }
+    if (!wire) {
+        FlatVector::SetNull(vector, row, true);
+        return;
+    }
+    const auto &type = vector.GetType();
+    const auto store_string = [&](const char *data, idx_t size) {
+        FlatVector::SetNull(vector, row, false);
+        FlatVector::GetDataMutable<string_t>(vector)[row] = StringVector::AddStringOrBlob(vector, data, size);
+    };
+    switch (column.oracle_type) {
+    case 2:
+        if (type.id() == LogicalTypeId::BIGINT && column.scale == 0 && column.precision >= 1 &&
+            column.precision <= 18) {
+            int64_t value = 0;
+            try {
+                value = std::stoll(oracle_scanner::DecodeOracleNumber(*wire));
+            } catch (const std::exception &) {
+                through_value();
+                return;
+            }
+            FlatVector::SetNull(vector, row, false);
+            FlatVector::GetDataMutable<int64_t>(vector)[row] = value;
+            return;
+        }
+        if (type.id() == LogicalTypeId::DECIMAL && column.precision >= 1 && column.precision <= 38 &&
+            column.scale >= 1 && column.scale <= column.precision &&
+            DecimalType::GetWidth(type) == static_cast<uint8_t>(column.precision) &&
+            DecimalType::GetScale(type) == static_cast<uint8_t>(column.scale)) {
+            // The cast DuckDB's VARCHAR-to-DECIMAL conversion runs, called
+            // directly; it writes the slot only when it succeeds.
+            const auto number = oracle_scanner::DecodeOracleNumber(*wire);
+            const string_t text(number.data(), static_cast<uint32_t>(number.size()));
+            const auto width = DecimalType::GetWidth(type);
+            const auto scale = DecimalType::GetScale(type);
+            // With somewhere to put its message the cast reports a failure
+            // instead of throwing its own error, and the Value path below then
+            // raises the one a scan always raised.
+            string cast_error;
+            CastParameters parameters(false, &cast_error);
+            bool stored = false;
+            switch (type.InternalType()) {
+            case PhysicalType::INT16:
+                stored = TryCastToDecimal::Operation(text, FlatVector::GetDataMutable<int16_t>(vector)[row],
+                                                     parameters, width, scale);
+                break;
+            case PhysicalType::INT32:
+                stored = TryCastToDecimal::Operation(text, FlatVector::GetDataMutable<int32_t>(vector)[row],
+                                                     parameters, width, scale);
+                break;
+            case PhysicalType::INT64:
+                stored = TryCastToDecimal::Operation(text, FlatVector::GetDataMutable<int64_t>(vector)[row],
+                                                     parameters, width, scale);
+                break;
+            case PhysicalType::INT128:
+                stored = TryCastToDecimal::Operation(text, FlatVector::GetDataMutable<hugeint_t>(vector)[row],
+                                                     parameters, width, scale);
+                break;
+            default:
+                break;
+            }
+            if (!stored) {
+                through_value();
+                return;
+            }
+            FlatVector::SetNull(vector, row, false);
+            return;
+        }
+        if (type.id() == LogicalTypeId::VARCHAR && MappedType(column).id() == LogicalTypeId::VARCHAR) {
+            // Decimal text is ASCII, so it is always valid UTF-8.
+            const auto number = oracle_scanner::DecodeOracleNumber(*wire);
+            store_string(number.data(), number.size());
+            return;
+        }
+        break;
+    case 12:
+    case 180:
+        // A timestamp Value holds no heap data, so building one costs little,
+        // and its range and precision checks stay in one place.
+        break;
+    case 23:
+    case 113:
+        if (type.id() == LogicalTypeId::BLOB) {
+            store_string(reinterpret_cast<const char *>(wire->data()), wire->size());
+            return;
+        }
+        break;
+    case 100:
+        if (type.id() == LogicalTypeId::FLOAT) {
+            FlatVector::SetNull(vector, row, false);
+            FlatVector::GetDataMutable<float>(vector)[row] = oracle_scanner::DecodeOracleBinaryFloat(*wire);
+            return;
+        }
+        break;
+    case 101:
+        if (type.id() == LogicalTypeId::DOUBLE) {
+            FlatVector::SetNull(vector, row, false);
+            FlatVector::GetDataMutable<double>(vector)[row] = oracle_scanner::DecodeOracleBinaryDouble(*wire);
+            return;
+        }
+        break;
+    case 181:
+    case 231:
+        break;
+    default:
+        // Text. A Value refuses bytes that are not valid UTF-8, and so does
+        // this, by letting that Value be built and refuse them.
+        if (type.id() == LogicalTypeId::VARCHAR) {
+            const auto *data = reinterpret_cast<const char *>(wire->data());
+            if (!Value::StringIsValid(data, wire->size())) {
+                through_value();
+                return;
+            }
+            store_string(data, wire->size());
+            return;
+        }
+        break;
+    }
+    through_value();
 }
 
 std::string FormatCallScalar(uint16_t oracle_type, const std::vector<uint8_t> &wire) {

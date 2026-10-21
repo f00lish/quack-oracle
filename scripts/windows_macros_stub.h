@@ -25,3 +25,7 @@
 #define NEAR
 #define FAR
 #define OPTIONAL
+
+// rpcndr.h, which windows.h pulls in: `small` is a type there. A test that
+// named a variable `small` compiled everywhere but on the Windows runner.
+#define small char

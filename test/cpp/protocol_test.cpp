@@ -6157,19 +6157,19 @@ static void TestLobPrefetchDecoderResumes() {
 
     // The batch budget spans the whole response, not one fragment of it: rows
     // of 250-byte text overrun a 4200-byte batch however they are split.
-    OracleLobPrefetchLimits small;
-    small.prefix_units = 0;
-    small.maximum_row_bytes = 4200;
-    small.maximum_batch_bytes = 4200;
+    OracleLobPrefetchLimits tight;
+    tight.prefix_units = 0;
+    tight.maximum_row_bytes = 4200;
+    tight.maximum_batch_bytes = 4200;
     ByteWriter large;
     for (size_t row = 0; row < 20; row++) {
         large.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t>(250, 'w'));
         blob_cell(large, {}, false);
     }
     large.WriteByte(9).WriteUB4(0).WriteUB2(0);
-    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)DecodeLobPrefetchFetchResponse(large.Data(), columns, small); });
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)DecodeLobPrefetchFetchResponse(large.Data(), columns, tight); });
     for (const size_t step : {size_t {1}, size_t {97}, size_t {1000}}) {
-        LobPrefetchFetchResponseDecoder decoder(columns, small, 12, std::nullopt);
+        LobPrefetchFetchResponseDecoder decoder(columns, tight, 12, std::nullopt);
         bool refused = false;
         for (size_t size = step;; size = (std::min)(size + step, large.Data().size())) {
             const std::vector<uint8_t> received(large.Data().begin(),

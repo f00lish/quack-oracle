@@ -269,12 +269,14 @@ TtcFetchResponse TtcStatementChannel::ReceiveDecodedLobPrefetchFetchResponse(Ora
     const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,uint8_t server_field_version,
     const std::optional<TtcRowData> &preceding_row) {
     try {
-        std::optional<TtcFetchResponse> response;
+        // A prefetched batch can be megabytes, so like a scalar fetch it is
+        // decoded once, resuming after the last finished row on each fragment.
+        std::optional<LobPrefetchFetchResponseDecoder> decoder;
         (void)ReceiveResponseFragments(channel,[&](const std::vector<uint8_t> &message) {
-            response=DecodeLobPrefetchFetchResponse(message,columns,limits,server_field_version,preceding_row);
-            return response->completed;
+            if (!decoder) { decoder.emplace(columns,limits,server_field_version,preceding_row); }
+            return decoder->Decode(message);
         });
-        return std::move(*response);
+        return decoder->Take();
     } catch (...) {
         if (statements.State(handle)!=OracleStatementState::POISONED) { statements.Poison(handle); }
         throw;

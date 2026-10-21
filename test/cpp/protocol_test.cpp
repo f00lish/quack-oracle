@@ -6032,6 +6032,116 @@ static void TestLobPrefetchScalarBudget() {
     CHECK(refused);
 }
 
+// A prefetched LOB batch arrives in fragments as a scalar fetch does, and the
+// decoder resumes after the last finished row. The result, and the batch byte
+// budget, must be exactly what one pass over the joined response gives.
+static void TestLobPrefetchDecoderResumes() {
+    OracleColumn text;
+    text.name = "T";
+    text.oracle_type = 1;
+    text.character_set_form = 1;
+    text.byte_width = 16;
+    OracleColumn blob;
+    blob.name = "B";
+    blob.oracle_type = 113;
+    const std::vector<OracleColumn> columns = {text, blob};
+    const auto blob_cell = [](ByteWriter &writer, const std::vector<uint8_t> &prefix, bool with_prefix) {
+        const std::vector<uint8_t> locator = {0x11, 0x22, 0x33};
+        writer.WriteUB4(static_cast<uint32_t>(locator.size())).WriteUB8(prefix.size()).WriteUB4(0);
+        if (with_prefix) {
+            writer.WriteLengthPrefixed(prefix);
+        }
+        writer.WriteLengthPrefixed(locator);
+    };
+
+    OracleLobPrefetchLimits limits;
+    ByteWriter response;
+    for (uint8_t row = 1; row <= 5; row++) {
+        response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t>(row, 't'));
+        blob_cell(response, std::vector<uint8_t>(row * 3U, row), true);
+        // Only the text changes, then only the BLOB, in both count forms.
+        response.WriteByte(21).WriteUInt16LE(1).WriteByte(0x01);
+        response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'u', row});
+        response.WriteByte(21).WriteUB2(1).WriteByte(0x02);
+        response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteUB4(0);
+    }
+    // A repeated row, then a row header waiting over a continuation.
+    response.WriteByte(6).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteUB4(0).WriteUB2(0);
+    response.WriteUB4(1).WriteLengthPrefixed(std::vector<uint8_t> {0x00}).WriteUB4(0);
+    response.WriteByte(TTC_MESSAGE_ROW_DATA);
+    response.WriteByte(6).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteUB4(0).WriteUB2(0);
+    response.WriteUB4(1).WriteLengthPrefixed(std::vector<uint8_t> {0x02}).WriteUB4(0);
+    response.WriteByte(21).WriteUInt16LE(1).WriteByte(0x01);
+    response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'h'});
+    response.WriteByte(TTC_MESSAGE_ROW_DATA);
+    blob_cell(response, {9, 9}, true);
+    response.WriteByte(9).WriteUB4(0).WriteUB2(0);
+    const auto &bytes = response.Data();
+
+    const auto expected = DecodeLobPrefetchFetchResponse(bytes, columns, limits);
+    CHECK(expected.completed && expected.bytes_consumed == bytes.size() && expected.rows.size() == 18 &&
+           expected.used_row_header_selection && expected.used_row_continuation);
+    CHECK(expected.rows[0][0].value() == std::vector<uint8_t>({'t'}) && expected.rows[0][1].has_value() &&
+           expected.rows[1][1] == expected.rows[0][1] && !expected.rows[2][1] &&
+           expected.rows[2][0].value() == std::vector<uint8_t>({'u', 1}));
+    CHECK(expected.rows[15] == expected.rows[14] && expected.rows[16][0].value() == std::vector<uint8_t>({'h'}) &&
+           !expected.rows[16][1] && expected.rows[17][1].has_value());
+
+    for (size_t step = 1; step <= 17; step++) {
+        LobPrefetchFetchResponseDecoder decoder(columns, limits, 12, std::nullopt);
+        bool complete = false;
+        for (size_t size = (std::min)(step, bytes.size());; size = (std::min)(size + step, bytes.size())) {
+            const std::vector<uint8_t> received(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
+            try {
+                complete = decoder.Decode(received);
+            } catch (const ProtocolError &error) {
+                CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+            }
+            if (complete || size == bytes.size()) {
+                break;
+            }
+        }
+        CHECK(complete);
+        const auto resumed = decoder.Take();
+        CHECK(resumed.rows == expected.rows && resumed.last_row == expected.last_row &&
+               resumed.bytes_consumed == expected.bytes_consumed &&
+               resumed.used_row_header_selection == expected.used_row_header_selection &&
+               resumed.used_row_continuation == expected.used_row_continuation);
+    }
+
+    // The batch budget spans the whole response, not one fragment of it: rows
+    // of 250-byte text overrun a 4200-byte batch however they are split.
+    OracleLobPrefetchLimits small;
+    small.prefix_units = 0;
+    small.maximum_row_bytes = 4200;
+    small.maximum_batch_bytes = 4200;
+    ByteWriter large;
+    for (size_t row = 0; row < 20; row++) {
+        large.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t>(250, 'w'));
+        blob_cell(large, {}, false);
+    }
+    large.WriteByte(9).WriteUB4(0).WriteUB2(0);
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)DecodeLobPrefetchFetchResponse(large.Data(), columns, small); });
+    for (const size_t step : {size_t {1}, size_t {97}, size_t {1000}}) {
+        LobPrefetchFetchResponseDecoder decoder(columns, small, 12, std::nullopt);
+        bool refused = false;
+        for (size_t size = step;; size = (std::min)(size + step, large.Data().size())) {
+            const std::vector<uint8_t> received(large.Data().begin(),
+                                                large.Data().begin() + static_cast<std::ptrdiff_t>(size));
+            try {
+                (void)decoder.Decode(received);
+            } catch (const ProtocolError &error) {
+                refused = error.Kind() == ProtocolErrorKind::LIMIT_EXCEEDED;
+                CHECK(refused || error.Kind() == ProtocolErrorKind::TRUNCATED);
+            }
+            if (refused || size == large.Data().size()) {
+                break;
+            }
+        }
+        CHECK(refused);
+    }
+}
+
 // The attached catalog's pool of transaction sessions. A fake session here
 // records every statement it is sent, so a test can show which ones reached
 // it, and can die while idle, the way a session killed on the server does.
@@ -6681,6 +6791,7 @@ int main() {
     TestSsoWallet();
     TestLobPrefetchMaterializer();
     TestLobPrefetchScalarBudget();
+    TestLobPrefetchDecoderResumes();
     TestTransactionPoolReusesAfterAConfirmedEnd();
     TestTransactionPoolClosesWhatIsNotClean();
     TestTransactionPoolReplacesASessionThatDiedIdle();

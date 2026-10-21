@@ -108,6 +108,36 @@ TtcFetchResponse DecodeLobPrefetchFetchResponse(const std::vector<uint8_t> &mess
     const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,
     uint8_t server_field_version = 12,const std::optional<TtcRowData> &preceding_row = std::nullopt);
 
+// The same response decoded as it arrives in DATA fragments, resuming after
+// the last row it finished, as TtcFetchResponseDecoder does for a scalar fetch.
+// The batch byte budget those rows used is kept with them. The columns and
+// limits are held by reference and must outlive the decoder.
+class LobPrefetchFetchResponseDecoder {
+public:
+    LobPrefetchFetchResponseDecoder(const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,
+        uint8_t server_field_version,const std::optional<TtcRowData> &preceding_row);
+
+    // True once the response is complete; throws TRUNCATED when the bytes end
+    // inside a message, keeping the rows finished so far for the next call.
+    bool Decode(const std::vector<uint8_t> &message);
+    TtcFetchResponse Take();
+
+private:
+    // Valid only until the next row is added.
+    const TtcRowData *PreviousRow() const;
+
+    const std::vector<OracleColumn> &columns;
+    const OracleLobPrefetchLimits &limits;
+    uint8_t server_field_version;
+    std::optional<TtcRowData> preceding_row;
+    TtcFetchResponse result;
+    size_t resume_offset = 0;
+    size_t kept_rows = 0;
+    size_t kept_batch_bytes = 0;
+    bool kept_row_header_selection = false;
+    bool kept_row_continuation = false;
+};
+
 // Zero-length ordinary CLOB can omit charset metadata (owned JDBC capture).
 // No character decoding is needed; any nonempty prefix still fails below.
 inline std::optional<OracleLobPrefetch> DecodeCursorLobPrefetchCell(ByteReader &reader, bool character,

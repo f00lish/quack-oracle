@@ -12,13 +12,14 @@ tag rather than a tag alone:
 3. Set `EXTENSION_VERSION` back to the next `-dev` version.
 
 The DuckDB version an artifact is built against is pinned in places that must
-agree: the `duckdb` submodule, `duckdb_version` and `duckdb_tag` in
+agree: the `duckdb` submodule, `duckdb_version` and `duckdb_commit` in
 [the workflow](../.github/workflows/MainDistributionPipeline.yml), and the
 `extension-ci-tools` branch the workflow reuses. `docs/UPDATING.md` covers
-moving them. While DuckDB 2.0 is a pre-release they are not a tag but whatever
-Community Extensions' own `build.yml` builds a descriptor's `ref` against — a
-commit, the version tag it stamps (`v2.0.0-alpha46057` at 0.5.0) and a ci-tools
-branch — so read them there before a release, and move all of them together.
+moving them. They follow whatever Community Extensions' own `build.yml` builds a
+descriptor's `ref` against — at 0.5.1 the version `v2.0.0`, the commit that tag
+names (`d54cbbe3`) and the `v2.0-cyanoptera` ci-tools branch; at 0.5.0 it was the
+pre-release `v2.0.0-alpha46057` — so read them there before a release, and move
+all of them together.
 
 ## Never publish a locally built artifact
 

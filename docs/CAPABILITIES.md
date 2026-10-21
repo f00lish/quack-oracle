@@ -20,9 +20,9 @@ A wrong number is worse than an error, so the boundary is drawn at proof.
 Native builds: **Linux, macOS, Windows**. Those are what the live lanes and the
 clean-machine gate exercise.
 
-DuckDB: releases from 0.5.0 on are built for **DuckDB 2.0** only, against the
-2.0 commit Community Extensions builds against; an extension loads only into
-the DuckDB it was built for. 0.4.0 is the last release for DuckDB 1.5.6.
+DuckDB: releases from 0.5.0 on are built for **DuckDB 2.0** only — from 0.5.1,
+against the v2.0.0 release; 0.5.0 was built for a 2.0 pre-release. An extension
+loads only into the DuckDB version it was built for. 0.4.0 is the last release for DuckDB 1.5.6.
 
 **A WebAssembly build cannot connect to Oracle.** Not "is untested" — it is
 refused, by name, at connect:

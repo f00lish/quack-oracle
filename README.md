@@ -13,7 +13,7 @@ CREATE SECRET ora (TYPE oracle, HOST 'db.example.com', PORT 1521,
 SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 ```
 
-> **Status:** version 0.5.0, for DuckDB 2.0, published to DuckDB Community
+> **Status:** version 0.5.1, for DuckDB v2.0.0, published to DuckDB Community
 > Extensions — one `INSTALL` and you are done, see [Install](#1-install).
 > Reads, writes, procedure calls and TLS are verified against live Oracle 19c,
 > Oracle Free 23ai, and OCI Autonomous Database.
@@ -95,12 +95,11 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.5.0 targets **DuckDB 2.0**, and new releases are built for DuckDB 2.0
-only. The 2.0 line is still a pre-release: Community Extensions builds it
-against one DuckDB 2.0 commit, currently the one that reports itself as
-`v2.0.0-alpha46057`, and an extension loads only into the DuckDB it was built
-for. On **DuckDB v1.5.6** the same command installs 0.4.0, the last release
-built for it; on v1.5.5, 0.2.2.
+Version 0.5.1 targets **DuckDB v2.0.0**, and new releases are built for DuckDB 2.0
+only. An extension loads only into the DuckDB version it was built for, so a
+DuckDB 2.0 pre-release cannot load it; upgrade to v2.0.0. On **DuckDB v1.5.6**
+the same command installs 0.4.0, the last release built for it; on v1.5.5,
+0.2.2.
 
 Prefer to build from source — to hack on it, or to run against a DuckDB you
 built yourself? That path still works:
@@ -875,11 +874,10 @@ you need it. Writing a LOB is not supported.
 ### `The file was built specifically for DuckDB version '…'`
 
 Your DuckDB is a different version from the one the file was built for. An
-extension loads only into the exact DuckDB it was built against; during the
-2.0 pre-release that means the same 2.0 build, not just any 2.0. Run
-`INSTALL oracle_scanner FROM community` from the DuckDB you use — it fetches the
-build for that version if one exists — or, if you built from source, use the
-shell this project produced (`./build/release/duckdb`).
+extension loads only into the exact DuckDB version it was built against, and
+a 2.0 pre-release is not v2.0.0. Run `INSTALL oracle_scanner FROM community`
+from the DuckDB you use — it fetches the build for that version if one exists —
+or, if you built from source, use the shell this project produced (`./build/release/duckdb`).
 
 ### DuckDB refuses the extension as unsigned
 

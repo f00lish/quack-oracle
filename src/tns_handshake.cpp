@@ -262,8 +262,22 @@ TnsConnectResult RunTnsConnect(TnsPacketStream &stream, const std::string &descr
     case TnsPacketType::ACCEPT: {
         // Oracle 19c's ACCEPT layout carries negotiated SDU at offset 26.
         // Future TTC packets must obey the server-selected SDU.
+        //
+        // Legacy layout (11.2 and older): the listener answers with the bare
+        // 8-byte TNS header and **no payload at all** -- there is no
+        // negotiated SDU, no version and no flags2 to read.  Such an ACCEPT
+        // is still a valid acceptance, so fall back to the protocol defaults
+        // instead of rejecting the connection.
         if (response.payload.size() < 28) {
-            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle ACCEPT packet is truncated");
+            const auto legacy = response.payload.size() < 2;
+            if (!legacy) {
+                throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle ACCEPT packet is truncated");
+            }
+            // No negotiated SDU: use the historical default. 19c clients fall
+            // back to 8192 when the server does not offer one either.
+            constexpr uint16_t kDefaultSdu = 8192;
+            const auto legacy_version = ReadUInt16(response.payload, 0);
+            return {TnsConnectDisposition::ACCEPTED, kDefaultSdu, false, legacy_version, false, {}};
         }
         if (ReadUInt16(response.payload, 26) < 512) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle ACCEPT selected an invalid SDU");

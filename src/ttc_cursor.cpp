@@ -62,9 +62,17 @@ OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version) {
     SkipString(reader); // type name
     reader.ReadUB2();   // position
     reader.ReadUB4();   // UDS flags
+    // The same trailing fields the top-level describe reads, by the same
+    // gates: a domain schema and name from field version 17, an annotation
+    // count from 20, three more small fields from 24. Only 17 is ever
+    // negotiated by this client; the rest stay refused rather than guessed.
     if (field_version >= 17) {
+        SkipString(reader); // domain schema
+        SkipString(reader); // domain name
+    }
+    if (field_version >= 20) {
         throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
-                            "23c cursor-descriptor domain fields require a versioned decoder");
+                            "cursor-descriptor annotations require a versioned decoder");
     }
     column.byte_width = column.oracle_type == 23 ? maximum_size : size;
     // Same rule as the top-level describe: a zero declared maximum means the

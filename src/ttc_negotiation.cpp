@@ -90,7 +90,16 @@ TtcProtocolInfo ParseTtcProtocolResponse(const std::vector<uint8_t> &message) {
 
 std::vector<uint8_t> BuildTtcDataTypesRequest(const TtcNegotiationOptions &options) {
     if (options.compile_capabilities.empty() && options.runtime_capabilities.empty()) {
-        return {ORACLE_19C_TTC_DATA_TYPES_TEMPLATE.begin(), ORACLE_19C_TTC_DATA_TYPES_TEMPLATE.end()};
+        std::vector<uint8_t> request(ORACLE_19C_TTC_DATA_TYPES_TEMPLATE.begin(),
+                                     ORACLE_19C_TTC_DATA_TYPES_TEMPLATE.end());
+        // The template is the 19c capture, byte for byte, and stays that way so
+        // its recorded hash holds. The one thing changed on the way out is the
+        // field version it advertises: the capture says 12, this client says
+        // ORACLE_CLIENT_TTC_FIELD_VERSION. Servers below that still negotiate
+        // down to their own.
+        request.at(TTC_DATA_TYPES_CAPABILITIES_OFFSET + TTC_CAPABILITY_FIELD_VERSION_INDEX) =
+            ORACLE_CLIENT_TTC_FIELD_VERSION;
+        return request;
     }
     ByteWriter writer;
     writer.WriteByte(TTC_MESSAGE_DATA_TYPES).WriteUInt16LE(ORACLE_CHARSET_AL32UTF8).WriteUInt16LE(ORACLE_CHARSET_AL32UTF8);

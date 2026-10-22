@@ -33,6 +33,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
+#include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/session_factory.hpp"
 
 #include <cmath>
@@ -331,6 +332,8 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
         }
         timestamp = timestamp_t(microseconds);
         extra_nanoseconds = remainder;
+    } else if (value.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
+        timestamp = timestamp_t(value.GetValue<timestamp_tz_t>().value);
     } else if (value.type().id() == LogicalTypeId::DATE) {
         timestamp = Timestamp::FromDatetime(value.GetValue<date_t>(), dtime_t(0));
     } else if (value.type().id() == LogicalTypeId::TIMESTAMP) {
@@ -387,6 +390,16 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     bind.name = name;
     bind.oracle_type = column.oracle_type;
     bind.direction = BindDirection::BIND_IN;
+    // What goes on the wire is settled before the NULL test: a batch declares
+    // its bind metadata once, so a NULL row has to describe its column exactly
+    // as a row with a value does.
+    if (column.oracle_type == 231) {
+        // A local-zone column is written as a TIMESTAMP of UTC wall time.
+        bind.oracle_type = 180;
+    }
+    if ((column.oracle_type == 1 || column.oracle_type == 96) && column.character_set_form == 2) {
+        bind.character_set_form = 2;
+    }
     if (value.IsNull()) {
         return bind;
     }
@@ -397,16 +410,18 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
         if (type != LogicalTypeId::VARCHAR) {
             RefuseBind(column, value, "a character column takes VARCHAR");
         }
-        if (column.character_set_form == 2) {
-            // Readable, but the value would be sent in the database character
-            // set into a column that stores the national one.
-            RefuseBind(column, value, "a national character set column cannot be written in this version");
-        }
         const auto text = value.GetValue<std::string>();
         if (text.empty()) {
             // Oracle stores an empty string as NULL, and this client reads it
             // back as NULL. Binding it explicitly says the same thing rather
             // than relying on the server to make the substitution.
+            return bind;
+        }
+        if (column.character_set_form == 2) {
+            // NCHAR and NVARCHAR2: the bind says it is the national form and
+            // the value is UTF-16BE, which is what python-oracledb sends for
+            // DB_TYPE_NVARCHAR and what a read returns.
+            bind.value = EncodingFor(column, [&] { return oracle_scanner::EncodeUtf8ToUtf16Be(text); });
             return bind;
         }
         bind.value = std::vector<uint8_t>(text.begin(), text.end());
@@ -439,6 +454,71 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     case 180: { // TIMESTAMP
         bind.value = EncodingFor(
             column, [&] { return oracle_scanner::EncodeOracleTimestamp(DateTimeFromValue(value, column), false); });
+        return bind;
+    }
+    case 231: { // TIMESTAMP WITH LOCAL TIME ZONE
+        // The session is UTC, so a TIMESTAMPTZ is bound as the TIMESTAMP of its
+        // UTC wall time and Oracle files it as the instant it names. Only a
+        // TIMESTAMPTZ says which instant is meant; a bare TIMESTAMP would
+        // silently be read as UTC.
+        if (type != LogicalTypeId::TIMESTAMP_TZ) {
+            RefuseBind(column, value, "a TIMESTAMP WITH LOCAL TIME ZONE column takes TIMESTAMPTZ");
+        }
+        bind.value = EncodingFor(
+            column, [&] { return oracle_scanner::EncodeOracleTimestamp(DateTimeFromValue(value, column), false); });
+        return bind;
+    }
+    case 252: { // BOOLEAN
+        if (type != LogicalTypeId::BOOLEAN) {
+            RefuseBind(column, value, "a BOOLEAN column takes BOOLEAN");
+        }
+        // Two bytes, as python-oracledb sends them: a 1, then 1 for true and 0
+        // for false.
+        bind.value = std::vector<uint8_t> {1, static_cast<uint8_t>(value.GetValue<bool>() ? 1 : 0)};
+        return bind;
+    }
+    case 182: { // INTERVAL YEAR TO MONTH
+        if (type != LogicalTypeId::INTERVAL) {
+            RefuseBind(column, value, "an INTERVAL YEAR TO MONTH column takes INTERVAL");
+        }
+        const auto interval = value.GetValue<interval_t>();
+        if (interval.days != 0 || interval.micros != 0) {
+            RefuseValue(column, "an INTERVAL YEAR TO MONTH holds whole months; this interval has days or time");
+        }
+        bind.value = EncodingFor(column, [&] {
+            return oracle_scanner::EncodeOracleIntervalYearMonth(interval.months / 12, interval.months % 12);
+        });
+        return bind;
+    }
+    case 183: { // INTERVAL DAY TO SECOND
+        if (type != LogicalTypeId::INTERVAL) {
+            RefuseBind(column, value, "an INTERVAL DAY TO SECOND column takes INTERVAL");
+        }
+        const auto interval = value.GetValue<interval_t>();
+        if (interval.months != 0) {
+            // A month is not a fixed number of days, so there is no exact
+            // DAY TO SECOND for it.
+            RefuseValue(column, "an INTERVAL DAY TO SECOND cannot hold months");
+        }
+        constexpr int64_t MICROS_PER_DAY = 86400LL * 1000000LL;
+        // Whole days inside the time part move to the day count, so the hour
+        // field stays 0..23 as Oracle requires.
+        const int64_t days = static_cast<int64_t>(interval.days) + interval.micros / MICROS_PER_DAY;
+        const int64_t micros = interval.micros % MICROS_PER_DAY;
+        if ((days > 0 && micros < 0) || (days < 0 && micros > 0)) {
+            // Oracle's interval has one sign for every field.
+            RefuseValue(column, "the days and the time part of this interval have opposite signs");
+        }
+        if (days > NumericLimits<int32_t>::Maximum() || days < NumericLimits<int32_t>::Minimum()) {
+            RefuseValue(column, "the day count is out of range");
+        }
+        const int64_t seconds_total = micros / 1000000LL;
+        bind.value = EncodingFor(column, [&] {
+            return oracle_scanner::EncodeOracleIntervalDaySecond(
+                static_cast<int32_t>(days), static_cast<int32_t>(seconds_total / 3600),
+                static_cast<int32_t>(seconds_total / 60 % 60), static_cast<int32_t>(seconds_total % 60),
+                static_cast<int32_t>(micros % 1000000LL * 1000));
+        });
         return bind;
     }
     case 181:
@@ -673,6 +753,17 @@ private:
                 OracleBind output;
                 output.name = "r" + std::to_string(column_index + 1);
                 output.oracle_type = returned_columns[column_index].oracle_type;
+                if (output.oracle_type == 96) {
+                    // A CHAR OUT bind is blank-padded to the whole buffer (32767
+                    // here), not to the column's width. Asked for as VARCHAR2 the
+                    // value comes back as the column holds it, already padded to
+                    // the declared width.
+                    output.oracle_type = 1;
+                }
+                if ((returned_columns[column_index].oracle_type == 1 || returned_columns[column_index].oracle_type == 96) &&
+                    returned_columns[column_index].character_set_form == 2) {
+                    output.character_set_form = 2;
+                }
                 output.direction = BindDirection::BIND_OUT;
                 output.maximum_bytes = 32767;
                 binds.push_back(std::move(output));

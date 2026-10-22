@@ -67,6 +67,7 @@
 #include "oracle_scanner/ttc_io_vector.hpp"
 #include "oracle_scanner/ttc_out_binds.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
+#include "oracle_scanner/ttc_data_types_template.hpp"
 #include "oracle_scanner/ttc_statement_channel.hpp"
 #include "oracle_scanner/ttc_row_data.hpp"
 #include "oracle_scanner/ttc_negotiation.hpp"
@@ -6825,6 +6826,147 @@ static void TestLobOperationObeysTheDeadlineMidResponse() {
     CHECK(server.Requests(raw) == 1);
 }
 
+// BOOLEAN, TIMESTAMP WITH LOCAL TIME ZONE, and the binds that write national
+// text, intervals and BOOLEAN. Recorded from Free 23ai (the server's values)
+// and from python-oracledb 4.0.1 Thin against Free (its bind metadata and
+// values); PROVENANCE.md lists them with hashes.
+//
+// boolean_value_bytes: the values a 23ai server sends for type 252, TRUE then
+//     FALSE, to a client advertising TTC field version 17.
+// ltz_value_bytes: a TIMESTAMP(6) WITH LOCAL TIME ZONE, 2026-03-04
+//     05:06:07.123456, read from a session whose time zone is +00:00.
+// python_*_bind: the bind metadata and value python-oracledb sent for an
+//     NCHAR 'ab', an NVARCHAR2 N'Zq<e acute><CJK>', a BOOLEAN TRUE and an
+//     INTERVAL DAY TO SECOND '3 4:5:6.000007'. Each starts at the bind's type
+//     byte and ends with its value; its buffer size is python's own, which is
+//     larger than the value, so the test swaps in this client's.
+static void TestBooleanLocalZoneAndWrites() {
+    const std::vector<uint8_t> boolean_value_bytes {0x01, 0x00};
+    const std::vector<uint8_t> ltz_value_bytes {0x78, 0x7e, 0x03, 0x04, 0x06, 0x07, 0x08, 0x07, 0x5b, 0xca, 0x00};
+    const std::vector<uint8_t> python_nchar_bind {
+        0x60, 0x01, 0x00, 0x00, 0x02, 0x1f, 0x40, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x02, 0x00, 0x00,
+        0x07, 0x04, 0x00, 0x61, 0x00, 0x62
+    };
+    const std::vector<uint8_t> python_nvarchar_bind {
+        0x01, 0x01, 0x00, 0x00, 0x02, 0x3e, 0x80, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x02, 0x00, 0x00,
+        0x07, 0x08, 0x00, 0x5a, 0x00, 0x71, 0x00, 0xe9, 0x4e, 0x2d
+    };
+    const std::vector<uint8_t> python_boolean_bind {
+        0xfc, 0x01, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x01, 0x01
+    };
+    const std::vector<uint8_t> python_interval_ds_bind {
+        0xb7, 0x01, 0x00, 0x00, 0x01, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x0b, 0x80, 0x00,
+        0x00, 0x03, 0x40, 0x41, 0x42, 0x80, 0x00, 0x1b, 0x58
+    };
+
+    // Reading: the last byte says which, and the LTZ value is an ordinary
+    // TIMESTAMP with no offset, which the UTC session makes an instant.
+    CHECK(boolean_value_bytes[0] == 1 && boolean_value_bytes[1] == 0);
+    const auto ltz = DecodeOracleTimestamp(ltz_value_bytes);
+    CHECK(!ltz.has_offset && ltz.year == 2026 && ltz.month == 3 && ltz.day == 4 && ltz.hour == 5 &&
+          ltz.minute == 6 && ltz.second == 7 && ltz.nanosecond == 123456000);
+
+    // Writing: this client's bind must be the captured one, byte for byte,
+    // except where python sized its buffer for a larger value than it sent.
+    const auto encode_tail = [](OracleBind bind, size_t tail_size) {
+        TtcExecuteBindsRequest request;
+        request.sql = "INSERT INTO T VALUES (:1)";
+        request.binds = {std::move(bind)};
+        request.ttc_field_version = 17;
+        const auto encoded = EncodeTtcExecuteBindsRequest(request);
+        return std::vector<uint8_t>(encoded.end() - static_cast<std::ptrdiff_t>(tail_size), encoded.end());
+    };
+    const auto with_size = [](std::vector<uint8_t> captured, size_t python_size_bytes, uint32_t size) {
+        ByteWriter writer;
+        writer.WriteUB4(size);
+        const auto replacement = writer.Take();
+        captured.erase(captured.begin() + 4, captured.begin() + 4 + static_cast<std::ptrdiff_t>(python_size_bytes));
+        captured.insert(captured.begin() + 4, replacement.begin(), replacement.end());
+        return captured;
+    };
+    OracleBind nchar;
+    nchar.oracle_type = 96;
+    nchar.character_set_form = 2;
+    nchar.value = std::vector<uint8_t> {0x00, 0x61, 0x00, 0x62};
+    auto expected = with_size(python_nchar_bind, 3, 4);
+    CHECK(encode_tail(nchar, expected.size()) == expected);
+
+    OracleBind nvarchar;
+    nvarchar.oracle_type = 1;
+    nvarchar.character_set_form = 2;
+    nvarchar.value = EncodeUtf8ToUtf16Be("Zq\xc3\xa9\xe4\xb8\xad");
+    CHECK(nvarchar.value && *nvarchar.value == std::vector<uint8_t>(python_nvarchar_bind.end() - 8, python_nvarchar_bind.end()));
+    expected = with_size(python_nvarchar_bind, 3, 8);
+    CHECK(encode_tail(nvarchar, expected.size()) == expected);
+
+    OracleBind boolean;
+    boolean.oracle_type = 252;
+    boolean.value = std::vector<uint8_t> {1, 1};
+    expected = with_size(python_boolean_bind, 2, 2);
+    CHECK(encode_tail(boolean, expected.size()) == expected);
+
+    OracleBind interval;
+    interval.oracle_type = 183;
+    interval.value = EncodeOracleIntervalDaySecond(3, 4, 5, 6, 7000);
+    CHECK(*interval.value == std::vector<uint8_t>(python_interval_ds_bind.end() - 11, python_interval_ds_bind.end()));
+    expected = with_size(python_interval_ds_bind, 2, 11);
+    CHECK(encode_tail(interval, expected.size()) == expected);
+
+    // The default form of a character bind is untouched.
+    OracleBind plain;
+    plain.oracle_type = 1;
+    plain.value = std::vector<uint8_t> {'a'};
+    CHECK(encode_tail(plain, 19).at(13) == 1 && encode_tail(plain, 19).at(0) == 1);
+
+    // UTF-8 to UTF-16BE: BMP, a surrogate pair, and every malformed shape.
+    CHECK(EncodeUtf8ToUtf16Be("") == std::vector<uint8_t>());
+    CHECK(EncodeUtf8ToUtf16Be("\xf0\x9f\x98\x80") == (std::vector<uint8_t> {0xd8, 0x3d, 0xde, 0x00}));
+    CHECK(DecodeUtf16BeToUtf8(EncodeUtf8ToUtf16Be("h\xc3\xa9llo \xd0\x9f \xf0\x9f\x98\x80")).size() == 14);
+    for (const char *bad : {"\x80", "\xc0\x80", "\xc3", "\xe0\x80\x80", "\xed\xa0\x80", "\xf4\x90\x80\x80",
+                            "\xf8\x88\x80\x80\x80", "\xe4\xb8", "a\xff"}) {
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)EncodeUtf8ToUtf16Be(bad); });
+    }
+    std::mt19937 random(7);
+    for (int round = 0; round < 5000; round++) {
+        std::string text;
+        for (int count = random() % 6; count > 0; count--) {
+            uint32_t code_point = random() % 3 == 0 ? 0x10000 + random() % 0x100000 : random() % 0xD000;
+            if (code_point == 0) {
+                code_point = 1;
+            }
+            if (code_point < 0x80) {
+                text += static_cast<char>(code_point);
+            } else if (code_point < 0x800) {
+                text += static_cast<char>(0xC0 | (code_point >> 6));
+                text += static_cast<char>(0x80 | (code_point & 0x3F));
+            } else if (code_point < 0x10000) {
+                text += static_cast<char>(0xE0 | (code_point >> 12));
+                text += static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+                text += static_cast<char>(0x80 | (code_point & 0x3F));
+            } else {
+                text += static_cast<char>(0xF0 | (code_point >> 18));
+                text += static_cast<char>(0x80 | ((code_point >> 12) & 0x3F));
+                text += static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+                text += static_cast<char>(0x80 | (code_point & 0x3F));
+            }
+        }
+        const auto round_trip = DecodeUtf16BeToUtf8(EncodeUtf8ToUtf16Be(text));
+        CHECK(std::string(round_trip.begin(), round_trip.end()) == text);
+    }
+
+    // The data-types request advertises field version 17 and is otherwise the
+    // recorded template, byte for byte.
+    const auto request = BuildTtcDataTypesRequest(TtcNegotiationOptions());
+    CHECK(request.size() == ORACLE_19C_TTC_DATA_TYPES_TEMPLATE.size());
+    CHECK(request.at(TTC_DATA_TYPES_CAPABILITIES_OFFSET + TTC_CAPABILITY_FIELD_VERSION_INDEX) == 17);
+    size_t differing = 0;
+    for (size_t index = 0; index < request.size(); index++) {
+        differing += request[index] != ORACLE_19C_TTC_DATA_TYPES_TEMPLATE[index] ? 1 : 0;
+    }
+    CHECK(differing == 1);
+    std::cout << "boolean, local zone and write binds ok" << std::endl;
+}
+
 // What the types added in 0.6.0 look like on the wire. Every byte sequence
 // below was recorded from Oracle 19c, and the INTERVAL, NVARCHAR2 and ROWID
 // values read the same from Free 23ai; PROVENANCE.md lists them with hashes.
@@ -7096,6 +7238,7 @@ int main() {
     TestFetchResponseDecoderResumes();
     TestOracleIntegerMatchesDecimalText();
     TestNewTypeValues();
+    TestBooleanLocalZoneAndWrites();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();
     TestTtcImplicitResultSet();

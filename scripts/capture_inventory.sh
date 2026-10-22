@@ -55,6 +55,12 @@ captures = [
     ("interval_ym_value_bytes", "test/cpp/protocol_test.cpp", "interval_ym_value_bytes"),
     ("interval_ds_value_bytes", "test/cpp/protocol_test.cpp", "interval_ds_value_bytes"),
     ("nvarchar_value_bytes", "test/cpp/protocol_test.cpp", "nvarchar_value_bytes"),
+    ("boolean_value_bytes", "test/cpp/protocol_test.cpp", "boolean_value_bytes"),
+    ("ltz_value_bytes", "test/cpp/protocol_test.cpp", "ltz_value_bytes"),
+    ("python_nchar_bind", "test/cpp/protocol_test.cpp", "python_nchar_bind"),
+    ("python_nvarchar_bind", "test/cpp/protocol_test.cpp", "python_nvarchar_bind"),
+    ("python_boolean_bind", "test/cpp/protocol_test.cpp", "python_boolean_bind"),
+    ("python_interval_ds_bind", "test/cpp/protocol_test.cpp", "python_interval_ds_bind"),
 ]
 
 for name, path, identifier in captures:

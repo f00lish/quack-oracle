@@ -61,5 +61,9 @@ TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, si
 // is UTF-8, so a CLOB is converted here and reaches the rest of the client
 // looking like a VARCHAR2.
 std::vector<uint8_t> DecodeUtf16BeToUtf8(const std::vector<uint8_t> &utf16);
+// The reverse, for a value written to a national character column. The input
+// must be well-formed UTF-8 (no overlong forms, surrogates or code points past
+// U+10FFFF); anything else is MALFORMED rather than repaired.
+std::vector<uint8_t> EncodeUtf8ToUtf16Be(const std::string &utf8);
 
 } // namespace oracle_scanner

@@ -60,9 +60,14 @@ void RequireReadableColumn(const OracleColumn &column) {
         // Readable because the value carries its own offset; nothing has to be
         // assumed about a session zone.
         return;
-    case 231:
-        refuse("TIMESTAMP WITH LOCAL TIME ZONE is relative to a session time zone this client does not negotiate");
-        break;
+    case 231: // TIMESTAMP WITH LOCAL TIME ZONE
+        // Readable because the session time zone is fixed at UTC when the
+        // session is opened, which turns the wall-clock time on the wire into
+        // an instant.
+        return;
+    case 252: // BOOLEAN, which a 23ai server sends as itself to a client that
+              // advertises TTC field version 17
+        return;
     case 112: // CLOB
     case 113: // BLOB
         // The value in the row is a locator, not content; the fetch resolves it
@@ -103,6 +108,10 @@ LogicalType MappedType(const OracleColumn &column) {
     case 182: // INTERVAL YEAR TO MONTH
     case 183: // INTERVAL DAY TO SECOND
         return LogicalType::INTERVAL;
+    case 252: // BOOLEAN
+        return LogicalType::BOOLEAN;
+    case 231: // TIMESTAMP WITH LOCAL TIME ZONE, an instant: the session is UTC
+        return LogicalType::TIMESTAMP_TZ;
     case 112: // CLOB
         // A CLOB read comes back as the session's character set, which this
         // client negotiates as UTF-8 — the same bytes a VARCHAR2 arrives in.
@@ -213,8 +222,18 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
     case 180:
         return TimestampValueFor(column, oracle_scanner::DecodeOracleTimestamp(*wire));
     case 181:
-    case 231:
         return Value(FormatDateTime(oracle_scanner::DecodeOracleTimestamp(*wire)));
+    case 231: {
+        // The session time zone is UTC (see the auth parameters), so this wall
+        // time is the instant. DuckDB's TIMESTAMPTZ keeps microseconds.
+        const auto timestamp = TimestampValueFor(column, oracle_scanner::DecodeOracleTimestamp(*wire));
+        return Value::TIMESTAMPTZ(timestamp_tz_t(timestamp.GetValue<timestamp_t>().value));
+    }
+    case 252:
+        if (wire->empty()) {
+            throw InvalidInputException("Oracle BOOLEAN value is empty");
+        }
+        return Value::BOOLEAN(wire->back() == 1);
     case 23:
     case 24:
     case 113:
@@ -383,6 +402,13 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
         if (type.id() == LogicalTypeId::DOUBLE) {
             FlatVector::SetNull(vector, row, false);
             FlatVector::GetDataMutable<double>(vector)[row] = oracle_scanner::DecodeOracleBinaryDouble(*wire);
+            return;
+        }
+        break;
+    case 252:
+        if (type.id() == LogicalTypeId::BOOLEAN && !wire->empty()) {
+            FlatVector::SetNull(vector, row, false);
+            FlatVector::GetDataMutable<bool>(vector)[row] = wire->back() == 1;
             return;
         }
         break;

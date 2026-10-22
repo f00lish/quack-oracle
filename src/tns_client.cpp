@@ -774,9 +774,14 @@ O5LogonResponse TnsClientConnection::AuthenticateO5Logon(const std::string &user
                                     {"SESSION_CLIENT_DRIVER_NAME", "python-oracledb thn : 4.0.1", 0},
                                     // Oracle's authentication parser retains the NUL terminator as part of this value.
                                     {"SESSION_CLIENT_VERSION", "67112960", 0},
+                                    // The session time zone is UTC, always. A TIMESTAMP WITH LOCAL
+                                    // TIME ZONE arrives as a wall-clock time in the session zone with no
+                                    // offset, so a fixed zone is what makes it an instant here. The
+                                    // capture this was copied from said +04:00, the capturing client's
+                                    // own offset; nothing relied on that.
                                     {"AUTH_ALTER_SESSION",
-                                     std::string("ALTER SESSION SET TIME_ZONE='+04:00'\0",
-                                                 sizeof("ALTER SESSION SET TIME_ZONE='+04:00'\0") - 1),
+                                     std::string("ALTER SESSION SET TIME_ZONE='+00:00'\0",
+                                                 sizeof("ALTER SESSION SET TIME_ZONE='+00:00'\0") - 1),
                                      1},
                                     {"AUTH_CONNECT_STRING", auth_connect_string, 0}};
     request.client_session_key = SecureRandomBytes(32);

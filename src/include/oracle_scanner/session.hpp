@@ -64,6 +64,10 @@ struct OracleBind {
     // Required for scalar OUT / IN OUT values when the input value does not
     // establish a buffer size. REF CURSOR has a fixed wire allocation.
     uint32_t maximum_bytes = 0;
+    // Oracle's csfrm for a character bind: 0 means the default (the database
+    // character set for a character type), 2 the national one, in which case
+    // the value must be UTF-16BE.
+    uint8_t character_set_form = 0;
 };
 
 class OracleCursor {

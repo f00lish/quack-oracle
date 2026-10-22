@@ -190,4 +190,60 @@ std::vector<uint8_t> DecodeUtf16BeToUtf8(const std::vector<uint8_t> &utf16) {
     return result;
 }
 
+std::vector<uint8_t> EncodeUtf8ToUtf16Be(const std::string &utf8) {
+    std::vector<uint8_t> result;
+    result.reserve(utf8.size() * 2);
+    const auto put = [&result](uint32_t unit) {
+        result.push_back(static_cast<uint8_t>(unit >> 8U));
+        result.push_back(static_cast<uint8_t>(unit & 0xFFU));
+    };
+    const auto malformed = [] { throw ProtocolError(ProtocolErrorKind::MALFORMED, "text is not valid UTF-8"); };
+    size_t index = 0;
+    while (index < utf8.size()) {
+        const auto lead = static_cast<uint8_t>(utf8[index]);
+        uint32_t code_point = 0;
+        size_t extra = 0;
+        uint32_t minimum = 0;
+        if (lead < 0x80) {
+            code_point = lead;
+        } else if (lead >= 0xC2 && lead <= 0xDF) {
+            code_point = lead & 0x1FU;
+            extra = 1;
+            minimum = 0x80;
+        } else if (lead >= 0xE0 && lead <= 0xEF) {
+            code_point = lead & 0x0FU;
+            extra = 2;
+            minimum = 0x800;
+        } else if (lead >= 0xF0 && lead <= 0xF4) {
+            code_point = lead & 0x07U;
+            extra = 3;
+            minimum = 0x10000;
+        } else {
+            malformed();
+        }
+        if (extra != 0 && index + extra >= utf8.size()) {
+            malformed();
+        }
+        for (size_t step = 1; step <= extra; step++) {
+            const auto next = static_cast<uint8_t>(utf8[index + step]);
+            if ((next & 0xC0U) != 0x80U) {
+                malformed();
+            }
+            code_point = (code_point << 6U) | (next & 0x3FU);
+        }
+        if (code_point < minimum || code_point > 0x10FFFF || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
+            malformed();
+        }
+        if (code_point >= 0x10000) {
+            const auto offset = code_point - 0x10000U;
+            put(0xD800U + (offset >> 10U));
+            put(0xDC00U + (offset & 0x3FFU));
+        } else {
+            put(code_point);
+        }
+        index += extra + 1;
+    }
+    return result;
+}
+
 } // namespace oracle_scanner

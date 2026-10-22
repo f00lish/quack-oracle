@@ -111,6 +111,7 @@ void Validate(const TtcExecuteBindsRequest &request) {
             // row that disagrees with it would be decoded by Oracle as the type
             // the first row declared.
             if (iteration[index].oracle_type != request.binds[index].oracle_type ||
+                iteration[index].character_set_form != request.binds[index].character_set_form ||
                 iteration[index].direction != request.binds[index].direction) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED,
                                     "TTC array DML iteration disagrees with the declared bind metadata");
@@ -155,7 +156,8 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
         // The empty object-id slot is a distinct UB4 (encoded as one zero
         // byte). Omitting it shifts version/charset/form by one field; Oracle
         // then reports a nonsensical collation id for character binds.
-        writer.WriteUB4(0).WriteUB2(0).WriteUB2(character_type ? 873 : 0).WriteByte(character_type ? 1 : 0).WriteUB4(0);
+        const uint8_t character_form = bind.character_set_form != 0 ? bind.character_set_form : (character_type ? 1 : 0);
+        writer.WriteUB4(0).WriteUB2(0).WriteUB2(character_type ? 873 : 0).WriteByte(character_form).WriteUB4(0);
         // 12.2+ uses a separate OACCOLID after max-character-size even for
         // bind metadata. Its one-byte zero encoding keeps the following
         // ROW_DATA marker aligned with Oracle's bound OALL8 parser.

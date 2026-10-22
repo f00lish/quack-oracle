@@ -64,6 +64,14 @@ one that records what a server sent.
 | `interval_ym_value_bytes` | 15 | Oracle 19c and Free, three INTERVAL YEAR TO MONTH values: `2-3`, `-5-11`, `0-0` | `3b1f11e0c16f787be39958da84045a434a4d0a86e3325c38bc51dce8c6d9a0d5` |
 | `interval_ds_value_bytes` | 33 | Oracle 19c and Free, three INTERVAL DAY TO SECOND values: `3 04:05:06.789012345`, `-12 23:59:59.5`, `0 0:0:0` | `0fa30cc86aff9f31922dba84155fa5c923a59cf688758fc7a452db6b2a0e8a09` |
 | `nvarchar_value_bytes` | 30 | Oracle 19c and Free, one NVARCHAR2 value in UTF-16BE, ending in a surrogate pair | `4b91f33a7bdcccc78e7faeedae3566cbd49c6be8842dbe1920f098db696e3ee0` |
+| `boolean_value_bytes` | 2 | Free 23ai, a BOOLEAN column's TRUE then FALSE as sent for type 252 to a client advertising TTC field version 17: one byte each | `47dc540c94ceb704a23875c11273e16bb0b8a87aed84de911f2133568115f254` |
+| `ltz_value_bytes` | 11 | Free 23ai, one TIMESTAMP(6) WITH LOCAL TIME ZONE (2026-03-04 05:06:07.123456) read from a session whose time zone is +00:00 | `adc7213e52613cb8b6748b14bb0388ec7f4b7af8594e2364bdb881a6e8f95e50` |
+| `python_nchar_bind` | 23 | python-oracledb 4.0.1 Thin against Free 23ai: the bind metadata and value of an NCHAR `'ab'` (type 96, form 2, UTF-16BE) | `f4926f5de9166b2e27dfc29f9d2cdda8209588b772acacf046b3f31c62cd7c81` |
+| `python_nvarchar_bind` | 27 | the same client, an NVARCHAR2 value (type 1, form 2, UTF-16BE) | `aa6cfe87eddc1be2deb3d8af742f23f418b5fe020a582fd60ab388436934418e` |
+| `python_boolean_bind` | 18 | the same client, a BOOLEAN TRUE (type 252, value `01 01`) | `895c6cdc5cbbad2864bcf18d02887a71446805c5a9c1bcaabea6dff87a0f989d` |
+| `python_interval_ds_bind` | 27 | the same client, an INTERVAL DAY TO SECOND `3 4:5:6.000007` (type 183, 11 bytes) | `462ed8316388b543137054e1836096601a1dab5560865fd22f6a247bed51e357` |
+
+The python-oracledb binds carry the buffer size python chose, which is larger than the value; the test that uses them swaps in this client's size and requires every other byte to match. The TTIDTY negotiation template above is unchanged: this client advertises TTC field version 17 by overwriting that one byte of the request at run time, so its recorded hash still describes the capture.
 
 Live test databases are external and are named here only by the environment
 variables that supply them; see [README.md](README.md). Nothing about an

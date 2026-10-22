@@ -16,8 +16,18 @@ constexpr uint16_t ORACLE_CHARSET_AL32UTF8 = 873;
 // this client advertises in its TTIDTY request. The bundled 19c template
 // carries 12 at that index, and every decoder gate has to agree with what was
 // actually offered rather than with a literal written at the call site.
+//
+// 17 is python-oracledb's TNS_CCAP_FIELD_VERSION_23_1, the lowest value at
+// which a 23ai server sends a SQL BOOLEAN as its own type (252) rather than as
+// NUMBER. Measured on Free 23ai with this client: 13 to 16 still get NUMBER, 17
+// gets 252, and 18 and above change the shape of the execute request, which
+// this client does not build (ORA-03120). A 19c server reports 12 and so still
+// negotiates down to 12.
 constexpr size_t TTC_CAPABILITY_FIELD_VERSION_INDEX = 7;
-constexpr uint8_t ORACLE_CLIENT_TTC_FIELD_VERSION = 12;
+// Where the capability vector starts in the TTIDTY request: message type, two
+// character sets, the encoding byte and the vector's length byte.
+constexpr size_t TTC_DATA_TYPES_CAPABILITIES_OFFSET = 7;
+constexpr uint8_t ORACLE_CLIENT_TTC_FIELD_VERSION = 17;
 
 struct TtcProtocolInfo {
     uint8_t server_version = 0;

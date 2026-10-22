@@ -701,6 +701,8 @@ void TestWriteOracleValueMatchesValueFor() {
     auto national_fixed = Column("n_fixed", 96);
     national_fixed.character_set_form = 2;
     auto interval_column = Column("elapsed", 183, 2, 9);
+    auto local_zone_column = Column("seen_at", 231);
+    local_zone_column.scale = 6;
     const std::vector<std::pair<OracleColumn, std::vector<Wire>>> cases = {
         {Column("id", 2, 10, 0),
          {std::nullopt, Number("0"), Number("-1"), Number("9999999999"), Number("100000000000000000000")}},
@@ -740,6 +742,9 @@ void TestWriteOracleValueMatchesValueFor() {
         {timestamp_column, {oracle_scanner::EncodeOracleTimestamp(moment, false)}},
         {Column("ts_us", 180), {oracle_scanner::EncodeOracleTimestamp(micro_moment, false),
                                 oracle_scanner::EncodeOracleTimestamp(moment, false)}},
+        {Column("flag", 252), {std::vector<uint8_t> {1}, std::vector<uint8_t> {0}, std::vector<uint8_t> {}}},
+        {local_zone_column, {oracle_scanner::EncodeOracleTimestamp(micro_moment, false),
+                             oracle_scanner::EncodeOracleTimestamp(moment, false)}},
     };
     const auto store = [](const auto &write) -> std::string {
         try {
@@ -775,9 +780,9 @@ void TestWriteOracleValueMatchesValueFor() {
     // an out-of-range BIGINT, two DECIMAL overflows, two strings that are not
     // UTF-8 and a timestamp finer than its column, then an odd and a lone
     // surrogate UTF-16 value, a year-month span past int32, a day-second span
-    // finer than a microsecond, a LONG that is not UTF-8 and a logical UROWID,
-    // each at two rows.
-    CHECK(refusals == 2 * 12);
+    // finer than a microsecond, a LONG that is not UTF-8, a logical UROWID, an
+    // empty BOOLEAN and a local-zone time finer than a microsecond, each at two rows.
+    CHECK(refusals == 2 * 14);
 }
 
 // The types added in 0.6.0 reach SQL as the DuckDB types they map to, with the
@@ -1021,8 +1026,8 @@ void TestUnsupportedColumnTypesAreRefusedAtBind() {
     // types beside it.
     CHECK(bind_error(114, 0).find("Oracle type 114") != std::string::npos);
 
-    const auto local_zone = bind_error(231, 0);
-    CHECK(local_zone.find("session time zone") != std::string::npos);
+    // TIMESTAMP WITH LOCAL TIME ZONE and BOOLEAN are readable (see
+    // TestBooleanAndLocalZoneReadThroughSql); the refusals above are what is left.
 
     // Anything with no mapping at all still fails by name rather than falling
     // through to the textual default.
@@ -1039,6 +1044,39 @@ void TestUnsupportedColumnTypesAreRefusedAtBind() {
     auto accepted = database.Query("SELECT * FROM oracle_query('ora', 'SELECT v FROM app.items')");
     CHECK(!accepted->HasError());
     CHECK(accepted->GetValue(0, 0).ToString().find("+02:00") != std::string::npos);
+}
+
+// BOOLEAN (type 252, one byte) and TIMESTAMP WITH LOCAL TIME ZONE (type 231, a
+// wall-clock time in the session's zone, which this client fixes at UTC) read
+// as DuckDB's own types.
+void TestBooleanAndLocalZoneReadThroughSql() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("B", 252), Column("L", 231)};
+    script->columns[1].scale = 6;
+    script->rows = {
+        {std::vector<uint8_t> {1}, oracle_scanner::EncodeOracleTimestamp({2026, 3, 4, 5, 6, 7, 123456000, 0, false}, false)},
+        {std::vector<uint8_t> {0}, oracle_scanner::EncodeOracleTimestamp({1969, 12, 31, 23, 59, 59, 0, 0, false}, false)},
+        {std::nullopt, std::nullopt}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    auto result = database.Query("SELECT b, l, typeof(b), typeof(l) FROM oracle_query('ora', 'SELECT b, l FROM app.items')");
+    CHECK(!result->HasError());
+    CHECK(result->RowCount() == 3);
+    CHECK(result->GetValue(0, 0) == duckdb::Value::BOOLEAN(true) && result->GetValue(0, 1) == duckdb::Value::BOOLEAN(false));
+    CHECK(result->GetValue(0, 2).IsNull());
+    CHECK(result->GetValue(2, 0).ToString() == "BOOLEAN" && result->GetValue(3, 0).ToString() == "TIMESTAMP WITH TIME ZONE");
+    CHECK(result->GetValue(1, 0) == duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(1772600767123456LL)));
+    CHECK(result->GetValue(1, 1) == duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(-1000000LL)));
+
+    // A TIMESTAMP(9) with a finer fraction than a microsecond is reported.
+    auto fine = std::make_shared<FakeScript>();
+    fine->columns = {Column("L", 231)};
+    fine->rows = {{oracle_scanner::EncodeOracleTimestamp({2026, 3, 4, 5, 6, 7, 123456789, 0, false}, false)}};
+    auto fine_factory = InstallFake(fine);
+    TestDatabase fine_database;
+    auto refused = fine_database.Query("SELECT * FROM oracle_query('ora', 'SELECT l FROM app.items')");
+    CHECK(refused->HasError() && refused->GetError().find("sub-microsecond") != std::string::npos);
+    std::cout << "BOOLEAN and local-zone columns read as DuckDB types" << std::endl;
 }
 
 // A LOB column reaches this layer as plain bytes: the session resolves the
@@ -1447,7 +1485,67 @@ void TestWriteBindsFollowTheOracleColumnType() {
     // A column this client cannot read is one it cannot reason about writing.
     auto national = Column("N_LABEL", 1);
     national.character_set_form = 2;
-    unsupported(national, duckdb::Value("beta"), "national character set");
+    // A national column is written as UTF-16BE behind the national form.
+    national.character_set_form = 2;
+    const auto national_bind = bind_for(national, duckdb::Value("h\xC3\xA9\xF0\x9F\x98\x80"));
+    CHECK(national_bind.oracle_type == 1 && national_bind.character_set_form == 2);
+    CHECK(national_bind.value == std::vector<uint8_t>({0x00, 0x68, 0x00, 0xE9, 0xD8, 0x3D, 0xDE, 0x00}));
+    CHECK(!bind_for(national, duckdb::Value("")).value.has_value());
+    auto national_fixed_column = Column("N_FIXED", 96);
+    national_fixed_column.character_set_form = 2;
+    CHECK(bind_for(national_fixed_column, duckdb::Value("ab")).character_set_form == 2);
+    CHECK(bind_for(text_column, duckdb::Value("ab")).character_set_form == 0);
+    unsupported(national, duckdb::Value::BIGINT(1), "character column");
+    // A NULL row describes its column exactly as a row with a value does, which
+    // a batch needs because its bind metadata is declared once.
+    CHECK(bind_for(national, duckdb::Value(duckdb::LogicalType::VARCHAR)).character_set_form == 2);
+    CHECK(bind_for(Column("SEEN_AT", 231), duckdb::Value(duckdb::LogicalType::TIMESTAMP_TZ)).oracle_type == 180);
+
+    // BOOLEAN is the two bytes python-oracledb sends.
+    const auto boolean_column = Column("FLAG", 252);
+    CHECK(bind_for(boolean_column, duckdb::Value::BOOLEAN(true)).value == std::vector<uint8_t>({1, 1}));
+    CHECK(bind_for(boolean_column, duckdb::Value::BOOLEAN(false)).value == std::vector<uint8_t>({1, 0}));
+    CHECK(bind_for(boolean_column, duckdb::Value::BOOLEAN(true)).oracle_type == 252);
+    CHECK(!bind_for(boolean_column, duckdb::Value(duckdb::LogicalType::BOOLEAN)).value.has_value());
+    unsupported(boolean_column, duckdb::Value::BIGINT(1), "takes BOOLEAN");
+
+    // A local-zone column takes a TIMESTAMPTZ, which goes to Oracle as the
+    // TIMESTAMP of its UTC wall time because the session zone is UTC.
+    auto local_zone = Column("SEEN_AT", 231);
+    local_zone.scale = 6;
+    oracle_scanner::OracleDateTime utc_moment;
+    utc_moment.year = 2026;
+    utc_moment.month = 3;
+    utc_moment.day = 4;
+    utc_moment.hour = 5;
+    utc_moment.minute = 6;
+    utc_moment.second = 7;
+    utc_moment.nanosecond = 123456000;
+    const auto local_zone_bind = bind_for(
+        local_zone, duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(1772600767123456LL)));
+    CHECK(local_zone_bind.oracle_type == 180);
+    CHECK(local_zone_bind.value == oracle_scanner::EncodeOracleTimestamp(utc_moment, false));
+    unsupported(local_zone, duckdb::Value("2026-03-04 05:06:07"), "takes TIMESTAMPTZ");
+
+    // Intervals: whole months for YEAR TO MONTH, days and time for DAY TO SECOND.
+    const auto year_month = Column("SPAN", 182);
+    CHECK(bind_for(year_month, duckdb::Value::INTERVAL(27, 0, 0)).value == oracle_scanner::EncodeOracleIntervalYearMonth(2, 3));
+    CHECK(bind_for(year_month, duckdb::Value::INTERVAL(-71, 0, 0)).value ==
+          oracle_scanner::EncodeOracleIntervalYearMonth(-5, -11));
+    unconvertible(year_month, duckdb::Value::INTERVAL(1, 1, 0), "whole months");
+    unsupported(year_month, duckdb::Value("1-2"), "takes INTERVAL");
+    const auto day_second = Column("ELAPSED", 183);
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, 3, 4 * 3600000000LL + 5 * 60000000LL + 6000007LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(3, 4, 5, 6, 7000));
+    // Whole days in the time part move to the day count; a negative span keeps one sign.
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, 1, 25 * 3600000000LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(2, 1, 0, 0, 0));
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, -2, -3600000000LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(-2, -1, 0, 0, 0));
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, 0, -500000LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(0, 0, 0, 0, -500000000));
+    unconvertible(day_second, duckdb::Value::INTERVAL(0, 1, -1000000LL), "opposite signs");
+    unconvertible(day_second, duckdb::Value::INTERVAL(1, 0, 0), "cannot hold months");
     unsupported(Column("WHEN_TZ", 181), duckdb::Value("2024-03-05 06:07:08+02:00"), "TIMESTAMP WITH TIME ZONE");
 
     std::cout << "write binds follow the Oracle column type" << std::endl;
@@ -1787,6 +1885,78 @@ void TestAttachedCatalogAgainstAFakeSession() {
 // adapter builds, the binds it sends, and the session it sends them on. Until
 // the fake could answer a projection of a scripted table, none of this could be
 // reached without a live Oracle.
+// The dictionary names a column's type in words, and the attached catalog's
+// write and filter paths work from that, not from the describe. Types it did
+// not name used to arrive as "Oracle type 0 has no mapping". These now map, so
+// a national column is bound as one, an interval and a BOOLEAN are written, and
+// what still cannot be written is named for what it is.
+void TestAttachedCatalogNamesTheNewTypes() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("T")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const auto row = [](const char *name, const char *type, const char *scale) {
+        return std::vector<WireValue>{Text("T"), Text(name), Text(type), Number("22"), WireValue(),
+                                       scale ? Number(scale) : WireValue(), Text("Y")};
+    };
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {row("NV", "NVARCHAR2", nullptr), row("NC", "NCHAR", nullptr), row("YM", "INTERVAL YEAR(2) TO MONTH", "0"),
+           row("DS", "INTERVAL DAY(2) TO SECOND(6)", "6"), row("FLAG", "BOOLEAN", nullptr),
+           row("SEEN", "TIMESTAMP(6) WITH LOCAL TIME ZONE", "6"), row("ADDR", "ROWID", nullptr),
+           row("OLD", "LONG", nullptr)}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    auto national = Column("NV", 1);
+    national.character_set_form = 2;
+    auto national_fixed = Column("NC", 96);
+    national_fixed.character_set_form = 2;
+    script->tables["T"] = {{national, national_fixed, Column("YM", 182), Column("DS", 183), Column("FLAG", 252),
+                            Column("SEEN", 231), Column("ADDR", 11), Column("OLD", 8)},
+                           {}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+
+    auto described = database.Query("SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'T' "
+                                    "ORDER BY column_index");
+    CHECK(!described->HasError());
+    const std::vector<std::string> expected_types = {"VARCHAR", "VARCHAR", "INTERVAL", "INTERVAL",
+                                                     "BOOLEAN", "TIMESTAMP WITH TIME ZONE", "VARCHAR", "VARCHAR"};
+    CHECK(described->RowCount() == expected_types.size());
+    for (duckdb::idx_t index = 0; index < expected_types.size(); index++) {
+        CHECK(described->GetValue(1, index).ToString() == expected_types[index]);
+    }
+
+    database.Run("INSERT INTO ora.main.T (NV, NC, YM, DS, FLAG, SEEN) VALUES ('h\xC3\xA9', 'ab', INTERVAL 14 MONTHS, "
+                 "INTERVAL '2 days 03:04:05', true, TIMESTAMPTZ '2026-03-04 05:06:07+00');");
+    CHECK(script->batch_rows.size() == 1 && script->batch_rows[0].size() == 6);
+    const auto &binds = script->batch_rows[0];
+    CHECK(binds[0].oracle_type == 1 && binds[0].character_set_form == 2);
+    CHECK(binds[0].value == std::vector<uint8_t>({0x00, 0x68, 0x00, 0xE9}));
+    CHECK(binds[1].oracle_type == 96 && binds[1].character_set_form == 2);
+    CHECK(binds[2].oracle_type == 182 && binds[2].value == oracle_scanner::EncodeOracleIntervalYearMonth(1, 2));
+    CHECK(binds[3].oracle_type == 183 && binds[3].value == oracle_scanner::EncodeOracleIntervalDaySecond(2, 3, 4, 5, 0));
+    CHECK(binds[4].oracle_type == 252 && binds[4].value == std::vector<uint8_t>({1, 1}));
+    CHECK(binds[5].oracle_type == 180);
+
+    // What cannot be written is refused by name, not as "type 0".
+    auto refused = database.Query("INSERT INTO ora.main.T (OLD) VALUES ('x');");
+    CHECK(refused->HasError() && refused->GetError().find("Oracle type 8 cannot be written") != std::string::npos);
+    refused = database.Query("INSERT INTO ora.main.T (ADDR) VALUES ('AAAAAAAAAAAAAAAAAA');");
+    CHECK(refused->HasError() && refused->GetError().find("Oracle type 11 cannot be written") != std::string::npos);
+    std::cout << "the attached catalog names national, interval, boolean and local-zone columns" << std::endl;
+}
+
 void TestAttachedWritesAgainstAFakeSession() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -3297,6 +3467,7 @@ int main() {
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
     TestNewTypesReadThroughSql();
+    TestBooleanAndLocalZoneReadThroughSql();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();
     TestUnsupportedColumnTypesAreRefusedAtBind();
@@ -3315,6 +3486,7 @@ int main() {
     TestReadSessionsArePooledPerConnection();
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedWritesAgainstAFakeSession();
+    TestAttachedCatalogNamesTheNewTypes();
     TestParallelScanShardsOneSnapshot();
     TestWriteBindsFollowTheOracleColumnType();
     TestCallableSignatureResolution();

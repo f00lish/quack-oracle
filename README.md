@@ -827,13 +827,15 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `BINARY_FLOAT`, `BINARY_DOUBLE` | `FLOAT`, `DOUBLE` | |
 | `CLOB`, `NCLOB` | `VARCHAR` | see the warning below |
 | `BLOB` | `BLOB` | see the warning below |
-| `NCHAR`, `NVARCHAR2` | `VARCHAR` | converted from UTF-16; read only |
+| `NCHAR`, `NVARCHAR2` | `VARCHAR` | converted from UTF-16, and written back as UTF-16 |
 | `INTERVAL YEAR TO MONTH` | `INTERVAL` | whole months |
 | `INTERVAL DAY TO SECOND` | `INTERVAL` | days and microseconds; a finer fraction is refused |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | an instant; sessions opened here use UTC |
+| `BOOLEAN` (23ai) | `BOOLEAN` | |
 | `ROWID`, `UROWID` | `VARCHAR` | the 18 characters `ROWIDTOCHAR` gives; a logical UROWID is refused |
 | `LONG`, `LONG RAW` | `VARCHAR`, `BLOB` | up to 1 MiB a value |
 
-Anything else — `TIMESTAMP WITH LOCAL TIME ZONE`, `BFILE`, `XMLTYPE`, `JSON`,
+Anything else — `BFILE`, `XMLTYPE`, `JSON`,
 `VECTOR`, object and collection types — is **refused when the query is
 bound**, with a message naming the column and the reason. It is never decoded
 into something that looks right and is not.

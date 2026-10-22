@@ -1,5 +1,7 @@
 // Opt-in live checks of the column types added in 0.6.0: NCHAR and NVARCHAR2,
-// INTERVAL YEAR TO MONTH and DAY TO SECOND, ROWID and UROWID, LONG and LONG RAW.
+// INTERVAL YEAR TO MONTH and DAY TO SECOND, ROWID and UROWID, LONG and LONG RAW,
+// TIMESTAMP WITH LOCAL TIME ZONE, BOOLEAN (23ai only; skipped where the server
+// has none), and writing the national and interval columns and BOOLEAN.
 //
 // ORA19C_HOST, ORA19C_PORT, ORA19C_SERVICE, ORA19C_USER and ORA19C_PASSWORD
 // name an administrative account. The test creates a throwaway user with a
@@ -138,6 +140,19 @@ int main() {
         // Every table is created before the catalog is attached: it reads the
         // column dictionary once, and a table created after that is not in it.
         table("T_FINE (D INTERVAL DAY(2) TO SECOND(9))", "create fine");
+        table("T_LTZ (ID NUMBER(5) PRIMARY KEY, L TIMESTAMP(6) WITH LOCAL TIME ZONE, L9 TIMESTAMP(9) WITH LOCAL TIME ZONE)",
+              "create ltz");
+        table("T_WRITE (ID NUMBER(5) PRIMARY KEY, NV NVARCHAR2(40), NC NCHAR(8), YM INTERVAL YEAR(4) TO MONTH, "
+              "DS INTERVAL DAY(4) TO SECOND(6), L TIMESTAMP(6) WITH LOCAL TIME ZONE)",
+              "create write");
+        table("T_CHAR (ID NUMBER(3), C CHAR(4))", "create char");
+        // BOOLEAN exists from 23ai. A server without it refuses the type, and the
+        // stage is skipped rather than failed.
+        bool has_boolean = true;
+        {
+            auto created_boolean = admin.Query(Admin("CREATE TABLE " + user + ".T_BOOL (ID NUMBER(5) PRIMARY KEY, B BOOLEAN)"));
+            has_boolean = !created_boolean->HasError();
+        }
         Run(admin, "CREATE SECRET rt (" + Secret(user, password) + ");", "runtime secret");
         Run(admin, "ATTACH 'rt' AS raw (TYPE oracle_scanner);", "attach");
         const auto dml = [&](const std::string &sql, const std::string &stage) {
@@ -289,20 +304,144 @@ int main() {
               "CLOB and ROWID in one row");
         std::cout << "PASS CLOB and ROWID in one row\n";
 
-        // What stays refused: writing into a table with a national column, and
-        // filtering on one. A write takes its columns from the dictionary alone,
-        // which does not name NVARCHAR2, so the refusal names the column.
-        auto write = admin.Query("INSERT INTO raw.T_NATIONAL VALUES (9, 'x', 'y');");
-        Check(write->HasError() && write->GetError().find("\"NV\"") != std::string::npos,
-              "writing a national column is refused");
+        // TIMESTAMP WITH LOCAL TIME ZONE is an instant: the session is UTC, so
+        // the wall time on the wire is UTC. Compared with SYS_EXTRACT_UTC, which
+        // is Oracle's own statement of the same instant.
+        dml("INSERT INTO T_LTZ VALUES (1, TO_TIMESTAMP_TZ('2026-03-04 05:06:07.123456 +03:00', 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM'), NULL)", "ltz 1");
+        dml("INSERT INTO T_LTZ VALUES (2, TO_TIMESTAMP_TZ('1969-12-31 23:59:59 -05:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), NULL)", "ltz 2");
+        dml("INSERT INTO T_LTZ VALUES (3, NULL, NULL)", "ltz 3");
+        dml("INSERT INTO T_LTZ VALUES (4, TIMESTAMP '2026-06-15 12:00:00.5 +00:00', TIMESTAMP '2026-06-15 12:00:00.000000100 +00:00')", "ltz 4");
+        Check(Scalar(admin, "SELECT * FROM oracle_query('rt', 'SELECT SESSIONTIMEZONE FROM DUAL');", "session zone") == "+00:00",
+              "the session time zone is UTC");
+        for (const auto &source :
+             {std::string("oracle_query('rt', 'SELECT ID, L, TO_CHAR(SYS_EXTRACT_UTC(L), ''YYYY-MM-DD HH24:MI:SS.FF6'') AS U FROM T_LTZ WHERE ID <> 4 ORDER BY ID')")}) {
+            auto result = Run(admin, "SELECT id, l, typeof(l), u FROM " + source + " ORDER BY id;", "ltz read");
+            Check(result->RowCount() == 3, "ltz rows");
+            Check(result->GetValue(2, 0).ToString() == "TIMESTAMP WITH TIME ZONE", "ltz is TIMESTAMPTZ");
+            Check(result->GetValue(1, 0).ToString().substr(0, 26) == "2026-03-04 02:06:07.123456" &&
+                      result->GetValue(3, 0).ToString() == "2026-03-04 02:06:07.123456",
+                  "ltz instant equals Oracle's UTC");
+            Check(result->GetValue(1, 1).ToString().substr(0, 19) == "1970-01-01 04:59:59" &&
+                      result->GetValue(3, 1).ToString() == "1970-01-01 04:59:59.000000",
+                  "ltz before 1970 and across a day boundary");
+            Check(result->GetValue(1, 2).IsNull(), "ltz NULL");
+        }
+        {
+            auto attached = Run(admin, "SELECT count(*) FROM raw.T_LTZ WHERE l IS NOT NULL AND id <> 4;", "ltz attached");
+            Check(attached->GetValue(0, 0).ToString() == "2", "attached ltz");
+        }
+        // TIMESTAMP(9) with a fraction a microsecond cannot hold is reported.
+        auto too_fine = admin.Query("SELECT * FROM oracle_query('rt', 'SELECT L9 FROM T_LTZ WHERE ID = 4');");
+        Check(too_fine->HasError() && too_fine->GetError().find("sub-microsecond") != std::string::npos,
+              "ltz finer than a microsecond is refused");
+        std::cout << "PASS TIMESTAMP WITH LOCAL TIME ZONE reads as an instant\n";
+
+        // Writing national text, intervals and local-zone times through the catalog.
+        Run(admin,
+            "INSERT INTO raw.T_WRITE VALUES (1, 'h\xc3\xa9llo \xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 " + emoji +
+                "', '\xe6\x97\xa5\xe6\x9c\xac', INTERVAL 27 MONTH, INTERVAL '3 days 04:05:06.789012', "
+                "TIMESTAMPTZ '2026-03-04 05:06:07.123456+00'), "
+                "(2, 'plain', 'ab', INTERVAL (-71) MONTH, INTERVAL '-12 days -23:59:59.5', TIMESTAMPTZ '2026-03-04 08:06:07+03'), "
+                "(3, NULL, NULL, NULL, NULL, NULL), "
+                "(4, 'x', 'y', INTERVAL 0 MONTH, INTERVAL '25 hours', TIMESTAMPTZ '1969-12-31 23:59:59+00');",
+            "write insert");
+        {
+            auto result = Run(admin,
+                              "SELECT id, nv, nc, ym, ds, l, ymt, dst, lu FROM oracle_query('rt', 'SELECT ID, NV, NC, YM, DS, L, "
+                              "TO_CHAR(YM) AS YMT, TO_CHAR(DS) AS DST, TO_CHAR(SYS_EXTRACT_UTC(L), ''YYYY-MM-DD HH24:MI:SS.FF6'') AS LU "
+                              "FROM T_WRITE ORDER BY ID') ORDER BY id;",
+                              "write read back");
+            Check(result->RowCount() == 4, "write rows");
+            Check(result->GetValue(1, 0).ToString() == "h\xc3\xa9llo \xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 " + emoji &&
+                      result->GetValue(2, 0).ToString() == "\xe6\x97\xa5\xe6\x9c\xac      ",
+                  "national text written and read back");
+            Check(result->GetValue(1, 1).ToString() == "plain" && result->GetValue(2, 1).ToString() == "ab      ", "national ascii written");
+            Check(result->GetValue(1, 2).IsNull() && result->GetValue(2, 2).IsNull(), "national NULL written");
+            Check(result->GetValue(6, 0).ToString() == "+0002-03" && result->GetValue(6, 1).ToString() == "-0005-11",
+                  "INTERVAL YEAR TO MONTH as Oracle prints it");
+            Check(result->GetValue(7, 0).ToString() == "+0003 04:05:06.789012" && result->GetValue(7, 1).ToString() == "-0012 23:59:59.500000",
+                  "INTERVAL DAY TO SECOND as Oracle prints it");
+            Check(result->GetValue(7, 3).ToString() == "+0001 01:00:00.000000", "25 hours is 1 day 1 hour");
+            Check(result->GetValue(8, 0).ToString() == "2026-03-04 05:06:07.123456" && result->GetValue(8, 1).ToString() == "2026-03-04 05:06:07.000000" &&
+                      result->GetValue(8, 3).ToString() == "1969-12-31 23:59:59.000000",
+                  "TIMESTAMPTZ written as the instant it names");
+            Check(result->GetValue(3, 2).IsNull() && result->GetValue(4, 2).IsNull() && result->GetValue(5, 2).IsNull(),
+                  "interval and local-zone NULLs written");
+        }
+        // RETURNING hands back what Oracle stored, for the new types as well. A
+        // CHAR is as wide as its column, not as wide as the bind buffer.
+        {
+            auto returned = Run(admin,
+                                "INSERT INTO raw.T_WRITE VALUES (5, 'ret', 'r', INTERVAL 14 MONTH, INTERVAL '1 day 02:03:04', "
+                                "TIMESTAMPTZ '2026-03-04 05:06:07+00') RETURNING nv, nc, length(nc), ym, ds, l;",
+                                "returning");
+            Check(returned->RowCount() == 1 && returned->GetValue(0, 0).ToString() == "ret" &&
+                      returned->GetValue(1, 0).ToString() == "r       " && returned->GetValue(2, 0).ToString() == "8" &&
+                      returned->GetValue(3, 0).ToString() == "1 year 2 months" &&
+                      returned->GetValue(4, 0).ToString() == "1 day 02:03:04" &&
+                      returned->GetValue(5, 0).ToString().substr(0, 19) == "2026-03-04 05:06:07",
+                  "RETURNING national, interval and local-zone columns");
+            auto plain = Run(admin, "INSERT INTO raw.T_CHAR VALUES (1, 'r') RETURNING length(c);", "returning char");
+            Check(plain->GetValue(0, 0).ToString() == "4", "a CHAR comes back as wide as its column");
+            Run(admin, "DELETE FROM raw.T_WRITE WHERE id = 5;", "returning cleanup");
+        }
+        // UPDATE goes through the same binds.
+        Run(admin, "UPDATE raw.T_WRITE SET nv = 'new' || chr(233), ds = INTERVAL '1 day', l = TIMESTAMPTZ '2030-01-01 00:00:00+00' WHERE id = 2;",
+            "write update");
+        {
+            auto result = Run(admin,
+                              "SELECT nv, dst, lu FROM oracle_query('rt', 'SELECT NV, TO_CHAR(DS) AS DST, "
+                              "TO_CHAR(SYS_EXTRACT_UTC(L), ''YYYY-MM-DD HH24:MI:SS'') AS LU FROM T_WRITE WHERE ID = 2');",
+                              "write update read");
+            Check(result->GetValue(0, 0).ToString() == "new\xc3\xa9" && result->GetValue(1, 0).ToString() == "+0001 00:00:00.000000" &&
+                      result->GetValue(2, 0).ToString() == "2030-01-01 00:00:00",
+                  "national, interval and local-zone UPDATE");
+        }
+        // What cannot be a value of the column is refused with the column named.
+        auto mixed = admin.Query("INSERT INTO raw.T_WRITE (id, ds) VALUES (9, INTERVAL '1 day -1 hour');");
+        Check(mixed->HasError() && mixed->GetError().find("opposite signs") != std::string::npos, "mixed-sign interval refused");
+        auto months = admin.Query("INSERT INTO raw.T_WRITE (id, ds) VALUES (9, INTERVAL 1 MONTH);");
+        Check(months->HasError() && months->GetError().find("cannot hold months") != std::string::npos, "months refused for DAY TO SECOND");
+        auto too_long = admin.Query("INSERT INTO raw.T_WRITE (id, nv) VALUES (9, repeat('x', 41));");
+        Check(too_long->HasError() && std::string(too_long->GetError()).find("ORA-12899") != std::string::npos,
+              "Oracle's own length check applies to a national column");
+        // A pushed-down filter on a national column is still not translated.
         Run(admin, "SET oracle_filter_pushdown = true;", "pushdown on");
-        auto filtered = admin.Query("SELECT * FROM raw.T_NATIONAL WHERE nv = 'plain';");
-        Check(filtered->HasError() && filtered->GetError().find("\"NV\"") != std::string::npos,
+        auto filtered = admin.Query("SELECT * FROM raw.T_WRITE WHERE nv = 'new\xc3\xa9';");
+        Check(filtered->HasError() && filtered->GetError().find("national character set column") != std::string::npos,
               "filtering on a national column is refused when pushed down");
         Run(admin, "SET oracle_filter_pushdown = false;", "pushdown off");
-        auto unfiltered = Run(admin, "SELECT count(*) FROM raw.T_NATIONAL WHERE nv = 'plain';", "local filter");
+        auto unfiltered = Run(admin, "SELECT count(*) FROM raw.T_WRITE WHERE nv = 'new\xc3\xa9';", "local filter");
         Check(unfiltered->GetValue(0, 0).ToString() == "1", "the same filter runs in DuckDB when it is not pushed down");
-        std::cout << "PASS national columns are read-only and never filtered remotely\n";
+        std::cout << "PASS national text, intervals and local-zone times can be written\n";
+
+        if (has_boolean) {
+            Run(admin, "SELECT * FROM oracle_execute_transaction('raw', 'INSERT INTO T_BOOL VALUES (1, TRUE)');", "bool 1");
+            dml("INSERT INTO T_BOOL VALUES (2, FALSE)", "bool 2");
+            dml("INSERT INTO T_BOOL VALUES (3, NULL)", "bool 3");
+            for (const auto &source : {std::string("oracle_query('rt', 'SELECT ID, B FROM T_BOOL')"), std::string("raw.T_BOOL")}) {
+                auto result = Run(admin, "SELECT id, b, typeof(b) FROM " + source + " ORDER BY id;", "bool read");
+                Check(result->RowCount() == 3 && result->GetValue(1, 0).ToString() == "true" &&
+                          result->GetValue(1, 1).ToString() == "false" && result->GetValue(1, 2).IsNull() &&
+                          result->GetValue(2, 0).ToString() == "BOOLEAN",
+                      "BOOLEAN read as true, false and NULL");
+            }
+            Run(admin, "INSERT INTO raw.T_BOOL VALUES (4, true), (5, false), (6, NULL);", "bool write");
+            Run(admin, "UPDATE raw.T_BOOL SET b = NOT b WHERE id IN (4, 5);", "bool update");
+            auto returned_bool = Run(admin, "INSERT INTO raw.T_BOOL VALUES (7, true) RETURNING b;", "bool returning");
+            Check(returned_bool->GetValue(0, 0).ToString() == "true", "BOOLEAN RETURNING");
+            auto written = Run(admin,
+                               "SELECT id, b, bt FROM oracle_query('rt', 'SELECT ID, B, CASE WHEN B THEN ''T'' WHEN NOT B THEN ''F'' END AS BT "
+                               "FROM T_BOOL WHERE ID BETWEEN 4 AND 6 ORDER BY ID') ORDER BY id;",
+                               "bool written read");
+            Check(written->RowCount() == 3 && written->GetValue(1, 0).ToString() == "false" && written->GetValue(2, 0).ToString() == "F" &&
+                      written->GetValue(1, 1).ToString() == "true" && written->GetValue(2, 1).ToString() == "T" &&
+                      written->GetValue(1, 2).IsNull(),
+                  "BOOLEAN written and updated, checked by Oracle itself");
+            std::cout << "PASS BOOLEAN reads and writes\n";
+        } else {
+            std::cout << "SKIP BOOLEAN: this server has no such type\n";
+        }
         Run(admin, "DETACH raw;", "detach");
     } catch (const std::exception &error) {
         std::cerr << "live test stopped" << (std::string(error.what()) == "live check failed" ? "" : ": error") << "\n";

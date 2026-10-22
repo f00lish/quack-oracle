@@ -279,9 +279,11 @@ homogeneous, so `[1, 'one', DATE '2026-01-02']` cannot even be constructed. A
 | `BINARY_FLOAT`, `BINARY_DOUBLE` | `FLOAT`, `DOUBLE` | |
 | `CLOB`, `NCLOB` | `VARCHAR` | See §4 |
 | `BLOB` | `BLOB` | See §4 |
-| `NCHAR`, `NVARCHAR2` | `VARCHAR` | UTF-16 in the row, read as UTF-8. Read only: refused when written, and a filter on one is not pushed down |
-| `INTERVAL YEAR TO MONTH` | `INTERVAL` | Whole months. A span past the 32-bit month count DuckDB keeps is refused |
-| `INTERVAL DAY TO SECOND` | `INTERVAL` | Days and microseconds. Oracle keeps nanoseconds; a fraction finer than a microsecond is refused, not rounded |
+| `NCHAR`, `NVARCHAR2` | `VARCHAR` | UTF-16 in the row, read as UTF-8; written back as UTF-16 behind the national form. A filter on one is not pushed down |
+| `INTERVAL YEAR TO MONTH` | `INTERVAL` | Whole months. A span past the 32-bit month count DuckDB keeps is refused. Written from an interval with months only |
+| `INTERVAL DAY TO SECOND` | `INTERVAL` | Days and microseconds. Oracle keeps nanoseconds; a fraction finer than a microsecond is refused, not rounded. Written from an interval without months, whose days and time have one sign |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | An instant. The session time zone is UTC (see below), so the value Oracle sends is the instant. Microseconds only: a finer fraction is refused. Written from a `TIMESTAMPTZ` |
+| `BOOLEAN` (23ai) | `BOOLEAN` | Needs a server that sends it as its own type, which 23ai does to a client advertising TTC field version 17, as this one does. Earlier servers have no such column |
 | `ROWID`, `UROWID` | `VARCHAR` | The 18 characters Oracle itself prints (`ROWIDTOCHAR`). A logical UROWID, which an index-organized table has, is refused |
 | `LONG` | `VARCHAR` | At most 1 MiB per value |
 | `LONG RAW` | `BLOB` | At most 1 MiB per value |
@@ -304,17 +306,26 @@ a mode that silently narrowed unconstrained `NUMBER` would make correctness
 depend on a flag, and a reconciliation that is exact in one session and two
 cents off in another is worse than one that always asks for a cast.
 
-A 23ai SQL `BOOLEAN` column is not a type this client declares support for, so
-Oracle sends it as an unconstrained `NUMBER`: `TRUE` and `FALSE` read as the text
-`1` and `0`. It is not mapped to `BOOLEAN` here, because that would need the
-client to announce the type at login, which is a wire change with no capture
-behind it yet.
+**The session time zone is UTC.** Every session this extension opens sets
+`TIME_ZONE='+00:00'` at login, as python-oracledb Thin sets its own client's
+offset. A `TIMESTAMP WITH LOCAL TIME ZONE` reaches the client as a wall-clock
+time with no offset, in the session's zone, so a fixed zone is what makes it an
+instant. It also means `SESSIONTIMEZONE`, `CURRENT_TIMESTAMP` and the display of
+a local-zone column in your own SQL are UTC in a session opened here. (Before
+0.6.0 the zone was a fixed `+04:00`, copied from the capture the login was
+modelled on, and nothing relied on it.)
+
+**BOOLEAN needs field version 17.** This client advertises TTC field version 17
+(python-oracledb's `TNS_CCAP_FIELD_VERSION_23_1`), the lowest at which a 23ai
+server sends a SQL `BOOLEAN` as itself rather than as `NUMBER`. It was measured:
+13 to 16 still get `NUMBER`, 17 gets the type, and 18 and above change the shape
+of the execute request. A 19c server reports 12 and negotiates down, so nothing
+changes there.
 
 **Refused while binding**, before any fetch, each naming its reason:
 
 | Type | Why |
 | --- | --- |
-| `TIMESTAMP WITH LOCAL TIME ZONE` | Relative to a session time zone this client never negotiates |
 | `BFILE` | No read path |
 | Object, `VARRAY`, nested table, `XMLTYPE`, `REF` | Outside this version |
 
@@ -427,9 +438,11 @@ Values are encoded from the **Oracle** column type, never from the DuckDB type
 alone, so nothing reaches Oracle as text for a session `NLS` setting to
 reinterpret.
 
-Writable column types: `VARCHAR2`, `CHAR`, `NUMBER`, `DATE`, `TIMESTAMP`,
-`TIMESTAMP WITH TIME ZONE`, `RAW`, `BINARY_FLOAT`, `BINARY_DOUBLE`. Everything
-else — LOBs included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
+Writable column types: `VARCHAR2`, `CHAR`, `NCHAR`, `NVARCHAR2`, `NUMBER`,
+`DATE`, `TIMESTAMP`, `TIMESTAMP WITH LOCAL TIME ZONE`, `INTERVAL YEAR TO MONTH`,
+`INTERVAL DAY TO SECOND`, `BOOLEAN`, `RAW`, `BINARY_FLOAT`, `BINARY_DOUBLE`.
+(`TIMESTAMP WITH TIME ZONE` is read but not written.) Everything else — LOBs,
+`LONG`, `ROWID` included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
 column is refused too: cast to `DECIMAL` or text first, because binary floats
 are not exact.
 
@@ -595,8 +608,8 @@ the attached catalog's transactions reuse sessions as §6 describes.
 ## 11. Not supported, in one list
 
 Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
-LOB writing · `BFILE` · writing `NCHAR`/`NVARCHAR2` · a logical `UROWID` ·
-`TIMESTAMP WITH LOCAL TIME ZONE` · object, collection, record and `XMLTYPE`
+LOB writing · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
+`LONG` and `ROWID` · object, collection, record and `XMLTYPE`
 types · `UPDATE`/`DELETE … RETURNING` · schemas other than the connected user's ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1
 verifier · SEPS · IAM · failover of an established session (TAF) ·

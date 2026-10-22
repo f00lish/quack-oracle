@@ -213,6 +213,7 @@ struct OracleAttachedState {
         // and any type outside the mapping, as text. Match the timestamp family
         // by shape and leave everything the mapping does not name at zero.
         uint16_t oracle_type = 0;
+        uint8_t character_set_form = 0;
         if (type == "NUMBER") {
             oracle_type = 2;
         } else if (type == "DATE") {
@@ -227,6 +228,28 @@ struct OracleAttachedState {
             oracle_type = 100;
         } else if (type == "BINARY_DOUBLE") {
             oracle_type = 101;
+        } else if (type == "NVARCHAR2") {
+            // The dictionary names the national types apart; on the wire they
+            // share the code of VARCHAR2 and CHAR and differ in the form.
+            oracle_type = 1;
+            character_set_form = 2;
+        } else if (type == "NCHAR") {
+            oracle_type = 96;
+            character_set_form = 2;
+        } else if (StringUtil::StartsWith(type, "INTERVAL YEAR")) {
+            oracle_type = 182;
+        } else if (StringUtil::StartsWith(type, "INTERVAL DAY")) {
+            oracle_type = 183;
+        } else if (type == "BOOLEAN") {
+            oracle_type = 252;
+        } else if (type == "ROWID") {
+            oracle_type = 11;
+        } else if (type == "UROWID") {
+            oracle_type = 208;
+        } else if (type == "LONG") {
+            oracle_type = 8;
+        } else if (type == "LONG RAW") {
+            oracle_type = 24;
         } else if (StringUtil::StartsWith(type, "TIMESTAMP")) {
             if (StringUtil::EndsWith(type, "WITH LOCAL TIME ZONE")) {
                 oracle_type = 231;
@@ -250,7 +273,8 @@ struct OracleAttachedState {
                 static_cast<uint32_t>(byte_width),
                 number(row[offset + 3], 0),
                 number(row[offset + 4], 0),
-                std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y"};
+                std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
+                character_set_form};
     }
 
     // Reads the columns of every object in the schema in one dictionary query

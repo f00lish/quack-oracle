@@ -578,7 +578,7 @@ the attached catalog's transactions reuse sessions as §6 describes.
 ## 11. Not supported, in one list
 
 Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
-LOB writing · `BFILE` · `NCHAR`/`NVARCHAR2` · `INTERVAL` ·
+LOB writing · `BFILE` · writing `NCHAR`/`NVARCHAR2` · a logical `UROWID` ·
 `TIMESTAMP WITH LOCAL TIME ZONE` · object, collection, record and `XMLTYPE`
 types · `UPDATE`/`DELETE … RETURNING` · schemas other than the connected user's ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1

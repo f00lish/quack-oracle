@@ -61,9 +61,9 @@ private:
     const std::vector<OracleColumn> &columns;
     uint8_t ttc_field_version;
     std::optional<TtcRowData> preceding_row;
-    // The columns a row without a row header carries, and which are LOBs.
+    // The columns a row without a row header carries, and how each frames its value.
     std::vector<size_t> row_columns;
-    std::vector<bool> row_is_lob;
+    std::vector<TtcColumnFraming> row_framing;
     TtcFetchResponse result;
     // What is kept between calls: the rows decoded before resume_offset, and
     // whether any of them needed a row header or a continuation. Rows after it

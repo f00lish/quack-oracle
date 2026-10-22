@@ -397,6 +397,11 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
         if (type != LogicalTypeId::VARCHAR) {
             RefuseBind(column, value, "a character column takes VARCHAR");
         }
+        if (column.character_set_form == 2) {
+            // Readable, but the value would be sent in the database character
+            // set into a column that stores the national one.
+            RefuseBind(column, value, "a national character set column cannot be written in this version");
+        }
         const auto text = value.GetValue<std::string>();
         if (text.empty()) {
             // Oracle stores an empty string as NULL, and this client reads it

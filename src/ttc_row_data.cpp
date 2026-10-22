@@ -9,14 +9,80 @@ namespace oracle_scanner {
 // misread rather than a locator, and it would otherwise become an allocation.
 constexpr size_t MAX_LOB_LOCATOR_BYTES = 4096;
 
-TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, const std::vector<bool> &is_lob,
-                                        size_t maximum_value_bytes) {
-    return DecodeTtcRowDataPrefix(message.data(), message.size(), is_lob, maximum_value_bytes);
+// The longest UROWID Oracle allows is 4000 bytes; anything past this is a
+// misread, not a rowid.
+constexpr size_t MAX_UROWID_BYTES = 4096;
+
+namespace {
+
+// A ROWID column: a length byte that is 0 or 0xFF for NULL, then the data
+// object, the file, one skipped byte, the block and the row as universal
+// integers. They are returned as twelve big-endian bytes so that the codec
+// sees one fixed shape, whatever width each integer was sent in.
+std::optional<std::vector<uint8_t>> ReadRowid(ByteReader &reader) {
+    const auto length = reader.ReadByte();
+    if (length == 0 || length == TNS_NULL_LENGTH_INDICATOR) {
+        return std::nullopt;
+    }
+    const auto object = reader.ReadUB4();
+    const auto file = reader.ReadUB2();
+    reader.ReadByte();
+    const auto block = reader.ReadUB4();
+    const auto row = reader.ReadUB2();
+    std::vector<uint8_t> result;
+    result.reserve(12);
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        result.push_back(static_cast<uint8_t>(object >> shift));
+    }
+    result.push_back(static_cast<uint8_t>(file >> 8U));
+    result.push_back(static_cast<uint8_t>(file));
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        result.push_back(static_cast<uint8_t>(block >> shift));
+    }
+    result.push_back(static_cast<uint8_t>(row >> 8U));
+    result.push_back(static_cast<uint8_t>(row));
+    return result;
 }
 
-TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const std::vector<bool> &is_lob,
+// A UROWID column: its size as a universal integer, zero for NULL, and then the
+// bytes in the ordinary length-prefixed form, so the size is stated twice.
+std::optional<std::vector<uint8_t>> ReadUrowid(ByteReader &reader) {
+    const auto size = reader.ReadUB4();
+    if (size == 0) {
+        return std::nullopt;
+    }
+    if (size > MAX_UROWID_BYTES) {
+        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC UROWID length is implausible");
+    }
+    auto value = reader.ReadLengthPrefixed(MAX_UROWID_BYTES);
+    if (!value || value->size() != size) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC UROWID length disagrees with its prefix");
+    }
+    return value;
+}
+
+// The indicator and return code behind a LONG value. Neither is kept: a NULL
+// is already the empty value in front of them. The indicator is signed, so its
+// length byte may carry the sign in the high bit.
+void SkipLongTrailer(ByteReader &reader) {
+    const auto indicator_length = reader.ReadByte() & 0x7FU;
+    if (indicator_length > 4) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC LONG indicator is implausibly wide");
+    }
+    (void)reader.ReadRaw(indicator_length);
+    (void)reader.ReadUB2();
+}
+
+} // namespace
+
+TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, const std::vector<TtcColumnFraming> &framing,
                                         size_t maximum_value_bytes) {
-    if (is_lob.empty() || is_lob.size() > 4096 || maximum_value_bytes == 0 || maximum_value_bytes > (16U << 20U)) {
+    return DecodeTtcRowDataPrefix(message.data(), message.size(), framing, maximum_value_bytes);
+}
+
+TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const std::vector<TtcColumnFraming> &framing,
+                                        size_t maximum_value_bytes) {
+    if (framing.empty() || framing.size() > 4096 || maximum_value_bytes == 0 || maximum_value_bytes > (16U << 20U)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC row-data decoder bounds are invalid");
     }
     ByteReader reader(data, size);
@@ -24,10 +90,23 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const 
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ROW_DATA message");
     }
     TtcRowData result;
-    result.reserve(is_lob.size());
-    for (size_t column = 0; column < is_lob.size(); column++) {
-        if (!is_lob[column]) {
+    result.reserve(framing.size());
+    for (size_t column = 0; column < framing.size(); column++) {
+        if (framing[column] == TtcColumnFraming::SCALAR) {
             result.push_back(reader.ReadLengthPrefixed(maximum_value_bytes));
+            continue;
+        }
+        if (framing[column] == TtcColumnFraming::ROWID) {
+            result.push_back(ReadRowid(reader));
+            continue;
+        }
+        if (framing[column] == TtcColumnFraming::UROWID) {
+            result.push_back(ReadUrowid(reader));
+            continue;
+        }
+        if (framing[column] == TtcColumnFraming::LONG) {
+            result.push_back(reader.ReadLengthPrefixed(maximum_value_bytes));
+            SkipLongTrailer(reader);
             continue;
         }
         const auto locator_size = reader.ReadUB4();

@@ -41,4 +41,32 @@ std::string DecodeOracleNumber(const std::vector<uint8_t> &wire);
 // malformed value is reported.
 std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire);
 
+// INTERVAL YEAR TO MONTH is 5 bytes: the year as a big-endian uint32 offset by
+// 0x80000000 and the month plus 60. INTERVAL DAY TO SECOND is 11: the day in the
+// same form, then hour, minute and second each plus 60, then the fractional
+// seconds as nanoseconds in the same offset form. Both signs ride on every
+// component, so -5-11 is year -5 and month -11. Captured from 19c and Free.
+struct OracleIntervalYearMonth {
+    int64_t months = 0;
+};
+struct OracleIntervalDaySecond {
+    int32_t days = 0;
+    // The hours, minutes, seconds and fraction as one signed count of nanoseconds.
+    int64_t nanoseconds = 0;
+};
+std::vector<uint8_t> EncodeOracleIntervalYearMonth(int32_t years, int32_t months);
+OracleIntervalYearMonth DecodeOracleIntervalYearMonth(const std::vector<uint8_t> &wire);
+std::vector<uint8_t> EncodeOracleIntervalDaySecond(int32_t days, int32_t hours, int32_t minutes, int32_t seconds,
+                                                   int32_t nanoseconds);
+OracleIntervalDaySecond DecodeOracleIntervalDaySecond(const std::vector<uint8_t> &wire);
+
+// A ROWID as the 18 characters Oracle itself prints (ROWIDTOCHAR): data object,
+// file, block and row in the base-64 alphabet A-Za-z0-9+/. The input is the twelve
+// bytes of a physical rowid (4 for the data object, 2 for the file, 4 for the
+// block, 2 for the row, all big-endian), or the thirteen of a UROWID whose first
+// byte is 1.
+// A logical UROWID, which an index-organized table has, is not decoded and
+// yields no value.
+std::optional<std::string> TryDecodeOracleRowid(const std::vector<uint8_t> &wire);
+
 } // namespace oracle_scanner

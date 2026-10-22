@@ -124,9 +124,9 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t
 
 TtcRowDataPrefix DecodePartialRowDataPrefix(const uint8_t *data, size_t size,
                                              const std::vector<size_t> &present_columns,
-                                             const std::vector<bool> &is_lob) {
-    if (is_lob.size() != present_columns.size()) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC partial row LOB map disagrees with its columns");
+                                             const std::vector<TtcColumnFraming> &framing) {
+    if (framing.size() != present_columns.size()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC partial row framing map disagrees with its columns");
     }
     if (present_columns.empty()) {
         // A bit vector that selects nothing says the row repeats the previous
@@ -141,7 +141,7 @@ TtcRowDataPrefix DecodePartialRowDataPrefix(const uint8_t *data, size_t size,
     // locators included. Reading them as ordinary length-prefixed values costs
     // nothing on the first row of a fetch and desynchronizes every row after
     // the first bit vector, which is why this shares the full decoder.
-    return DecodeTtcRowDataPrefix(data, size, is_lob, 16U << 20U);
+    return DecodeTtcRowDataPrefix(data, size, framing, 16U << 20U);
 }
 
 TtcRowData MergeChangedColumns(const TtcRowData &previous_row, const std::vector<size_t> &present_columns,
@@ -186,14 +186,14 @@ std::vector<size_t> WireCarryingColumns(const std::vector<OracleColumn> &columns
     return result;
 }
 
-// Which of the given columns are LOBs, whose values are framed as locators.
-std::vector<bool> LobColumns(const std::vector<OracleColumn> &columns, const std::vector<size_t> &wire_columns) {
-    std::vector<bool> is_lob;
-    is_lob.reserve(wire_columns.size());
+// How each of the given columns frames its value: a plain length, a LOB locator, a ROWID.
+std::vector<TtcColumnFraming> ColumnFraming(const std::vector<OracleColumn> &columns, const std::vector<size_t> &wire_columns) {
+    std::vector<TtcColumnFraming> framing;
+    framing.reserve(wire_columns.size());
     for (const auto index : wire_columns) {
-        is_lob.push_back(IsOracleLobType(columns[index].oracle_type));
+        framing.push_back(TtcFramingForType(columns[index].oracle_type));
     }
-    return is_lob;
+    return framing;
 }
 
 // Places the values that were on the wire at their described column positions
@@ -223,7 +223,7 @@ TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn>
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
     row_columns = WireCarryingColumns(columns, std::nullopt);
-    row_is_lob = LobColumns(columns, row_columns);
+    row_framing = ColumnFraming(columns, row_columns);
 }
 
 const TtcRowData *TtcFetchResponseDecoder::PreviousRow() const {
@@ -275,20 +275,20 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
             // A row without a row header carries every column that carries
             // bytes at all, the same for each row, so that set is worked out once.
             std::vector<size_t> selected_columns;
-            std::vector<bool> selected_is_lob;
+            std::vector<TtcColumnFraming> selected_framing;
             if (row_header_present_columns) {
                 selected_columns = WireCarryingColumns(columns, row_header_present_columns);
-                selected_is_lob = LobColumns(columns, selected_columns);
+                selected_framing = ColumnFraming(columns, selected_columns);
             }
             const auto &wire_columns = row_header_present_columns ? selected_columns : row_columns;
-            const auto &is_lob = row_header_present_columns ? selected_is_lob : row_is_lob;
+            const auto &framing = row_header_present_columns ? selected_framing : row_framing;
             TtcRowData values;
             if (wire_columns.empty()) {
                 // Every column this row would carry is zero-width, so ROW_DATA
                 // is its message byte and nothing else.
                 offset += 1;
             } else {
-                auto row = DecodeTtcRowDataPrefix(at, remaining, is_lob);
+                auto row = DecodeTtcRowDataPrefix(at, remaining, framing);
                 values = std::move(row.values);
                 offset += row.bytes_consumed;
             }
@@ -319,10 +319,10 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
             // Zero-width columns carry no bytes here either, so they are
             // dropped from the selection before the values are read.
             const auto wire_columns = WireCarryingColumns(columns, continuation.present_columns);
-            const auto partial_is_lob = LobColumns(columns, wire_columns);
+            const auto partial_framing = ColumnFraming(columns, wire_columns);
             auto partial = DecodePartialRowDataPrefix(at + continuation.bytes_consumed,
                                                             remaining - continuation.bytes_consumed, wire_columns,
-                                                            partial_is_lob);
+                                                            partial_framing);
             offset += continuation.bytes_consumed + partial.bytes_consumed;
             auto merged = MergeChangedColumns(*previous_row, wire_columns, std::move(partial.values), columns.size());
             result.used_row_continuation = true;

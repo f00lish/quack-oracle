@@ -46,6 +46,15 @@ captures = [
     ("lob_get_length_response", "test/cpp/protocol_test.cpp", "lob_get_length_response"),
     ("lob_read_clob_response", "test/cpp/protocol_test.cpp", "lob_read_clob_response"),
     ("lob_read_blob_response", "test/cpp/protocol_test.cpp", "lob_read_blob_response"),
+    ("plain_rowid_fetch", "test/cpp/protocol_test.cpp", "plain_rowid_fetch"),
+    ("physical_urowid_fetch", "test/cpp/protocol_test.cpp", "physical_urowid_fetch"),
+    ("logical_urowid_fetch", "test/cpp/protocol_test.cpp", "logical_urowid_fetch"),
+    ("long_fetch", "test/cpp/protocol_test.cpp", "long_fetch"),
+    ("long_raw_fetch", "test/cpp/protocol_test.cpp", "long_raw_fetch"),
+    ("long_middle_fetch", "test/cpp/protocol_test.cpp", "long_middle_fetch"),
+    ("interval_ym_value_bytes", "test/cpp/protocol_test.cpp", "interval_ym_value_bytes"),
+    ("interval_ds_value_bytes", "test/cpp/protocol_test.cpp", "interval_ds_value_bytes"),
+    ("nvarchar_value_bytes", "test/cpp/protocol_test.cpp", "nvarchar_value_bytes"),
 ]
 
 for name, path, identifier in captures:

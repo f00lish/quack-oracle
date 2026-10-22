@@ -55,6 +55,15 @@ one that records what a server sent.
 | `lob_get_length_response` | 151 | Oracle 19c, the LOB_OP GET_LENGTH response for a ten-character CLOB | `79ca06d9b2b0e87a50d055cf9247c91aeed04705fcd32e83c1fa03c33e6f40a0` |
 | `lob_read_clob_response` | 176 | Oracle 19c, the LOB_OP READ response for the same CLOB, ten Cyrillic characters in AL16UTF16 | `be443b3bcbabcb9d54ade98ff875d674e107175c0b566474b37d4bbd20c12d0f` |
 | `lob_read_blob_response` | 157 | Oracle 19c, the LOB_OP READ response for a one-byte BLOB | `25ce01892864c504fd42ff03a9c0ccf3bd70bd6078260411dc0ea04af6dc8401` |
+| `plain_rowid_fetch` | 78 | Oracle 19c, fetch response for `SELECT id, r` over a ROWID column: one row, then a NULL ROWID. The text decoded from the first row matches `ROWIDTOCHAR` of the same row on 19c and Free | `daf4a79391f84d674c60351db0cae2b0d343bc23eb20b72475317e5e9fc2c1c5` |
+| `physical_urowid_fetch` | 82 | Oracle 19c, the same for a UROWID column holding a physical rowid, then a NULL | `a5406773617217035a2ce9d45310fa729c0f7552e7b932746097c33c00a529b5` |
+| `logical_urowid_fetch` | 93 | Oracle 19c, the same for a UROWID column holding the rowids of an index-organized table. It frames like a physical one and is not decoded | `794ddd566c13a80c9ab55e7db2e9410d219e3ed910d328d3d7a150ae277b1346` |
+| `long_fetch` | 92 | Oracle 19c, fetch response for `SELECT id, l` over a LONG column: `short`, then NULL, which arrives as an indicator of -1 and return code 1405 | `9acd33da9a3f85cb107a61c8dcfc491bbaf1ff7fc3ff4222ad2b0dd10fe07aac` |
+| `long_raw_fetch` | 81 | Oracle 19c, the same for a LONG RAW column holding `DEADBEEF` | `96283a6c136e129b211d2245378f5a1d39290c6b707b5fe5499e1f5e6447874a` |
+| `long_middle_fetch` | 109 | Oracle 19c, fetch response for `SELECT a, l, b` over three rows where the LONG sits between two other columns and holds a value, NULL and a value, the third row behind a BIT_VECTOR | `809f7b2d1d83a1c49ce4f1c4e2e4029b8bca5e2bcffd812f68fed3d22055d06e` |
+| `interval_ym_value_bytes` | 15 | Oracle 19c and Free, three INTERVAL YEAR TO MONTH values: `2-3`, `-5-11`, `0-0` | `3b1f11e0c16f787be39958da84045a434a4d0a86e3325c38bc51dce8c6d9a0d5` |
+| `interval_ds_value_bytes` | 33 | Oracle 19c and Free, three INTERVAL DAY TO SECOND values: `3 04:05:06.789012345`, `-12 23:59:59.5`, `0 0:0:0` | `0fa30cc86aff9f31922dba84155fa5c923a59cf688758fc7a452db6b2a0e8a09` |
+| `nvarchar_value_bytes` | 30 | Oracle 19c and Free, one NVARCHAR2 value in UTF-16BE, ending in a surrogate pair | `4b91f33a7bdcccc78e7faeedae3566cbd49c6be8842dbe1920f098db696e3ee0` |
 
 Live test databases are external and are named here only by the environment
 variables that supply them; see [README.md](README.md). Nothing about an

@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_row_data.hpp"
 
 #include <limits>
 
@@ -94,7 +95,7 @@ OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version) {
     // carries bytes at all: NUMBER and DATE report size 0 while still sending a
     // value, and only a zero maximum means nothing is sent. A REF CURSOR is
     // never a ROW_DATA column, so it is excluded rather than reasoned about.
-    column.omitted_from_row_data = maximum_size == 0 && column.oracle_type != 102;
+    column.omitted_from_row_data = maximum_size == 0 && column.oracle_type != 102 && !IsOracleLongType(column.oracle_type);
     if (column.oracle_type == 102) {
         column.byte_width = 4;
     }

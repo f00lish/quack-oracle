@@ -8,6 +8,7 @@
 #include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/operator/decimal_cast_operators.hpp"
 #include "duckdb/common/types/time.hpp"
+#include "oracle_scanner/ttc_lob.hpp"
 
 #include <cstdlib>
 #include <cmath>
@@ -24,22 +25,32 @@ namespace duckdb {
 // live 19c matrix showed NCHAR and NVARCHAR2 emitting their UTF-16 bytes as if
 // they were UTF-8, INTERVAL YEAR TO MONTH and DAY TO SECOND emitting binary
 // that DuckDB then rejected as invalid unicode, and LOB columns failing much
-// later with an opaque wire error. Each rejection below names what was found
-// and why it is not supported, so the message is actionable.
+// later with an opaque wire error. Each of those now has a decoder; what is
+// still refused below is refused for the same reason it always was. Each
+// rejection below names what was found and why it is not supported, so the
+// message is actionable.
 void RequireReadableColumn(const OracleColumn &column) {
     const auto refuse = [&](const std::string &reason) {
         throw NotImplementedException("Oracle column \"%s\" cannot be read: %s", column.name, reason);
     };
     // NCHAR, NVARCHAR2 and NCLOB share their type codes with the database
-    // character set forms and differ only here.
-    if (column.character_set_form == 2 && column.oracle_type != 112) {
-        refuse("national character set values (NCHAR, NVARCHAR2) are UTF-16 on the wire and are not decoded");
+    // character set forms and differ only in this one. NCHAR and NVARCHAR2
+    // travel in the row as UTF-16BE, the national character set this client
+    // negotiates, and are converted to UTF-8 when read. Any other type that
+    // claims the national form is not one this version has seen.
+    if (column.character_set_form == 2 && column.oracle_type != 1 && column.oracle_type != 96 &&
+        column.oracle_type != 112) {
+        refuse("a national character set form on Oracle type " + std::to_string(column.oracle_type) +
+               " has no decoder");
     }
     switch (column.oracle_type) {
     case 1:   // VARCHAR2
     case 2:   // NUMBER
+    case 8:   // LONG
+    case 11:  // ROWID
     case 12:  // DATE
     case 23:  // RAW
+    case 24:  // LONG RAW
     case 96:  // CHAR
     case 100: // BINARY_FLOAT
     case 101: // BINARY_DOUBLE
@@ -58,10 +69,10 @@ void RequireReadableColumn(const OracleColumn &column) {
         // through LOB_OP before the row ever reaches this layer, so by the time
         // a value is converted a LOB is bytes like any other.
         return;
-    case 182:
-    case 183:
-        refuse("INTERVAL values have no decoder yet");
-        break;
+    case 182: // INTERVAL YEAR TO MONTH
+    case 183: // INTERVAL DAY TO SECOND
+    case 208: // UROWID
+        return;
     default:
         break;
     }
@@ -86,8 +97,12 @@ LogicalType MappedType(const OracleColumn &column) {
         }
         return LogicalType::VARCHAR;
     case 23:  // RAW
+    case 24:  // LONG RAW
     case 113: // BLOB
         return LogicalType::BLOB;
+    case 182: // INTERVAL YEAR TO MONTH
+    case 183: // INTERVAL DAY TO SECOND
+        return LogicalType::INTERVAL;
     case 112: // CLOB
         // A CLOB read comes back as the session's character set, which this
         // client negotiates as UTF-8 — the same bytes a VARCHAR2 arrives in.
@@ -201,13 +216,49 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
     case 231:
         return Value(FormatDateTime(oracle_scanner::DecodeOracleTimestamp(*wire)));
     case 23:
+    case 24:
     case 113:
         return Value::BLOB(wire->data(), wire->size());
+    case 182: {
+        const auto months = oracle_scanner::DecodeOracleIntervalYearMonth(*wire).months;
+        if (months < NumericLimits<int32_t>::Minimum() || months > NumericLimits<int32_t>::Maximum()) {
+            throw ConversionException("Oracle INTERVAL YEAR TO MONTH of %d months is outside the range DuckDB can represent",
+                                      months);
+        }
+        return Value::INTERVAL(static_cast<int32_t>(months), 0, 0);
+    }
+    case 183: {
+        const auto interval = oracle_scanner::DecodeOracleIntervalDaySecond(*wire);
+        // DuckDB keeps microseconds. Oracle keeps nanoseconds, and a column
+        // declared past six fractional digits that actually uses them is a
+        // value this cannot hold, so it is reported rather than rounded.
+        if (interval.nanoseconds % 1000 != 0) {
+            throw ConversionException(
+                "Oracle column \"%s\" carries sub-microsecond precision an INTERVAL cannot hold in DuckDB", column.name);
+        }
+        return Value::INTERVAL(0, interval.days, interval.nanoseconds / 1000);
+    }
+    case 11:
+    case 208: {
+        auto text = oracle_scanner::TryDecodeOracleRowid(*wire);
+        if (!text) {
+            throw NotImplementedException(
+                "Oracle column \"%s\" holds a logical UROWID, which an index-organized table has; only physical "
+                "rowids are decoded",
+                column.name);
+        }
+        return Value(*text);
+    }
     case 100:
         return Value::FLOAT(oracle_scanner::DecodeOracleBinaryFloat(*wire));
     case 101:
         return Value::DOUBLE(oracle_scanner::DecodeOracleBinaryDouble(*wire));
     default:
+        if (column.character_set_form == 2 && (column.oracle_type == 1 || column.oracle_type == 96)) {
+            // NCHAR and NVARCHAR2: UTF-16BE in the row. An NCLOB is already UTF-8 here.
+            const auto utf8 = oracle_scanner::DecodeUtf16BeToUtf8(*wire);
+            return Value(std::string(utf8.begin(), utf8.end()));
+        }
         return Value(std::string(wire->begin(), wire->end()));
     }
 }
@@ -314,6 +365,7 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
         // and its range and precision checks stay in one place.
         break;
     case 23:
+    case 24:
     case 113:
         if (type.id() == LogicalTypeId::BLOB) {
             store_string(reinterpret_cast<const char *>(wire->data()), wire->size());
@@ -336,11 +388,17 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
         break;
     case 181:
     case 231:
+    case 182:
+    case 183:
+    case 11:
+    case 208:
         break;
     default:
         // Text. A Value refuses bytes that are not valid UTF-8, and so does
-        // this, by letting that Value be built and refuse them.
-        if (type.id() == LogicalTypeId::VARCHAR) {
+        // this, by letting that Value be built and refuse them. National
+        // character columns are UTF-16 on the wire and take the Value path,
+        // which converts them.
+        if (type.id() == LogicalTypeId::VARCHAR && column.character_set_form != 2) {
             const auto *data = reinterpret_cast<const char *>(wire->data());
             if (!Value::StringIsValid(data, wire->size())) {
                 through_value();

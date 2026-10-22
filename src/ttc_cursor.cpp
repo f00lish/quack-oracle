@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_row_data.hpp"
 
 namespace oracle_scanner {
 
@@ -68,7 +69,8 @@ OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version) {
     column.byte_width = column.oracle_type == 23 ? maximum_size : size;
     // Same rule as the top-level describe: a zero declared maximum means the
     // column sends nothing in ROW_DATA. See OracleColumn::omitted_from_row_data.
-    column.omitted_from_row_data = maximum_size == 0 && column.oracle_type != ORACLE_CURSOR_TYPE;
+    column.omitted_from_row_data =
+        maximum_size == 0 && column.oracle_type != ORACLE_CURSOR_TYPE && !IsOracleLongType(column.oracle_type);
     if (column.oracle_type == ORACLE_CURSOR_TYPE) {
         column.byte_width = 4;
     }

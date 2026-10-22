@@ -6716,6 +6716,251 @@ static void TestLobOperationObeysTheDeadlineMidResponse() {
     CHECK(server.Requests(raw) == 1);
 }
 
+// What the types added in 0.6.0 look like on the wire. Every byte sequence
+// below was recorded from Oracle 19c, and the INTERVAL, NVARCHAR2 and ROWID
+// values read the same from Free 23ai; PROVENANCE.md lists them with hashes.
+//
+// interval_ym_value_bytes: INTERVAL YEAR TO MONTH '2-3', '-5-11', '0-0'.
+// interval_ds_value_bytes: INTERVAL DAY TO SECOND '3 04:05:06.789012345',
+//     '-12 23:59:59.5', '0 0:0:0'.
+// nvarchar_value_bytes: N'héllo Привет 😀' as NVARCHAR2, UTF-16BE, ending in a
+//     surrogate pair.
+// The *_fetch sets are the ROW_DATA and end of call of
+// `SELECT id, <column> FROM <table>`, with the describe left out. A LONG
+// carries an indicator and a return code behind its value, and a NULL LONG
+// carries -1 and 1405 (ORA-01405), which is what `81 01 ... 05 7d` is.
+// long_middle_fetch is `SELECT a, l, b` over rows (1,'xy','p'), (2,NULL,'q'),
+// (3,'z',NULL), with the third row behind a BIT_VECTOR.
+static void TestNewTypeValues() {
+    const std::vector<uint8_t> plain_rowid_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0x0e, 0x03, 0x08, 0x35, 0xb4, 0x01, 0x01, 0x00, 0x02, 0x89, 0x89, 0x00, 0x07, 0x02,
+        0xc1, 0x03, 0x00, 0x08, 0x01, 0x06, 0x04, 0x01, 0xf2, 0x0e, 0x9b, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0xa0, 0x9a, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x19,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x02
+    };
+
+    const std::vector<uint8_t> physical_urowid_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0x01, 0x0d, 0x0d, 0x01, 0x00, 0x08, 0x35, 0xb4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89,
+        0x00, 0x00, 0x07, 0x02, 0xc1, 0x03, 0x00, 0x08, 0x01, 0x06, 0x04, 0x01, 0xf2, 0x0f, 0x18, 0x01, 0x01, 0x01,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0xa0, 0x9f, 0x01, 0x02, 0x00, 0x00, 0x00,
+        0x01, 0x02, 0x01, 0x19, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02
+    };
+
+    const std::vector<uint8_t> logical_urowid_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0x01, 0x0d, 0x0d, 0x02, 0x04, 0x00, 0x40, 0x89, 0xa1, 0x05, 0x61, 0x6c, 0x70, 0x68,
+        0x61, 0xfe, 0x07, 0x02, 0xc1, 0x03, 0x01, 0x09, 0x09, 0x02, 0x04, 0x00, 0x40, 0x89, 0xa1, 0x01, 0x62, 0xfe,
+        0x08, 0x01, 0x06, 0x04, 0x01, 0xf2, 0x0f, 0xa5, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x01, 0x01, 0x02, 0x69, 0xe5, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x19, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x02
+    };
+
+    const std::vector<uint8_t> long_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0xfe, 0x01, 0x05, 0x73, 0x68, 0x6f, 0x72, 0x74, 0x00, 0x00, 0x00, 0x07, 0x02, 0xc1,
+        0x03, 0x00, 0x81, 0x01, 0x02, 0x05, 0x7d, 0x04, 0x01, 0x01, 0x02, 0xa0, 0xa4, 0x01, 0x02, 0x02, 0x05, 0x7b,
+        0x00, 0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0x7b, 0x01, 0x02, 0x19, 0x4f, 0x52, 0x41, 0x2d, 0x30,
+        0x31, 0x34, 0x30, 0x33, 0x3a, 0x20, 0x6e, 0x6f, 0x20, 0x64, 0x61, 0x74, 0x61, 0x20, 0x66, 0x6f, 0x75, 0x6e,
+        0x64, 0x0a
+    };
+
+    const std::vector<uint8_t> long_raw_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0xfe, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02,
+        0xa0, 0xa9, 0x01, 0x01, 0x02, 0x05, 0x7b, 0x00, 0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0x7b, 0x01,
+        0x01, 0x19, 0x4f, 0x52, 0x41, 0x2d, 0x30, 0x31, 0x34, 0x30, 0x33, 0x3a, 0x20, 0x6e, 0x6f, 0x20, 0x64, 0x61,
+        0x74, 0x61, 0x20, 0x66, 0x6f, 0x75, 0x6e, 0x64, 0x0a
+    };
+
+    const std::vector<uint8_t> long_middle_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0xfe, 0x01, 0x02, 0x78, 0x79, 0x00, 0x00, 0x00, 0x01, 0x70, 0x07, 0x02, 0xc1, 0x03,
+        0x00, 0x81, 0x01, 0x02, 0x05, 0x7d, 0x01, 0x71, 0x15, 0x01, 0x03, 0x07, 0x07, 0x02, 0xc1, 0x04, 0xfe, 0x01,
+        0x01, 0x7a, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0xa1, 0x64, 0x01, 0x03, 0x02, 0x05, 0x7b, 0x00,
+        0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0x7b, 0x01, 0x03, 0x19, 0x4f, 0x52, 0x41, 0x2d, 0x30, 0x31,
+        0x34, 0x30, 0x33, 0x3a, 0x20, 0x6e, 0x6f, 0x20, 0x64, 0x61, 0x74, 0x61, 0x20, 0x66, 0x6f, 0x75, 0x6e, 0x64,
+        0x0a
+    };
+
+    const std::vector<uint8_t> interval_ym_value_bytes {
+        0x80, 0x00, 0x00, 0x02, 0x3f, 0x7f, 0xff, 0xff, 0xfb, 0x31, 0x80, 0x00, 0x00, 0x00, 0x3c
+    };
+    const std::vector<uint8_t> interval_ds_value_bytes {
+        0x80, 0x00, 0x00, 0x03, 0x40, 0x41, 0x42, 0xaf, 0x07, 0x5f, 0x79, 0x7f, 0xff, 0xff, 0xf4, 0x25, 0x01, 0x01,
+        0x62, 0x32, 0x9b, 0x00, 0x80, 0x00, 0x00, 0x00, 0x3c, 0x3c, 0x3c, 0x80, 0x00, 0x00, 0x00
+    };
+    const std::vector<uint8_t> nvarchar_value_bytes {
+        0x00, 0x68, 0x00, 0xe9, 0x00, 0x6c, 0x00, 0x6c, 0x00, 0x6f, 0x00, 0x20, 0x04, 0x1f, 0x04, 0x40, 0x04, 0x38,
+        0x04, 0x32, 0x04, 0x35, 0x04, 0x42, 0x00, 0x20, 0xd8, 0x3d, 0xde, 0x00
+    };
+
+    // INTERVAL YEAR TO MONTH.
+    const std::vector<int64_t> expected_months = {27, -71, 0};
+    for (size_t index = 0; index < 3; index++) {
+        const std::vector<uint8_t> wire(interval_ym_value_bytes.begin() + 5 * static_cast<std::ptrdiff_t>(index),
+                                        interval_ym_value_bytes.begin() + 5 * static_cast<std::ptrdiff_t>(index + 1));
+        CHECK(DecodeOracleIntervalYearMonth(wire).months == expected_months[index]);
+    }
+    CHECK(EncodeOracleIntervalYearMonth(2, 3) ==
+          std::vector<uint8_t>(interval_ym_value_bytes.begin(), interval_ym_value_bytes.begin() + 5));
+    CHECK(EncodeOracleIntervalYearMonth(-5, -11) ==
+          std::vector<uint8_t>(interval_ym_value_bytes.begin() + 5, interval_ym_value_bytes.begin() + 10));
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeOracleIntervalYearMonth({0x80, 0, 0, 2}); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeOracleIntervalYearMonth({0x80, 0, 0, 2, 0x3f, 0}); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeOracleIntervalYearMonth({0x80, 0, 0, 2, 0x4c}); });
+
+    // INTERVAL DAY TO SECOND.
+    const auto day_second = [&](size_t index) {
+        return std::vector<uint8_t>(interval_ds_value_bytes.begin() + 11 * static_cast<std::ptrdiff_t>(index),
+                                    interval_ds_value_bytes.begin() + 11 * static_cast<std::ptrdiff_t>(index + 1));
+    };
+    const auto first = DecodeOracleIntervalDaySecond(day_second(0));
+    CHECK(first.days == 3 && first.nanoseconds == ((4 * 60 + 5) * 60 + 6) * 1000000000LL + 789012345);
+    const auto second = DecodeOracleIntervalDaySecond(day_second(1));
+    CHECK(second.days == -12 && second.nanoseconds == -(((23 * 60 + 59) * 60 + 59) * 1000000000LL + 500000000));
+    const auto zero = DecodeOracleIntervalDaySecond(day_second(2));
+    CHECK(zero.days == 0 && zero.nanoseconds == 0);
+    CHECK(EncodeOracleIntervalDaySecond(3, 4, 5, 6, 789012345) == day_second(0));
+    CHECK(EncodeOracleIntervalDaySecond(-12, -23, -59, -59, -500000000) == day_second(1));
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond({0x80, 0, 0, 3}); });
+    auto bad_hour = day_second(0);
+    bad_hour[4] = 60 + 24;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond(bad_hour); });
+    auto bad_fraction = day_second(0);
+    bad_fraction[7] = 0xc0;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond(bad_fraction); });
+    // Every value an Oracle interval can hold survives encode and decode.
+    std::mt19937_64 random(20261022);
+    for (int round = 0; round < 20000; round++) {
+        const auto sign = (random() & 1U) ? 1 : -1;
+        const auto days = sign * static_cast<int32_t>(random() % 1000000000U);
+        const auto hours = sign * static_cast<int32_t>(random() % 24U);
+        const auto minutes = sign * static_cast<int32_t>(random() % 60U);
+        const auto seconds = sign * static_cast<int32_t>(random() % 60U);
+        const auto nanoseconds = sign * static_cast<int32_t>(random() % 1000000000U);
+        const auto decoded = DecodeOracleIntervalDaySecond(EncodeOracleIntervalDaySecond(days, hours, minutes, seconds, nanoseconds));
+        CHECK(decoded.days == days);
+        CHECK(decoded.nanoseconds == ((static_cast<int64_t>(hours) * 60 + minutes) * 60 + seconds) * 1000000000LL + nanoseconds);
+        const auto years = sign * static_cast<int32_t>(random() % 1000000000U);
+        const auto months = sign * static_cast<int32_t>(random() % 12U);
+        CHECK(DecodeOracleIntervalYearMonth(EncodeOracleIntervalYearMonth(years, months)).months ==
+              static_cast<int64_t>(years) * 12 + months);
+    }
+
+    // NVARCHAR2 travels as UTF-16BE.
+    const auto utf8 = DecodeUtf16BeToUtf8(nvarchar_value_bytes);
+    CHECK(std::string(utf8.begin(), utf8.end()) == "h\xc3\xa9llo \xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xf0\x9f\x98\x80");
+
+    // ROWID text, against what ROWIDTOCHAR returned for the same rows.
+    const std::vector<uint8_t> physical = {0x00, 0x08, 0x35, 0xb4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00};
+    CHECK(TryDecodeOracleRowid(physical).value() == "AACDW0AABAAAImJAAA");
+    auto with_code = physical;
+    with_code.insert(with_code.begin(), 0x01);
+    CHECK(TryDecodeOracleRowid(with_code).value() == "AACDW0AABAAAImJAAA");
+    with_code[0] = 0x02;
+    CHECK(!TryDecodeOracleRowid(with_code));
+    CHECK(!TryDecodeOracleRowid({}) && !TryDecodeOracleRowid(std::vector<uint8_t>(11, 0)));
+    CHECK(TryDecodeOracleRowid(std::vector<uint8_t>(12, 0)).value() == "AAAAAAAAAAAAAAAAAA");
+    CHECK(TryDecodeOracleRowid(std::vector<uint8_t>(12, 0xff)).value() == "D/////P//D/////P//");
+
+    // ROW_DATA framed as a ROWID, a UROWID and a LONG.
+    OracleColumn id;
+    id.name = "ID";
+    id.oracle_type = 2;
+    id.precision = 5;
+    const auto column = [](const char *name, uint16_t type) {
+        OracleColumn result;
+        result.name = name;
+        result.oracle_type = type;
+        result.character_set_form = type == 8 ? 1 : 0;
+        return result;
+    };
+    const auto rowid = DecodeTtcFetchResponse(plain_rowid_fetch, {id, column("R", 11)}, 12);
+    CHECK(rowid.rows.size() == 2 && rowid.rows[0][1] && rowid.rows[0][1]->size() == 12 && !rowid.rows[1][1]);
+    CHECK(TryDecodeOracleRowid(*rowid.rows[0][1]).value() == "AACDW0AABAAAImJAAA");
+
+    const auto urowid = DecodeTtcFetchResponse(physical_urowid_fetch, {id, column("U", 208)}, 12);
+    CHECK(urowid.rows.size() == 2 && urowid.rows[0][1] && urowid.rows[0][1]->size() == 13 && !urowid.rows[1][1]);
+    CHECK(TryDecodeOracleRowid(*urowid.rows[0][1]).value() == "AACDW0AABAAAImJAAA");
+
+    // An index-organized table's UROWID is logical: it frames the same way and
+    // is not decoded.
+    const auto logical = DecodeTtcFetchResponse(logical_urowid_fetch, {id, column("U", 208)}, 12);
+    CHECK(logical.rows.size() == 2 && logical.rows[0][1] && (*logical.rows[0][1])[0] == 2 && logical.rows[1][1]);
+    CHECK(!TryDecodeOracleRowid(*logical.rows[0][1]));
+
+    const auto text = DecodeTtcFetchResponse(long_fetch, {id, column("L", 8)}, 12);
+    CHECK(text.rows.size() == 2 && text.rows[0][1] && !text.rows[1][1]);
+    CHECK(std::string(text.rows[0][1]->begin(), text.rows[0][1]->end()) == "short");
+    const auto raw = DecodeTtcFetchResponse(long_raw_fetch, {id, column("L", 24)}, 12);
+    CHECK(raw.rows.size() == 1 && raw.rows[0][1].value() == std::vector<uint8_t>({0xde, 0xad, 0xbe, 0xef}));
+
+    OracleColumn a = id;
+    a.name = "A";
+    OracleColumn b = column("B", 1);
+    b.character_set_form = 1;
+    const std::vector<OracleColumn> middle_columns = {a, column("L", 8), b};
+    const auto middle = DecodeTtcFetchResponse(long_middle_fetch, middle_columns, 12);
+    CHECK(middle.rows.size() == 3 && middle.used_row_continuation);
+    CHECK(std::string(middle.rows[0][1]->begin(), middle.rows[0][1]->end()) == "xy" && middle.rows[0][2].value()[0] == 'p');
+    CHECK(!middle.rows[1][1] && middle.rows[1][2].value()[0] == 'q');
+    CHECK(std::string(middle.rows[2][1]->begin(), middle.rows[2][1]->end()) == "z" && !middle.rows[2][2]);
+
+    // A response cut anywhere, and fed in pieces, decodes to the same rows.
+    const std::vector<std::pair<const std::vector<uint8_t> *, std::vector<OracleColumn>>> cases = {
+        {&plain_rowid_fetch, {id, column("R", 11)}},
+        {&physical_urowid_fetch, {id, column("U", 208)}},
+        {&logical_urowid_fetch, {id, column("U", 208)}},
+        {&long_fetch, {id, column("L", 8)}},
+        {&long_raw_fetch, {id, column("L", 24)}},
+        {&long_middle_fetch, middle_columns}};
+    for (const auto &entry : cases) {
+        const auto &bytes = *entry.first;
+        const auto expected = DecodeTtcFetchResponse(bytes, entry.second, 12);
+        for (size_t step = 1; step <= 7; step++) {
+            TtcFetchResponseDecoder decoder(entry.second, 12, std::nullopt);
+            for (size_t size = (std::min)(step, bytes.size());; size = (std::min)(size + step, bytes.size())) {
+                const std::vector<uint8_t> received(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
+                try {
+                    decoder.Decode(received);
+                } catch (const ProtocolError &error) {
+                    CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+                }
+                if (size == bytes.size()) {
+                    break;
+                }
+            }
+            CHECK(decoder.Take().rows == expected.rows);
+        }
+        // Every prefix is either a whole message sequence or reported as cut.
+        for (size_t size = 1; size < bytes.size(); size++) {
+            const std::vector<uint8_t> cut(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
+            try {
+                (void)DecodeTtcFetchResponse(cut, entry.second, 12);
+            } catch (const ProtocolError &error) {
+                CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED || error.Kind() == ProtocolErrorKind::MALFORMED);
+            }
+        }
+    }
+
+    // Bounds: a UROWID that states a size its bytes do not, or an absurd one,
+    // and a LONG whose indicator is wider than any integer.
+    const std::vector<TtcColumnFraming> urowid_only = {TtcColumnFraming::UROWID};
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 1, 5, 2, 1, 2}, urowid_only); });
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                [&] { DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 2, 0x7f, 0xff}, urowid_only); });
+    const std::vector<TtcColumnFraming> long_only = {TtcColumnFraming::LONG};
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 0, 0x85, 1, 2, 3, 4, 5, 0}, long_only); });
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] {
+        DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 0xfe, 1, 9, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0}, long_only, 8);
+    });
+}
+
+
 int main() {
 
     TestUniversalIntegers();
@@ -6741,6 +6986,7 @@ int main() {
     TestTtcFetchResponse();
     TestFetchResponseDecoderResumes();
     TestOracleIntegerMatchesDecimalText();
+    TestNewTypeValues();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();
     TestTtcImplicitResultSet();

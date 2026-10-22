@@ -153,6 +153,12 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             // is the padded one, so its own filter is on the padded string.
             Refuse("a string comparison against a column that is not VARCHAR2");
         }
+        if (column.character_set_form == 2) {
+            // An NVARCHAR2 compares in the national character set, and the
+            // literal would have to be converted into it; that conversion is
+            // not one this translator has shown to be the same predicate.
+            Refuse("a string comparison against a national character set column");
+        }
         std::string literal = "'";
         for (const auto character : text) {
             if (character == '\'') {

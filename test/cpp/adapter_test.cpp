@@ -693,6 +693,11 @@ void TestWriteOracleValueMatchesValueFor() {
     moment.nanosecond = 123456789;
     auto micro_moment = moment;
     micro_moment.nanosecond = 123456000;
+    auto national_label = Column("n_label", 1);
+    national_label.character_set_form = 2;
+    auto national_fixed = Column("n_fixed", 96);
+    national_fixed.character_set_form = 2;
+    auto interval_column = Column("elapsed", 183, 2, 9);
     const std::vector<std::pair<OracleColumn, std::vector<Wire>>> cases = {
         {Column("id", 2, 10, 0),
          {std::nullopt, Number("0"), Number("-1"), Number("9999999999"), Number("100000000000000000000")}},
@@ -703,6 +708,23 @@ void TestWriteOracleValueMatchesValueFor() {
          {Number("1234567890123456789012345678.0123456789"), Number("-0.0000000001"),
           Number("1234567890123456789012345678901")}},
         {Column("unbounded", 2), {Number("123456789012345678901234567890"), Number("-0.000000000000000000000000000015")}},
+        {national_label,
+         {std::vector<uint8_t> {0x00, 0x68, 0x00, 0xE9, 0x04, 0x1F, 0xD8, 0x3D, 0xDE, 0x00}, std::vector<uint8_t> {},
+          std::vector<uint8_t> {0x00}, std::vector<uint8_t> {0xD8, 0x3D}}},
+        {national_fixed, {std::vector<uint8_t> {0x00, 0x61, 0x00, 0x20}}},
+        {Column("span", 182),
+         {oracle_scanner::EncodeOracleIntervalYearMonth(2, 3), oracle_scanner::EncodeOracleIntervalYearMonth(-5, -11),
+          oracle_scanner::EncodeOracleIntervalYearMonth(200000000, 0)}},
+        {interval_column,
+         {oracle_scanner::EncodeOracleIntervalDaySecond(3, 4, 5, 6, 789012000),
+          oracle_scanner::EncodeOracleIntervalDaySecond(-12, -23, -59, -59, -500000000),
+          oracle_scanner::EncodeOracleIntervalDaySecond(0, 0, 0, 0, 1)}},
+        {Column("legacy", 8), {Text("a long text"), Text(""), std::vector<uint8_t> {0xFF}}},
+        {Column("legacy_raw", 24), {std::vector<uint8_t> {0xDE, 0xAD}}},
+        {Column("address", 11), {std::vector<uint8_t> {0x00, 0x08, 0x35, 0xB4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00}}},
+        {Column("universal", 208),
+         {std::vector<uint8_t> {0x01, 0x00, 0x08, 0x35, 0xB4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00},
+          std::vector<uint8_t> {0x02, 0x04, 0x00, 0x40, 0x89, 0xA1, 0x05, 0x61}}},
         {Column("label", 1), {Text(""), Text("plain"), Text("\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82"),
                               std::vector<uint8_t> {'o', 'k', 0xFF}, std::vector<uint8_t> {0xC3}}},
         {Column("fixed", 96), {Text("ab  ")}},
@@ -748,8 +770,60 @@ void TestWriteOracleValueMatchesValueFor() {
     }
     // The cases include refusals, so the comparison above covers errors too:
     // an out-of-range BIGINT, two DECIMAL overflows, two strings that are not
-    // UTF-8 and a timestamp finer than its column, each at two rows.
-    CHECK(refusals == 2 * 6);
+    // UTF-8 and a timestamp finer than its column, then an odd and a lone
+    // surrogate UTF-16 value, a year-month span past int32, a day-second span
+    // finer than a microsecond, a LONG that is not UTF-8 and a logical UROWID,
+    // each at two rows.
+    CHECK(refusals == 2 * 12);
+}
+
+// The types added in 0.6.0 reach SQL as the DuckDB types they map to, with the
+// values Oracle holds. A national column is UTF-16 in the row and comes out
+// UTF-8; an INTERVAL YEAR TO MONTH is months, an INTERVAL DAY TO SECOND is
+// days and microseconds; a ROWID and a UROWID are the text Oracle prints; LONG
+// reads as VARCHAR and LONG RAW as BLOB.
+void TestNewTypesReadThroughSql() {
+	auto script = std::make_shared<FakeScript>();
+	auto national = Column("N_LABEL", 1);
+	national.character_set_form = 2;
+	auto national_fixed = Column("N_FIXED", 96);
+	national_fixed.character_set_form = 2;
+	auto legacy = Column("LEGACY", 8);
+	legacy.character_set_form = 1;
+	script->columns = {national, national_fixed, Column("SPAN", 182),         Column("ELAPSED", 183, 2, 6),
+	                   legacy,   Column("LEGACY_RAW", 24), Column("ADDRESS", 11), Column("UNIVERSAL", 208)};
+	const std::vector<uint8_t> physical = {0x00, 0x08, 0x35, 0xB4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00};
+	auto universal = physical;
+	universal.insert(universal.begin(), 0x01);
+	script->rows = {{std::vector<uint8_t> {0x00, 0x68, 0x00, 0xE9, 0xD8, 0x3D, 0xDE, 0x00},
+	                 std::vector<uint8_t> {0x00, 0x61, 0x00, 0x20, 0x00, 0x20},
+	                 oracle_scanner::EncodeOracleIntervalYearMonth(-5, -11),
+	                 oracle_scanner::EncodeOracleIntervalDaySecond(3, 4, 5, 6, 789012000), Text("long text"),
+	                 std::vector<uint8_t> {0xDE, 0xAD}, physical, universal},
+	                {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+	                 std::nullopt}};
+
+	auto factory = InstallFake(script);
+	TestDatabase database;
+	auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT * FROM app.items')");
+	CHECK(!result->HasError());
+	const std::vector<duckdb::LogicalType> expected_types = {
+	    duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::INTERVAL,
+	    duckdb::LogicalType::INTERVAL, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BLOB,
+	    duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
+	CHECK(result->GetTypes() == expected_types);
+	CHECK(result->GetValue(0, 0).ToString() == "h\xC3\xA9\xF0\x9F\x98\x80");
+	// CHAR is blank-padded, and the padding is part of the value.
+	CHECK(result->GetValue(1, 0).ToString() == "a  ");
+	CHECK(result->GetValue(2, 0) == duckdb::Value::INTERVAL(-71, 0, 0));
+	CHECK(result->GetValue(3, 0) == duckdb::Value::INTERVAL(0, 3, ((4 * 60 + 5) * 60 + 6) * 1000000LL + 789012));
+	CHECK(result->GetValue(4, 0).ToString() == "long text");
+	CHECK(result->GetValue(5, 0).ToString() == "\\xDE\\xAD");
+	CHECK(result->GetValue(6, 0).ToString() == "AACDW0AABAAAImJAAA");
+	CHECK(result->GetValue(7, 0).ToString() == "AACDW0AABAAAImJAAA");
+	for (duckdb::idx_t column = 0; column < 8; column++) {
+		CHECK(result->GetValue(column, 1).IsNull());
+	}
 }
 
 // Projecting a subset of the columns must emit exactly the requested ones, in
@@ -933,30 +1007,24 @@ void TestUnsupportedColumnTypesAreRefusedAtBind() {
     };
 
     // NVARCHAR2 and NCHAR carry the VARCHAR2 and CHAR type codes; only the
-    // character set form separates them, and their values are UTF-16 in the row
-    // itself. NCLOB shares the CLOB type code and is readable, because its
-    // content does not travel in the row at all — it is read through LOB_OP,
-    // which serves AL16UTF16 for a plain CLOB too.
-    for (const uint16_t character_type : {1, 96}) {
-        const auto error = bind_error(character_type, 2);
-        CHECK(error.find("Not implemented Error") != std::string::npos);
-        CHECK(error.find("national character set") != std::string::npos);
-    }
+    // character set form separates them. They are readable now (UTF-16 in the
+    // row, converted), but a national form on any other type is a shape this
+    // version has not seen.
+    const auto national_number = bind_error(2, 2);
+    CHECK(national_number.find("Not implemented Error") != std::string::npos);
+    CHECK(national_number.find("national character set form on Oracle type 2") != std::string::npos);
 
     // BFILE has no read path and is refused by name, unlike the three LOB
     // types beside it.
     CHECK(bind_error(114, 0).find("Oracle type 114") != std::string::npos);
-
-    CHECK(bind_error(182, 0).find("INTERVAL") != std::string::npos);
-    CHECK(bind_error(183, 0).find("INTERVAL") != std::string::npos);
 
     const auto local_zone = bind_error(231, 0);
     CHECK(local_zone.find("session time zone") != std::string::npos);
 
     // Anything with no mapping at all still fails by name rather than falling
     // through to the textual default.
-    const auto unmapped = bind_error(8, 0);
-    CHECK(unmapped.find("Oracle type 8") != std::string::npos);
+    const auto unmapped = bind_error(119, 0);
+    CHECK(unmapped.find("Oracle type 119") != std::string::npos);
 
     // TIMESTAMP WITH TIME ZONE stays readable: the value carries its own
     // offset, so nothing has to be assumed about a session zone.
@@ -3141,6 +3209,7 @@ int main() {
     TestInterruptReachesEveryTransactionPath();
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
+    TestNewTypesReadThroughSql();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();
     TestUnsupportedColumnTypesAreRefusedAtBind();

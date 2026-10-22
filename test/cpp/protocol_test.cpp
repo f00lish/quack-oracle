@@ -545,6 +545,39 @@ static void TestConnectHandshake() {
     TnsPacketStream accepted_packets(accepted, false);
     auto result = RunTnsConnect(accepted_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))");
     CHECK(result.disposition == TnsConnectDisposition::ACCEPTED && result.negotiated_sdu == 8192 && result.check_oob);
+
+    // **11.2 and older ACCEPT layout.**
+    //
+    // 11.2 answers with a 24-byte ACCEPT payload whose negotiated SDU sits at
+    // offset 4, not at offset 26 (that is the 19c layout). The parser used to
+    // require 28 bytes and read the SDU from offset 26, so every 11.2 listener
+    // was rejected with "Oracle ACCEPT packet is truncated".
+    //
+    // The payload below is the one 11.2 actually sent, captured off the wire:
+    //   01 3a 04 01 20 00 20 00 01 00 00 00 00 20 c5 00 00 00 00 00 00 00
+    //    ^version=314 ^svc ^SDU=8192 ^SDU=8192
+    const std::vector<uint8_t> legacy_payload = {
+        0x01, 0x3a, 0x04, 0x01, 0x20, 0x00, 0x20, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x20, 0xc5, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    auto legacy_wire = EncodeTnsPacket(TnsPacketType::RESEND, 0, {}, false);
+    const auto legacy_accept = EncodeTnsPacket(TnsPacketType::ACCEPT, 0, legacy_payload, false);
+    legacy_wire.insert(legacy_wire.end(), legacy_accept.begin(), legacy_accept.end());
+    FragmentedStream legacy_stream(std::move(legacy_wire), 2);
+    TnsPacketStream legacy_packets(legacy_stream, false);
+    auto legacy_result = RunTnsConnect(legacy_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))");
+    CHECK(legacy_result.disposition == TnsConnectDisposition::ACCEPTED);
+    CHECK(legacy_result.negotiated_sdu == 8192);
+    CHECK(legacy_result.accept_version == 314);
+    // The 11.2 layout carries no flags2, so no OOB probe may be promised.
+    CHECK(!legacy_result.check_oob);
+
+    // A payload too short to hold either layout is still malformed.
+    const auto tiny_accept = EncodeTnsPacket(TnsPacketType::ACCEPT, 0, {0x01, 0x3a, 0x04}, false);
+    FragmentedStream tiny_stream(tiny_accept, 2);
+    TnsPacketStream tiny_packets(tiny_stream, false);
+    ExpectError(ProtocolErrorKind::TRUNCATED,
+                [&] { RunTnsConnect(tiny_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))"); });
     const auto first_packet_length = ReadUInt16(accepted.output, 0);
     CHECK(DecodeTnsPacket(std::vector<uint8_t>(accepted.output.begin(), accepted.output.begin() + first_packet_length), false).type ==
            TnsPacketType::CONNECT);

@@ -269,7 +269,17 @@ TnsConnectResult RunTnsConnect(TnsPacketStream &stream, const std::string &descr
         // is still a valid acceptance, so fall back to the protocol defaults
         // instead of rejecting the connection.
         if (response.payload.size() < 28) {
-            const auto legacy = response.payload.size() < 2;
+            // Legacy layout (11.2 and older): the listener answers with the bare
+            // 8-byte TNS header and **no payload at all** -- there is no
+            // negotiated SDU, no version and no flags2 to read.  Such an ACCEPT
+            // is still a valid acceptance, so fall back to the protocol defaults
+            // instead of rejecting the connection.
+            //
+            // The 8 bytes ARE counted in `payload` here (the packet is only
+            // 8 bytes long in total: the TNS header's own length field says 8).
+            // So the legacy test is "<= 8 bytes", not "no bytes".
+            // Measured on 11.2: `00 08 00 00 0b 00 00 00` -- 8 bytes total.
+            const auto legacy = response.payload.size() <= 8;
             if (!legacy) {
                 throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle ACCEPT packet is truncated");
             }

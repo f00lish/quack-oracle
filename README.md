@@ -49,7 +49,7 @@ Terms you will meet below, in Oracle terms:
 | --- | --- |
 | `duckdb` shell | `sqlplus` / SQLcl — the client you type SQL into |
 | secret | stored credentials for a connection; the Oracle equivalent of what you keep in a wallet or a connect string |
-| `TNS_ALIAS` in a secret | an alias from `tnsnames.ora` — the extension reads it out of the wallet ZIP itself |
+| `DSN` / `TNS_ALIAS` in a secret | Easy Connect strings, and aliases from `tnsnames.ora` — read from `CONFIG_DIR`, or out of the wallet ZIP or folder, by the extension itself |
 | table function (`oracle_query(...)`) | a pipelined table function: something you `SELECT` *from* |
 | `ATTACH` | closest to a database link, but pointing the other way: DuckDB mounts your Oracle schema, not the reverse |
 | catalog | one attached database; its schema and tables keep their Oracle names |
@@ -292,9 +292,11 @@ that would promise otherwise are refused by name rather than ignored:
 | `HOST`, `PORT`, `SERVICE_NAME` | The database endpoint |
 | `USER`, `PASSWORD` | Your Oracle credentials |
 | `PROTOCOL` | `tcp` (the default) or `tcps` for TLS |
-| `TNS_ALIAS` | An alias from the `tnsnames.ora` inside the wallet ZIP — use *instead of* HOST/PORT/SERVICE_NAME |
+| `DSN` | One string in python-oracledb's forms: an Easy Connect string (`tcps://host:2484/service?retry_count=3`), a full `(DESCRIPTION=...)`, or an alias name. Use *instead of* HOST/PORT/SERVICE_NAME. See [CAPABILITIES](docs/CAPABILITIES.md) for the Easy Connect parameters |
+| `TNS_ALIAS` | An alias from the `tnsnames.ora` in `CONFIG_DIR`, or else inside the wallet — use *instead of* HOST/PORT/SERVICE_NAME |
+| `CONFIG_DIR` | A folder holding `tnsnames.ora` (or that file) for `TNS_ALIAS`, or for an alias given as `DSN` |
 | `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` given inline — use *instead of* HOST/PORT/SERVICE_NAME and TNS_ALIAS. See [Several addresses and listener redirects](#several-addresses-and-listener-redirects) |
-| `WALLET_FILE` | A cloud wallet ZIP, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |
+| `WALLET_FILE` | A cloud wallet ZIP, an unpacked wallet folder, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |
 | `WALLET_PASSWORD` | The password the wallet's encrypted `ewallet.pem` is locked with. Not needed when the wallet carries `cwallet.sso` — every wallet OCI hands out does |
 | `TLS_SERVER_NAME` | The name checked against the server certificate |
 | `TLS_SNI_NAME` | Only when the endpoint is an IP or a different virtual host |

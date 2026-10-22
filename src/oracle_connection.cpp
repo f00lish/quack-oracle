@@ -84,31 +84,58 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
     const auto connect_descriptor = OptionalString(*secret, "connect_descriptor");
     const auto protocol = secret->TryGetValue("protocol");
     // Where the addresses come from: HOST/PORT/SERVICE_NAME, a TNS_ALIAS looked
-    // up in a wallet's tnsnames.ora, or a CONNECT_DESCRIPTOR given inline.
-    // Exactly one, so no setting is ever silently overridden by another.
+    // up in a tnsnames.ora, a CONNECT_DESCRIPTOR given inline, or a DSN (any of
+    // a descriptor, an Easy Connect string and an alias). Exactly one, so no
+    // setting is ever silently overridden by another.
     const bool names_host = !OptionalString(*secret, "host").empty() ||
                             !OptionalString(*secret, "service_name").empty() || !secret->TryGetValue("port").IsNull();
     if (!protocol.IsNull() && StringUtil::Lower(protocol.ToString()) != "tcp" &&
         StringUtil::Lower(protocol.ToString()) != "tcps") {
         throw BinderException("Oracle secret PROTOCOL must be 'tcp' or 'tcps'");
     }
-    if (!tns_alias.empty() && !connect_descriptor.empty()) {
-        throw BinderException("Oracle TNS_ALIAS and CONNECT_DESCRIPTOR cannot be combined");
+    const auto dsn = OptionalString(*secret, "dsn");
+    const auto config_dir = OptionalString(*secret, "config_dir");
+    const int sources = static_cast<int>(!tns_alias.empty()) + static_cast<int>(!connect_descriptor.empty()) +
+                        static_cast<int>(!dsn.empty());
+    if (sources > 1) {
+        if (dsn.empty()) {
+            throw BinderException("Oracle TNS_ALIAS and CONNECT_DESCRIPTOR cannot be combined");
+        }
+        throw BinderException("Oracle DSN cannot be combined with TNS_ALIAS or CONNECT_DESCRIPTOR");
     }
-    const char *descriptor_source = !tns_alias.empty() ? "TNS_ALIAS" : "CONNECT_DESCRIPTOR";
-    const bool from_descriptor = !tns_alias.empty() || !connect_descriptor.empty();
+    // A DSN is whichever of the three it looks like: a descriptor ('('), an
+    // Easy Connect string (it names a host or a service), or else an alias.
+    const bool dsn_is_descriptor = !dsn.empty() && dsn[0] == '(';
+    const bool dsn_is_easy_connect = !dsn.empty() && oracle_scanner::IsEasyConnectString(dsn);
+    const std::string alias = !tns_alias.empty()
+                                  ? tns_alias
+                                  : (!dsn.empty() && !dsn_is_descriptor && !dsn_is_easy_connect ? dsn : std::string());
+    const char *descriptor_source = !tns_alias.empty() ? "TNS_ALIAS" : (!dsn.empty() ? "DSN" : "CONNECT_DESCRIPTOR");
+    const bool from_descriptor = sources == 1;
+    if (!config_dir.empty() && alias.empty()) {
+        throw BinderException("Oracle CONFIG_DIR is only used to look up a TNS_ALIAS or an alias given as DSN");
+    }
     if (from_descriptor) {
         if (names_host) {
             throw BinderException("Oracle %s cannot be combined with HOST, PORT, or SERVICE_NAME", descriptor_source);
         }
-        if (!tns_alias.empty() && wallet_pem_file.empty()) {
-            throw BinderException("Oracle TNS_ALIAS requires WALLET_FILE pointing to a wallet ZIP");
+        if (!alias.empty() && wallet_pem_file.empty() && config_dir.empty()) {
+            throw BinderException("Oracle %s names an alias, which needs CONFIG_DIR (a folder or tnsnames.ora) or "
+                                  "WALLET_FILE to look it up in",
+                                  descriptor_source);
         }
         try {
-            const auto descriptor =
-                !tns_alias.empty() ? oracle_scanner::FindTnsAliasDescriptor(
-                                         oracle_scanner::ReadWalletTnsNamesArchive(wallet_pem_file), tns_alias)
-                                   : connect_descriptor;
+            std::string descriptor = connect_descriptor;
+            if (!alias.empty()) {
+                // tnsnames.ora comes from CONFIG_DIR when given, as in
+                // python-oracledb, and otherwise from the wallet.
+                descriptor = oracle_scanner::FindTnsAliasDescriptor(
+                    oracle_scanner::ReadTnsNamesSource(config_dir.empty() ? wallet_pem_file : config_dir), alias);
+            } else if (dsn_is_descriptor) {
+                descriptor = dsn;
+            } else if (dsn_is_easy_connect) {
+                descriptor = oracle_scanner::EasyConnectToDescriptor(dsn);
+            }
             const auto parsed = oracle_scanner::ParseConnectDescriptor(descriptor);
             config.routing.address_lists = parsed.address_lists;
             config.routing.failover = parsed.failover;

@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -5871,9 +5872,117 @@ static void TestSsoWallet() {
     }
     CHECK(ReadWalletIdentityPem(sso_file_path, false) == pem);
 
+    // A wallet folder, as python-oracledb's wallet_location names one.
+    const auto folder = base + "_folder";
+    CHECK(mkdir(folder.c_str(), 0700) == 0);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletIdentityPem(folder, false); });
+    {
+        std::ofstream output(folder + "/cwallet.sso", std::ios::binary);
+        CHECK(output);
+        output.write(wallet.data(), static_cast<std::streamsize>(wallet.size()));
+    }
+    CHECK(ReadWalletIdentityPem(folder, false) == pem);
+    CHECK(ReadWalletIdentityPem(folder, true) == pem);
+    {
+        std::ofstream output(folder + "/ewallet.pem", std::ios::binary);
+        output << plain_pem;
+    }
+    CHECK(ReadWalletIdentityPem(folder, false) == pem);
+    CHECK(ReadWalletIdentityPem(folder, true) == plain_pem);
+    std::remove((folder + "/cwallet.sso").c_str());
+    std::remove((folder + "/ewallet.pem").c_str());
+    rmdir(folder.c_str());
+
     std::remove(sso_only_path.c_str());
     std::remove(both_path.c_str());
     std::remove(sso_file_path.c_str());
+}
+
+// Easy Connect strings and tnsnames.ora from a folder: the two ways a
+// python-oracledb DSN reaches a connection without a wallet ZIP.
+static void TestEasyConnectAndTnsNamesFolder() {
+    const auto describe = [](const std::string &text) { return ParseConnectDescriptor(EasyConnectToDescriptor(text)); };
+
+    auto one = describe("db.example.com/sales.example.com");
+    CHECK(one.endpoints.size() == 1 && one.endpoints[0].host == "db.example.com" && one.endpoints[0].port == 1521 &&
+          one.endpoints[0].protocol == TransportProtocol::TCP && one.service_name == "sales.example.com");
+    one = describe("//db.example.com:1530/sales");
+    CHECK(one.endpoints[0].port == 1530 && one.service_name == "sales");
+    one = describe("tcps://db.example.com:2484/sales");
+    CHECK(one.endpoints[0].protocol == TransportProtocol::TCPS && one.endpoints[0].port == 2484);
+    one = describe("TCP://db/sales:shared/inst1");
+    CHECK(one.server_type == "shared" || one.server_type == "SHARED");
+    CHECK(one.instance_name == "inst1");
+    one = describe("[::1]:1522/sales");
+    CHECK(one.endpoints[0].host == "::1" && one.endpoints[0].port == 1522);
+
+    const auto many = describe("a.example:1521,b.example:1522,c.example/svc?failover=off&load_balance=on&"
+                               "retry_count=3&retry_delay=2&transport_connect_timeout=5&connect_timeout=40");
+    CHECK(many.endpoints.size() == 3 && many.endpoints[1].host == "b.example" && many.endpoints[1].port == 1522 &&
+          many.endpoints[2].port == 1521);
+    CHECK(!many.failover && many.load_balance);
+    CHECK(many.retry_count && *many.retry_count == 3 && many.retry_delay_seconds && *many.retry_delay_seconds == 2);
+    CHECK(many.transport_connect_timeout_seconds && *many.transport_connect_timeout_seconds == 5);
+    CHECK(many.connect_timeout_seconds && *many.connect_timeout_seconds == 40);
+
+    const auto dn = describe("tcps://db.example/svc?ssl_server_cert_dn=\"CN=db.example,O=Corp\"&ssl_server_dn_match=on");
+    CHECK(dn.server_cert_dn == "CN=db.example,O=Corp");
+
+    CHECK(IsEasyConnectString("host/service") && IsEasyConnectString("host:1521") &&
+          IsEasyConnectString("tcps://host/service"));
+    CHECK(!IsEasyConnectString("(DESCRIPTION=)") && !IsEasyConnectString("mydb_high") && !IsEasyConnectString(""));
+
+    // Refused by name, never dropped.
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db.example:1521"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db.example/"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db.example/svc name"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db(x)/svc"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db:port/svc"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db/svc?retry_count"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db/svc?ssl_server_cert_dn=a)(b"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { (void)EasyConnectToDescriptor("http://db/svc"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { (void)EasyConnectToDescriptor("db/svc?https_proxy=p"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { (void)EasyConnectToDescriptor("db/svc?wallet_location=/x"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED,
+                [&] { (void)describe("db/svc:pooled"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED,
+                [&] { (void)ParseConnectDescriptor(EasyConnectToDescriptor("db/svc?connect_timeout=250ms")); });
+    std::string too_many;
+    for (size_t index = 0; index < 17; index++) {
+        too_many += (index ? ",h" : "h") + std::to_string(index);
+    }
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)EasyConnectToDescriptor(too_many + "/svc"); });
+
+    // tnsnames.ora from a folder, from the file itself, and from a ZIP.
+    const auto base = TemporaryDirectory() + "/oracle_scanner_tnsnames_" +
+                      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string tnsnames =
+        "# comment\nfolder_db = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=f.example)(PORT=1521))"
+        "(CONNECT_DATA=(SERVICE_NAME=folder.example)))\n";
+    CHECK(mkdir(base.c_str(), 0700) == 0);
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { (void)ReadTnsNamesSource(base); });
+    {
+        std::ofstream output(base + "/tnsnames.ora", std::ios::binary);
+        output << tnsnames;
+    }
+    CHECK(ReadTnsNamesSource(base) == tnsnames);
+    CHECK(ReadTnsNamesSource(base + "/tnsnames.ora") == tnsnames);
+    const auto parsed = ParseConnectDescriptor(FindTnsAliasDescriptor(ReadTnsNamesSource(base), "FOLDER_DB"));
+    CHECK(parsed.endpoints.size() == 1 && parsed.endpoints[0].host == "f.example" && parsed.service_name == "folder.example");
+    {
+        std::ofstream output(base + "/nul.ora", std::ios::binary);
+        output << tnsnames << '\0';
+    }
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadTnsNamesSource(base + "/nul.ora"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ReadTnsNamesSource(std::string()); });
+    const auto zip_path = base + "/wallet.zip";
+    WriteWalletArchiveForTest(zip_path, {{"tnsnames.ora", tnsnames}});
+    CHECK(ReadTnsNamesSource(zip_path) == tnsnames);
+    std::remove((base + "/tnsnames.ora").c_str());
+    std::remove((base + "/nul.ora").c_str());
+    std::remove(zip_path.c_str());
+    rmdir(base.c_str());
+    std::cout << "easy connect and tnsnames folder ok" << std::endl;
 }
 
 // Bounded LOB prefetch: materializing a prefetched value and sizing a fetch
@@ -7082,6 +7191,7 @@ int main() {
     TestSessionFactory();
     TestSessionPool();
     TestSsoWallet();
+    TestEasyConnectAndTnsNamesFolder();
     TestLobPrefetchMaterializer();
     TestLobPrefetchScalarBudget();
     TestLobPrefetchDecoderResumes();

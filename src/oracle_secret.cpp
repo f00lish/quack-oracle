@@ -7,7 +7,7 @@ static unique_ptr<BaseSecret> CreateOracleSecret(ClientContext &, CreateSecretIn
     auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
     for (const auto &key : {"host", "port", "service_name", "user", "password", "protocol", "connect_timeout",
                             "read_timeout", "tls_server_name", "tls_sni_name", "tls_ca_file", "tls_server_cert_dn", "wallet_file",
-                            "wallet_password", "tns_alias", "connect_descriptor"}) {
+                            "wallet_password", "tns_alias", "connect_descriptor", "dsn", "config_dir"}) {
         secret->TrySetValue(key, input);
     }
     secret->redact_keys = {"password", "wallet_password"};
@@ -42,6 +42,8 @@ void RegisterOracleSecrets(ExtensionLoader &loader) {
     function.named_parameters["wallet_password"] = LogicalType::VARCHAR;
     function.named_parameters["tns_alias"] = LogicalType::VARCHAR;
     function.named_parameters["connect_descriptor"] = LogicalType::VARCHAR;
+    function.named_parameters["dsn"] = LogicalType::VARCHAR;
+    function.named_parameters["config_dir"] = LogicalType::VARCHAR;
     loader.RegisterFunction(std::move(function));
 }
 

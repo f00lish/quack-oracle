@@ -71,4 +71,14 @@ void ValidateRedirectReconnectData(const std::string &text);
 // complete DESCRIPTION value. The input is bounded by the wallet reader.
 std::string FindTnsAliasDescriptor(const std::string &tnsnames, const std::string &alias);
 
+// Easy Connect: [tcp[s]://]host[:port][,host[:port]...]/service[:server][/instance][?key=value&...].
+// IsEasyConnectString says whether a DSN has that shape (it names a host or a
+// service, so is neither a descriptor, which starts with '(', nor a bare
+// tnsnames alias). EasyConnectToDescriptor rewrites one into the equivalent
+// (DESCRIPTION=...) so the one descriptor parser decides what is accepted;
+// parameters it does not know are refused by name, not dropped. Timeouts are
+// whole seconds. Values are not percent-decoded.
+bool IsEasyConnectString(const std::string &text);
+std::string EasyConnectToDescriptor(const std::string &text);
+
 } // namespace oracle_scanner

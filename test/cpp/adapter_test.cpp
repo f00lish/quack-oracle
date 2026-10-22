@@ -33,6 +33,9 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <chrono>
+#include <fstream>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <thread>
 #include <cassert>
 #include <csignal>
@@ -2084,6 +2087,90 @@ void TestConnectDescriptorSecretReachesTheSession() {
     std::cout << "connect descriptor secrets reach the session" << std::endl;
 }
 
+// DSN and CONFIG_DIR: the python-oracledb spellings of the same three sources.
+void TestDsnSecretReachesTheSession() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto configs = std::make_shared<std::vector<ConnectionConfig>>();
+    oracle_scanner::ScopedOracleSessionFactory factory([script, configs](const ConnectionConfig &config,
+                                                                         const std::string &) {
+        configs->push_back(config);
+        return std::unique_ptr<OracleSession>(new FakeSession(script));
+    });
+    TestDatabase database;
+    const auto query = [&](const std::string &secret_options) {
+        database.Run("CREATE OR REPLACE SECRET dsn_secret (TYPE oracle, USER 'app_user', PASSWORD 'placeholder', " +
+                     secret_options + ");");
+        return database.Query("SELECT * FROM oracle_query('dsn_secret', 'SELECT label FROM app.items')");
+    };
+
+    // Easy Connect, with a list of hosts and routing parameters.
+    CHECK(!query("DSN 'a.example:1521,b.example:1522/sales.example?retry_count=4&transport_connect_timeout=3'")
+               ->HasError());
+    const auto &easy = configs->back();
+    CHECK(easy.host.empty() && easy.service_name == "sales.example" && easy.routing.retry_count == 4 &&
+          easy.connect_timeout_seconds == 3);
+    CHECK(!easy.routing.address_lists.empty() && easy.protocol == oracle_scanner::TransportProtocol::TCP);
+    size_t addresses = 0;
+    for (const auto &list : easy.routing.address_lists) {
+        addresses += list.addresses.size();
+    }
+    CHECK(addresses == 2);
+
+    // tcps:// selects TLS the way a TCPS descriptor does.
+    CHECK(!query("DSN 'tcps://secure.example:2484/svc', TLS_SERVER_NAME 'cert.example'")->HasError());
+    CHECK(configs->back().protocol == oracle_scanner::TransportProtocol::TCPS &&
+          configs->back().tls_server_name == "cert.example");
+
+    // A descriptor works as a DSN too.
+    CHECK(!query("DSN '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=d.example)(PORT=1521))"
+                 "(CONNECT_DATA=(SERVICE_NAME=svc)))'")
+               ->HasError());
+    CHECK(configs->back().service_name == "svc");
+
+    // A bare name is an alias, looked up in CONFIG_DIR: a folder or the file.
+    const auto folder = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+                        "/oracle_scanner_config_dir_" +
+                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    CHECK(mkdir(folder.c_str(), 0700) == 0);
+    const auto tnsnames_path = folder + "/tnsnames.ora";
+    {
+        std::ofstream output(tnsnames_path, std::ios::binary);
+        output << "folder_db = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=f.example)(PORT=1530))"
+                  "(CONNECT_DATA=(SERVICE_NAME=folder.example)))\n";
+    }
+    CHECK(!query("DSN 'folder_db', CONFIG_DIR '" + folder + "'")->HasError());
+    CHECK(configs->back().service_name == "folder.example");
+    CHECK(!query("TNS_ALIAS 'FOLDER_DB', CONFIG_DIR '" + tnsnames_path + "'")->HasError());
+    CHECK(configs->back().routing.address_lists.at(0).addresses.at(0).port == 1530);
+
+    const auto refused = [&](const std::string &secret_options, const std::string &expected) {
+        const auto before = configs->size();
+        auto result = query(secret_options);
+        CHECK(result->HasError());
+        if (result->GetError().find(expected) == std::string::npos) {
+            std::cerr << "unexpected error: " << result->GetError() << "\n";
+            CHECK(false && "wrong error for a refused secret");
+        }
+        CHECK(configs->size() == before);
+    };
+    refused("DSN 'a.example/svc', HOST 'a.example'", "DSN cannot be combined with HOST, PORT, or SERVICE_NAME");
+    refused("DSN 'a.example/svc', TNS_ALIAS 'x', CONFIG_DIR '" + folder + "'",
+            "DSN cannot be combined with TNS_ALIAS or CONNECT_DESCRIPTOR");
+    refused("DSN 'folder_db'", "names an alias, which needs CONFIG_DIR");
+    refused("DSN 'a.example/svc', CONFIG_DIR '" + folder + "'", "CONFIG_DIR is only used to look up");
+    refused("DSN 'missing_alias', CONFIG_DIR '" + folder + "'", "DSN could not be resolved");
+    refused("DSN 'a.example:1521'", "DSN could not be resolved");
+    refused("DSN 'a.example/svc?https_proxy=p'", "is not supported");
+    refused("DSN 'a.example/svc', PROTOCOL 'tcps'", "DSN protocol does not match PROTOCOL 'tcps'");
+    refused("DSN 'a.example/svc', WALLET_FILE '/x'", "require PROTOCOL 'tcps'");
+
+    std::remove(tnsnames_path.c_str());
+    rmdir(folder.c_str());
+    std::cout << "DSN and CONFIG_DIR secrets reach the session" << std::endl;
+}
+
 // Failover is for new connections only. A statement whose session fails after
 // its SQL went out is not sent again — not on the same session, and not on a
 // new one — and the next statement starts on a fresh session.
@@ -3234,6 +3321,7 @@ int main() {
     TestAutomaticCallBindsFromTheSignature();
     TestFunctionsCanReturnARefCursor();
     TestConnectDescriptorSecretReachesTheSession();
+    TestDsnSecretReachesTheSession();
     TestFailedStatementIsNotReplayed();
     TestFunctionExamplesRun();
     TestDocumentedRegistrationsAlterOnConflict();

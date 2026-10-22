@@ -96,8 +96,9 @@ ideographs — are untested, since none of the character sets above can hold one
 
 ### Secrets
 
-A connection is a DuckDB secret. There is no connection string and no `TNS_ADMIN`
-lookup on disk.
+A connection is a DuckDB secret. The `DSN` field takes the same strings as
+python-oracledb's `dsn`; there is no `TNS_ADMIN` lookup, so a `tnsnames.ora`
+outside a wallet is named explicitly with `CONFIG_DIR`.
 
 ```sql
 CREATE SECRET ora (
@@ -110,13 +111,27 @@ CREATE SECRET ora (
 | Field | Meaning |
 | --- | --- |
 | `HOST`, `PORT`, `SERVICE_NAME` | The endpoint, given directly |
-| `TNS_ALIAS` | An alias resolved from `tnsnames.ora` **inside the wallet ZIP** |
+| `DSN` | One string, read as a full `(DESCRIPTION=...)` if it starts with `(`, as an Easy Connect string if it names a host or service (`host:port/service`), and otherwise as an alias |
+| `TNS_ALIAS` | An alias resolved from `tnsnames.ora` in `CONFIG_DIR`, or else inside the `WALLET_FILE` |
+| `CONFIG_DIR` | A folder holding `tnsnames.ora`, or that file itself, for `TNS_ALIAS` or an alias given as `DSN` |
 | `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` inline; no wallet needed |
 | `USER`, `PASSWORD` | Credentials |
 | `PROTOCOL` | `tcp` (default) or `tcps` |
-| `WALLET_FILE`, `WALLET_PASSWORD` | A cloud wallet ZIP, read in memory only |
+| `WALLET_FILE`, `WALLET_PASSWORD` | A cloud wallet ZIP, a wallet folder (`cwallet.sso` or `ewallet.pem`), or one of those two files; read in memory only |
 | `TLS_CA_FILE`, `TLS_SERVER_NAME`, `TLS_SNI_NAME`, `TLS_SERVER_CERT_DN` | TLS material and the identity to check |
 | `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts; `CONNECT_TIMEOUT` is per attempt |
+
+**Easy Connect**
+
+`[tcp://|tcps://][//]host[:port][,host[:port]...]/service[:server][/instance][?key=value&...]`,
+for example `tcps://db.example.com:2484/sales.example.com?retry_count=3`. It is
+rewritten into the equivalent descriptor and judged by the same parser, so the
+rules below apply to it unchanged. The port defaults to 1521 per host. The
+parameters read are `failover`, `load_balance`, `retry_count`, `retry_delay`,
+`transport_connect_timeout`, `connect_timeout` (whole seconds),
+`ssl_server_cert_dn`, `ssl_server_dn_match`, and the accepted-and-ignored
+`expire_time` and `sdu`. Any other parameter is refused by name. Values are not
+percent-decoded, and a service name is required.
 
 **Works**
 
@@ -142,7 +157,9 @@ CREATE SECRET ora (
 
 - `TNS_ALIAS`, `CONNECT_DESCRIPTOR` and `HOST`/`PORT`/`SERVICE_NAME` — exactly
   one of the three.
-- `TNS_ALIAS` without `WALLET_FILE`; a descriptor with an address whose
+- `DSN` beside `TNS_ALIAS`, `CONNECT_DESCRIPTOR`, `HOST`, `PORT` or `SERVICE_NAME`;
+  `CONFIG_DIR` without an alias to look up; an alias with neither `CONFIG_DIR`
+  nor `WALLET_FILE`; a descriptor with an address whose
   protocol disagrees with `PROTOCOL`; a `TRANSPORT_CONNECT_TIMEOUT` that
   disagrees with the secret's `CONNECT_TIMEOUT`.
 - Descriptor settings whose meaning this client would silently drop:
@@ -158,7 +175,7 @@ CREATE SECRET ora (
 setting to turn it off, deliberately.
 
 **Not supported:** the 11g SHA-1 verifier, Native Network Encryption (ANO),
-`ewallet.p12`/`cwallet.sso` outside a cloud wallet ZIP, SEPS, IAM tokens, failover of an established session (TAF), Application
+`ewallet.p12`, SEPS, IAM tokens, failover of an established session (TAF), Application
 Continuity, FAN/ONS, automatic retry of SQL, and proxy authentication. A lost
 session fails the statement running on it; only new connections fail over.
 

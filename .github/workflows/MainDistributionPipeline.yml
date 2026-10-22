@@ -68,6 +68,16 @@ jobs:
       # the other side of them. 132 of the 319 published community extensions
       # exclude it, so this is the ordinary choice rather than a retreat.
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
+      # 只构建本项目真正需要的平台。
+      #
+      # 这个仓库的产物是给 data-manager 平台的 DuckDB 联邦引擎用的，
+      # 那台机器是 Windows x64 —— 别的平台（linux/osx/arm）没有人下载，
+      # 却各要占一次矩阵构建的分钟数和时间。
+      #
+      # opt_in_archs 是 ci-tools v2.0-cyanoptera 提供的显式白名单：
+      # 只构建列出的架构，exclude_archs 仍然生效（排除优先于选择）。
+      # 要恢复全平台构建，把这一行删掉即可。
+      opt_in_archs: 'windows_amd64'
 
   # clang-tidy over this project's own sources. Not the reusable code-quality
   # workflow: its tidy target filters translation units with the regex

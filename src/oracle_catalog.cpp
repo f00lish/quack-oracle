@@ -240,6 +240,13 @@ struct OracleAttachedState {
             oracle_type = 182;
         } else if (StringUtil::StartsWith(type, "INTERVAL DAY")) {
             oracle_type = 183;
+        } else if (type == "CLOB") {
+            oracle_type = 112;
+        } else if (type == "NCLOB") {
+            oracle_type = 112;
+            character_set_form = 2;
+        } else if (type == "BLOB") {
+            oracle_type = 113;
         } else if (type == "BOOLEAN") {
             oracle_type = 252;
         } else if (type == "ROWID") {

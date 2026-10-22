@@ -1501,6 +1501,22 @@ void TestWriteBindsFollowTheOracleColumnType() {
     CHECK(bind_for(national, duckdb::Value(duckdb::LogicalType::VARCHAR)).character_set_form == 2);
     CHECK(bind_for(Column("SEEN_AT", 231), duckdb::Value(duckdb::LogicalType::TIMESTAMP_TZ)).oracle_type == 180);
 
+    // LOBs: the content as a VARCHAR2 or RAW bind, empty as NULL, and a limit.
+    const auto clob = Column("DOC", 112);
+    CHECK(bind_for(clob, duckdb::Value("text")).oracle_type == 1);
+    CHECK(bind_for(clob, duckdb::Value("text")).value == std::vector<uint8_t>({'t', 'e', 'x', 't'}));
+    CHECK(!bind_for(clob, duckdb::Value("")).value.has_value() && bind_for(clob, duckdb::Value("")).oracle_type == 1);
+    auto nclob = Column("NDOC", 112);
+    nclob.character_set_form = 2;
+    CHECK(bind_for(nclob, duckdb::Value("h\xC3\xA9")).character_set_form == 0);
+    const auto blob = Column("IMG", 113);
+    CHECK(bind_for(blob, duckdb::Value::BLOB("\x01\x02")).oracle_type == 23);
+    CHECK(bind_for(blob, duckdb::Value(duckdb::LogicalType::BLOB)).oracle_type == 23);
+    unsupported(clob, duckdb::Value::BIGINT(1), "takes VARCHAR");
+    unsupported(blob, duckdb::Value("text"), "takes BLOB");
+    unconvertible(clob, duckdb::Value(std::string((16U << 20U), 'x')), "16 MiB");
+    CHECK(bind_for(clob, duckdb::Value(std::string((16U << 20U) - 1, 'x'))).value->size() == (16U << 20U) - 1);
+
     // BOOLEAN is the two bytes python-oracledb sends.
     const auto boolean_column = Column("FLAG", 252);
     CHECK(bind_for(boolean_column, duckdb::Value::BOOLEAN(true)).value == std::vector<uint8_t>({1, 1}));
@@ -1913,14 +1929,18 @@ void TestAttachedCatalogNamesTheNewTypes() {
           {row("NV", "NVARCHAR2", nullptr), row("NC", "NCHAR", nullptr), row("YM", "INTERVAL YEAR(2) TO MONTH", "0"),
            row("DS", "INTERVAL DAY(2) TO SECOND(6)", "6"), row("FLAG", "BOOLEAN", nullptr),
            row("SEEN", "TIMESTAMP(6) WITH LOCAL TIME ZONE", "6"), row("ADDR", "ROWID", nullptr),
-           row("OLD", "LONG", nullptr)}}});
+           row("OLD", "LONG", nullptr), row("DOC", "CLOB", nullptr), row("NDOC", "NCLOB", nullptr),
+           row("IMG", "BLOB", nullptr)}}});
     script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
     auto national = Column("NV", 1);
     national.character_set_form = 2;
     auto national_fixed = Column("NC", 96);
     national_fixed.character_set_form = 2;
+    auto national_doc = Column("NDOC", 112);
+    national_doc.character_set_form = 2;
     script->tables["T"] = {{national, national_fixed, Column("YM", 182), Column("DS", 183), Column("FLAG", 252),
-                            Column("SEEN", 231), Column("ADDR", 11), Column("OLD", 8)},
+                            Column("SEEN", 231), Column("ADDR", 11), Column("OLD", 8), Column("DOC", 112),
+                            national_doc, Column("IMG", 113)},
                            {}};
     script->affected_rows = 1;
     auto factory = InstallFake(script);
@@ -1931,7 +1951,8 @@ void TestAttachedCatalogNamesTheNewTypes() {
                                     "ORDER BY column_index");
     CHECK(!described->HasError());
     const std::vector<std::string> expected_types = {"VARCHAR", "VARCHAR", "INTERVAL", "INTERVAL",
-                                                     "BOOLEAN", "TIMESTAMP WITH TIME ZONE", "VARCHAR", "VARCHAR"};
+                                                     "BOOLEAN", "TIMESTAMP WITH TIME ZONE", "VARCHAR", "VARCHAR",
+                                                     "VARCHAR", "VARCHAR", "BLOB"};
     CHECK(described->RowCount() == expected_types.size());
     for (duckdb::idx_t index = 0; index < expected_types.size(); index++) {
         CHECK(described->GetValue(1, index).ToString() == expected_types[index]);
@@ -1948,6 +1969,23 @@ void TestAttachedCatalogNamesTheNewTypes() {
     CHECK(binds[3].oracle_type == 183 && binds[3].value == oracle_scanner::EncodeOracleIntervalDaySecond(2, 3, 4, 5, 0));
     CHECK(binds[4].oracle_type == 252 && binds[4].value == std::vector<uint8_t>({1, 1}));
     CHECK(binds[5].oracle_type == 180);
+
+    // A LOB is written as the ordinary bind of its content: VARCHAR2 for a CLOB
+    // or NCLOB, RAW for a BLOB.
+    database.Run("INSERT INTO ora.main.T (DOC, NDOC, IMG) VALUES ('doc', 'ndoc', '\\x01\\x02'::BLOB), (NULL, NULL, NULL), "
+                 "('', '', ''::BLOB);");
+    CHECK(script->batch_rows.size() == 3 && script->batch_rows[0].size() == 3);
+    CHECK(script->batch_rows[0][0].oracle_type == 1 && script->batch_rows[0][0].character_set_form == 0 &&
+          script->batch_rows[0][0].value == std::vector<uint8_t>({'d', 'o', 'c'}));
+    CHECK(script->batch_rows[0][1].oracle_type == 1 && script->batch_rows[0][1].character_set_form == 0);
+    CHECK(script->batch_rows[0][2].oracle_type == 23 && script->batch_rows[0][2].value == std::vector<uint8_t>({1, 2}));
+    for (size_t row = 1; row < 3; row++) {
+        CHECK(script->batch_rows[row][0].oracle_type == 1 && !script->batch_rows[row][0].value.has_value());
+        CHECK(script->batch_rows[row][2].oracle_type == 23 && !script->batch_rows[row][2].value.has_value());
+    }
+    // RETURNING cannot carry a LOB, and says so.
+    auto returning_lob = database.Query("INSERT INTO ora.main.T (DOC) VALUES ('x') RETURNING DOC;");
+    CHECK(returning_lob->HasError() && returning_lob->GetError().find("cannot return the LOB column") != std::string::npos);
 
     // What cannot be written is refused by name, not as "type 0".
     auto refused = database.Query("INSERT INTO ora.main.T (OLD) VALUES ('x');");

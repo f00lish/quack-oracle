@@ -61,6 +61,7 @@ captures = [
     ("python_nvarchar_bind", "test/cpp/protocol_test.cpp", "python_nvarchar_bind"),
     ("python_boolean_bind", "test/cpp/protocol_test.cpp", "python_boolean_bind"),
     ("python_interval_ds_bind", "test/cpp/protocol_test.cpp", "python_interval_ds_bind"),
+    ("python_long_bind_row", "test/cpp/protocol_test.cpp", "python_long_bind_row"),
 ]
 
 for name, path, identifier in captures:

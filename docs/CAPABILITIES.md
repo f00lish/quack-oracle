@@ -346,8 +346,26 @@ in as `''` comes back as NULL. That is Oracle's behavior, faithfully reproduced.
 
 ## 4. LOBs
 
-`CLOB`, `NCLOB`, and `BLOB` are **read**. `BFILE` is not, and no LOB can be
-**written**.
+`CLOB`, `NCLOB`, and `BLOB` are **read** and **written**. `BFILE` is neither.
+
+**Writing** sends the content as an ordinary bind, as python-oracledb Thin does:
+a `VARCHAR2` for a `CLOB` or `NCLOB` (Oracle converts to the national set
+itself) and a `RAW` for a `BLOB`. Oracle accepts such a bind past the usual
+32 767 bytes when its target is a LOB; the value goes out in chunks, and a bind
+that wide has its value sent after the short ones in the row, which is the order
+python-oracledb uses. Through an attached table that is `INSERT` and `UPDATE`
+with a `VARCHAR` or `BLOB` value; an empty value is NULL, like any empty string
+in Oracle.
+
+- **16 MiB per value.** One bind carries at most that. A larger value is refused
+  by name, because a bigger one needs a temporary LOB written block by block,
+  which is not implemented.
+- **Memory.** A statement is built whole, so a batch of N rows holds N times its
+  LOB values at once; insert large LOBs a few rows at a time.
+- **`INSERT … RETURNING` cannot cover a LOB column.** Oracle returns a locator
+  there, and DuckDB's `RETURNING` spans every column of the table, so a table
+  with a LOB column refuses it with a message that names the column.
+- A LOB column is not filtered remotely; a filter on one runs in DuckDB.
 
 A LOB column carries a locator in the row. Against a server that negotiates
 the 12c field version (19c, 23ai and Autonomous do), the fetch asks Oracle to
@@ -441,8 +459,8 @@ reinterpret.
 Writable column types: `VARCHAR2`, `CHAR`, `NCHAR`, `NVARCHAR2`, `NUMBER`,
 `DATE`, `TIMESTAMP`, `TIMESTAMP WITH LOCAL TIME ZONE`, `INTERVAL YEAR TO MONTH`,
 `INTERVAL DAY TO SECOND`, `BOOLEAN`, `RAW`, `BINARY_FLOAT`, `BINARY_DOUBLE`.
-(`TIMESTAMP WITH TIME ZONE` is read but not written.) Everything else — LOBs,
-`LONG`, `ROWID` included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
+`CLOB`, `NCLOB`, `BLOB` (see §4). (`TIMESTAMP WITH TIME ZONE` is read but not
+written.) Everything else — `LONG` and `ROWID` included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
 column is refused too: cast to `DECIMAL` or text first, because binary floats
 are not exact.
 
@@ -608,7 +626,7 @@ the attached catalog's transactions reuse sessions as §6 describes.
 ## 11. Not supported, in one list
 
 Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
-LOB writing · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
+LOB values past 16 MiB · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
 `LONG` and `ROWID` · object, collection, record and `XMLTYPE`
 types · `UPDATE`/`DELETE … RETURNING` · schemas other than the connected user's ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1

@@ -874,7 +874,7 @@ directly, and every client that touches the table gets a real numeric type.
 row carries only a pointer, and fetching the content costs extra round trips per
 value. Measured: 2,000 rows with a 2,000-character CLOB took **1.22 s**, against
 **0.004 s** for the same rows without that column. Select a LOB column only when
-you need it. Writing a LOB is not supported.
+you need it. Writing is cheap by comparison: a LOB value goes out as an ordinary bind, up to 16 MiB each.
 
 ---
 

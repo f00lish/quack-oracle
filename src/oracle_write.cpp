@@ -382,6 +382,10 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
 
 } // namespace
 
+// One bind carries at most this much (the TTC bind limit). Writing a LOB through
+// an ordinary bind therefore stops here.
+constexpr size_t MAX_LOB_WRITE_BYTES = 16U << 20U;
+
 OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, const std::string &name) {
     // A column this client cannot read is one it cannot reason about writing
     // either, and it refuses with the type named.
@@ -396,6 +400,17 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     if (column.oracle_type == 231) {
         // A local-zone column is written as a TIMESTAMP of UTC wall time.
         bind.oracle_type = 180;
+    }
+    if (column.oracle_type == 112) {
+        // A LOB is written as the ordinary bind of its content, as
+        // python-oracledb Thin does: a VARCHAR2 for a CLOB or NCLOB (the server
+        // converts to the national set itself, so the bind stays in the
+        // database set), a RAW for a BLOB. Oracle accepts one past the usual
+        // 32767 bytes when the target is a LOB, and the value goes out in the
+        // chunked form the length prefix already has.
+        bind.oracle_type = 1;
+    } else if (column.oracle_type == 113) {
+        bind.oracle_type = 23;
     }
     if ((column.oracle_type == 1 || column.oracle_type == 96) && column.character_set_form == 2) {
         bind.character_set_form = 2;
@@ -519,6 +534,24 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
                 static_cast<int32_t>(seconds_total / 60 % 60), static_cast<int32_t>(seconds_total % 60),
                 static_cast<int32_t>(micros % 1000000LL * 1000));
         });
+        return bind;
+    }
+    case 112:   // CLOB and NCLOB
+    case 113: { // BLOB
+        const bool character = column.oracle_type == 112;
+        if (type != (character ? LogicalTypeId::VARCHAR : LogicalTypeId::BLOB)) {
+            RefuseBind(column, value, character ? "a CLOB column takes VARCHAR" : "a BLOB column takes BLOB");
+        }
+        const auto bytes = character ? value.GetValue<std::string>() : StringValue::Get(value);
+        if (bytes.empty()) {
+            // An empty CLOB value is NULL on the way in, like any empty string.
+            return bind;
+        }
+        if (bytes.size() >= MAX_LOB_WRITE_BYTES) {
+            RefuseValue(column, "a LOB value is limited to " + std::to_string(MAX_LOB_WRITE_BYTES >> 20U) +
+                                    " MiB in this version; larger values need a temporary LOB, which is not implemented");
+        }
+        bind.value = std::vector<uint8_t>(bytes.begin(), bytes.end());
         return bind;
     }
     case 181:
@@ -1046,6 +1079,15 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
                                         static_cast<uint64_t>(position));
             }
             RequireReadableColumn(columns[position]);
+            if (columns[position].oracle_type == 112 || columns[position].oracle_type == 113) {
+                // Oracle hands a LOB in RETURNING back as a locator, not as
+                // content, and this client has no capture of that exchange.
+                // DuckDB evaluates RETURNING over every column of the table,
+                // so one LOB column rules the clause out.
+                throw NotImplementedException("Oracle INSERT ... RETURNING cannot return the LOB column \"%s\"; "
+                                              "insert without RETURNING and read the row back",
+                                              columns[position].name);
+            }
             if (!returned_list.empty()) {
                 returned_list += ", ";
                 into_list += ", ";

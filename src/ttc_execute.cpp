@@ -167,16 +167,34 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
     }
 }
 
-void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds) {
+// A bind whose buffer is wider than this is "long": its value is sent after
+// every other bind's in the row, though its metadata keeps its declared place.
+// Recorded from python-oracledb 4.0.1 inserting (id, clob, nclob) with the CLOB
+// at 40000 characters: the row carried id, then the NCLOB, then the CLOB.
+constexpr uint32_t LONG_BIND_BUFFER_BYTES = 32767;
+
+void WriteBindValue(ByteWriter &writer, const OracleBind &bind) {
+    if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
+        // OUT SYS_REFCURSOR has metadata but no client-side value.
+        writer.WriteByte(0);
+    } else if (bind.value) {
+        writer.WriteLengthPrefixed(bind.value);
+    } else {
+        writer.WriteByte(0);
+    }
+}
+
+void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds,
+                     const std::vector<uint32_t> &buffer_sizes) {
     writer.WriteByte(TTC_MESSAGE_ROW_DATA);
-    for (const auto &bind : binds) {
-        if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
-            // OUT SYS_REFCURSOR has metadata but no client-side value.
-            writer.WriteByte(0);
-        } else if (bind.value) {
-            writer.WriteLengthPrefixed(bind.value);
-        } else {
-            writer.WriteByte(0);
+    for (size_t index = 0; index < binds.size(); index++) {
+        if (buffer_sizes[index] <= LONG_BIND_BUFFER_BYTES) {
+            WriteBindValue(writer, binds[index]);
+        }
+    }
+    for (size_t index = 0; index < binds.size(); index++) {
+        if (buffer_sizes[index] > LONG_BIND_BUFFER_BYTES) {
+            WriteBindValue(writer, binds[index]);
         }
     }
 }
@@ -252,12 +270,13 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     for (size_t index = 2; index < 13; index++) {
         writer.WriteUB4(index == 7 && request.is_query ? 1 : (index == 9 ? OALL8_IMPLICIT_RESULTSETS : 0));
     }
-    WriteBindMetadata(writer, request.binds, IterationBufferSizes(request), request.ttc_field_version);
+    const auto buffer_sizes = IterationBufferSizes(request);
+    WriteBindMetadata(writer, request.binds, buffer_sizes, request.ttc_field_version);
     // One ROW_DATA message per iteration, in order. This is the whole of array
     // DML on the wire: the same parse, the same metadata, N rows of values.
-    WriteBindValues(writer, request.binds);
+    WriteBindValues(writer, request.binds, buffer_sizes);
     for (const auto &iteration : request.additional_iterations) {
-        WriteBindValues(writer, iteration);
+        WriteBindValues(writer, iteration, buffer_sizes);
     }
     return writer.Take();
 }

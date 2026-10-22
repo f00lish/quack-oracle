@@ -1,7 +1,7 @@
 // Opt-in live checks of the column types added in 0.6.0: NCHAR and NVARCHAR2,
 // INTERVAL YEAR TO MONTH and DAY TO SECOND, ROWID and UROWID, LONG and LONG RAW,
 // TIMESTAMP WITH LOCAL TIME ZONE, BOOLEAN (23ai only; skipped where the server
-// has none), and writing the national and interval columns and BOOLEAN.
+// has none), and writing the national and interval columns, BOOLEAN and LOBs.
 //
 // ORA19C_HOST, ORA19C_PORT, ORA19C_SERVICE, ORA19C_USER and ORA19C_PASSWORD
 // name an administrative account. The test creates a throwaway user with a
@@ -146,6 +146,7 @@ int main() {
               "DS INTERVAL DAY(4) TO SECOND(6), L TIMESTAMP(6) WITH LOCAL TIME ZONE)",
               "create write");
         table("T_CHAR (ID NUMBER(3), C CHAR(4))", "create char");
+        table("T_LOBW (ID NUMBER(5) PRIMARY KEY, C CLOB, B BLOB, N NCLOB)", "create lobw");
         // BOOLEAN exists from 23ai. A server without it refuses the type, and the
         // stage is skipped rather than failed.
         bool has_boolean = true;
@@ -414,6 +415,62 @@ int main() {
         auto unfiltered = Run(admin, "SELECT count(*) FROM raw.T_WRITE WHERE nv = 'new\xc3\xa9';", "local filter");
         Check(unfiltered->GetValue(0, 0).ToString() == "1", "the same filter runs in DuckDB when it is not pushed down");
         std::cout << "PASS national text, intervals and local-zone times can be written\n";
+
+        // Writing LOBs: sizes either side of the 32767 and 32768 boundaries and
+        // well past the 4000 a VARCHAR2 holds, in the same row as short columns
+        // (a long bind's value travels after the short ones). Lengths and the
+        // last characters are Oracle's own statement of what it stored.
+        Run(admin,
+            "INSERT INTO raw.T_LOBW VALUES (1, 'small', '\\x01\\x02'::BLOB, 'h' || chr(233)), "
+            "(2, repeat('x', 100000), NULL, repeat(chr(20013), 40000)), "
+            "(3, NULL, repeat('\\xAB'::BLOB, 100000), NULL), (4, '', ''::BLOB, ''), "
+            "(5, repeat('y', 32767), repeat('\\x01'::BLOB, 32768), repeat('z', 300));",
+            "lob insert");
+        Run(admin, "INSERT INTO raw.T_LOBW VALUES (6, repeat('w', 5000000), repeat('\\x07'::BLOB, 5000000), NULL);", "lob insert big");
+        Run(admin, "INSERT INTO raw.T_LOBW (id, c) VALUES (7, repeat('v', 4001));", "lob insert 4001");
+        Run(admin, "INSERT INTO raw.T_LOBW (id, n, c) VALUES (8, NULL, repeat('u', 40000));", "lob insert reordered");
+        {
+            auto result = Run(admin,
+                              "SELECT id, lc, lb, ln, tail, bhex FROM oracle_query('rt', 'SELECT ID, DBMS_LOB.GETLENGTH(C) AS LC, "
+                              "DBMS_LOB.GETLENGTH(B) AS LB, DBMS_LOB.GETLENGTH(N) AS LN, DBMS_LOB.SUBSTR(C, 3, DBMS_LOB.GETLENGTH(C) - 2) AS TAIL, "
+                              "RAWTOHEX(DBMS_LOB.SUBSTR(B, 2, 1)) AS BHEX FROM T_LOBW ORDER BY ID') ORDER BY id;",
+                              "lob lengths");
+            Check(result->RowCount() == 8, "lob rows");
+            const std::vector<std::string> lc = {"5", "100000", "NULL", "NULL", "32767", "5000000", "4001", "40000"};
+            const std::vector<std::string> lb = {"2", "NULL", "100000", "NULL", "32768", "5000000", "NULL", "NULL"};
+            const std::vector<std::string> ln = {"2", "40000", "NULL", "NULL", "300", "NULL", "NULL", "NULL"};
+            for (idx_t row = 0; row < 8; row++) {
+                Check(result->GetValue(1, row).ToString() == lc[row] && result->GetValue(2, row).ToString() == lb[row] &&
+                          result->GetValue(3, row).ToString() == ln[row],
+                      "lob lengths as Oracle counts them");
+            }
+            Check(result->GetValue(4, 1).ToString() == "xxx" && result->GetValue(4, 5).ToString() == "www" &&
+                      result->GetValue(5, 2).ToString() == "ABAB" && result->GetValue(5, 5).ToString() == "0707",
+                  "lob ends and bytes");
+        }
+        {
+            // And back through this client's own LOB read, content and all.
+            auto result = Run(admin,
+                              "SELECT id, length(c), md5(c) = md5(repeat(substr(c, 1, 1), length(c))) AS same, "
+                              "octet_length(b), length(n) FROM raw.T_LOBW WHERE id IN (2, 5, 6) ORDER BY id;",
+                              "lob read back");
+            Check(result->RowCount() == 3 && result->GetValue(1, 0).ToString() == "100000" &&
+                      result->GetValue(2, 0).ToString() == "true" && result->GetValue(1, 2).ToString() == "5000000" &&
+                      result->GetValue(3, 2).ToString() == "5000000" && result->GetValue(4, 0).ToString() == "40000",
+                  "lob content round trip");
+        }
+        Run(admin, "UPDATE raw.T_LOBW SET c = repeat('u', 70000), b = '\\xDE\\xAD'::BLOB, n = repeat('q', 50000) WHERE id = 1;", "lob update");
+        Check(Scalar(admin,
+                     "SELECT * FROM oracle_query('rt', 'SELECT DBMS_LOB.GETLENGTH(C) || ''/'' || DBMS_LOB.GETLENGTH(B) || ''/'' || "
+                     "DBMS_LOB.GETLENGTH(N) AS S FROM T_LOBW WHERE ID = 1');",
+                     "lob update check") == "70000/2/50000",
+              "UPDATE replaces LOB content");
+        auto oversize = admin.Query("INSERT INTO raw.T_LOBW (id, c) VALUES (9, repeat('x', 17000000));");
+        Check(oversize->HasError() && oversize->GetError().find("16 MiB") != std::string::npos, "an oversize LOB is refused by name");
+        auto lob_returning = admin.Query("INSERT INTO raw.T_LOBW (id) VALUES (10) RETURNING id;");
+        Check(lob_returning->HasError() && lob_returning->GetError().find("cannot return the LOB column") != std::string::npos,
+              "RETURNING over a LOB table says why it cannot");
+        std::cout << "PASS CLOB, NCLOB and BLOB are written, whole and updated\n";
 
         if (has_boolean) {
             Run(admin, "SELECT * FROM oracle_execute_transaction('raw', 'INSERT INTO T_BOOL VALUES (1, TRUE)');", "bool 1");

@@ -6912,6 +6912,63 @@ static void TestBooleanLocalZoneAndWrites() {
     expected = with_size(python_interval_ds_bind, 2, 11);
     CHECK(encode_tail(interval, expected.size()) == expected);
 
+    // A long bind's value follows every short bind's in the row, though its
+    // metadata keeps its place. python_long_bind_row is python-oracledb's
+    // insert of (id, clob, nclob) = (42, 40000 characters, 'abc'): three binds'
+    // metadata, then the row, cut after the first chunk header of the CLOB.
+    const std::vector<uint8_t> python_long_bind_row {
+        0x02, 0x01, 0x00, 0x00, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x02, 0x71, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00,
+        0x07, 0x02, 0xc1, 0x2a, 0x03, 0x61, 0x62, 0x63, 0xfe, 0x02, 0x7f, 0xff
+    };
+    {
+        const std::string clob_text(40000, 'y');
+        TtcExecuteBindsRequest request;
+        request.sql = "INSERT INTO T VALUES (:1, :2, :3)";
+        request.ttc_field_version = 17;
+        OracleBind id;
+        id.oracle_type = 2;
+        id.value = std::vector<uint8_t> {0xc1, 0x2a};
+        OracleBind clob;
+        clob.oracle_type = 1;
+        clob.value = std::vector<uint8_t>(clob_text.begin(), clob_text.end());
+        OracleBind nclob;
+        nclob.oracle_type = 1;
+        nclob.value = std::vector<uint8_t> {'a', 'b', 'c'};
+        request.binds = {id, clob, nclob};
+        const auto encoded = EncodeTtcExecuteBindsRequest(request);
+
+        // Rebuild python's bytes with this client's buffer sizes, then require the
+        // request to end with them: the same metadata, the short values, then the
+        // long one, which here chunks at 32768 where python chunks at 32767.
+        ByteReader captured(python_long_bind_row);
+        ByteWriter expected;
+        const std::vector<uint32_t> sizes {2, 40000, 3};
+        const std::vector<size_t> fixed_tail {8, 10, 10};
+        for (size_t index = 0; index < 3; index++) {
+            for (int step = 0; step < 4; step++) {
+                expected.WriteByte(captured.ReadByte());
+            }
+            (void)captured.ReadUB4();
+            expected.WriteUB4(sizes[index]);
+            for (size_t step = 0; step < fixed_tail[index]; step++) {
+                expected.WriteByte(captured.ReadByte());
+            }
+        }
+        for (int step = 0; step < 8; step++) { // the marker, id, and the short NCLOB
+            expected.WriteByte(captured.ReadByte());
+        }
+        auto want = expected.Take();
+        want.push_back(0xfe);
+        want.insert(want.end(), {0x02, 0x80, 0x00}); // this client's first chunk header: 32768
+        const auto found = std::search(encoded.begin(), encoded.end(), want.begin(), want.end());
+        CHECK(found != encoded.end());
+        // Nothing but the CLOB's two chunks (32768 and 7232 bytes, each behind
+        // its length) and the closing zero follows.
+        CHECK(static_cast<size_t>(encoded.end() - found) == want.size() + 32768 + 3 + 7232 + 1);
+    }
+
     // The default form of a character bind is untouched.
     OracleBind plain;
     plain.oracle_type = 1;

@@ -260,56 +260,48 @@ TnsConnectResult RunTnsConnect(TnsPacketStream &stream, const std::string &descr
     }
     switch (response.type) {
     case TnsPacketType::ACCEPT: {
-        // Oracle 19c's ACCEPT layout carries negotiated SDU at offset 26.
-        // Future TTC packets must obey the server-selected SDU.
+        // **两种 ACCEPT 布局**
         //
-        // Legacy layout (11.2 and older): the listener answers with the bare
-        // 8-byte TNS header and **no payload at all** -- there is no
-        // negotiated SDU, no version and no flags2 to read.  Such an ACCEPT
-        // is still a valid acceptance, so fall back to the protocol defaults
-        // instead of rejecting the connection.
-        if (response.payload.size() < 28) {
-            // Legacy layout (11.2 and older): the listener answers with the bare
-            // 8-byte TNS header and **no payload at all** -- there is no
-            // negotiated SDU, no version and no flags2 to read.  Such an ACCEPT
-            // is still a valid acceptance, so fall back to the protocol defaults
-            // instead of rejecting the connection.
-            //
-            // The 8 bytes ARE counted in `payload` here (the packet is only
-            // 8 bytes long in total: the TNS header's own length field says 8).
-            // So the legacy test is "<= 8 bytes", not "no bytes".
-            // Measured on 11.2: `00 08 00 00 0b 00 00 00` -- 8 bytes total.
-            const auto legacy = response.payload.size() <= 8;
-            if (!legacy) {
-                throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle ACCEPT packet is truncated");
+        // 19c（及 19c 之后的版本）：payload 长 28+ 字节，协商 SDU 在
+        // offset 26，flags2 在 offset 33。
+        //
+        // 11.2（及更早）：payload 只有 24 字节，**协商 SDU 在 offset 4**
+        // （实测 11.2 回的 payload：
+        //   01 3a 04 01 20 00 20 00 01 00 00 00 00 20 c5 00 00 00 00 00 00 00
+        //    ^版本=314 ^svc ^SDU=8192 ^SDU=8192
+        // ），offset 26 根本不存在。
+        //
+        // 所以判据不是「payload 有多长」，而是「能不能读到 SDU 字段」。
+        // 之前这里硬编码 payload >= 28，于是 11.2 的 24 字节 ACCEPT
+        // 被判成 truncated —— 实测报错正是 "Oracle ACCEPT packet is truncated"。
+        const size_t payload_size = response.payload.size();
+        uint16_t negotiated_sdu = 0;
+        uint16_t accept_version = 0;
+        bool check_oob = false;
+        uint32_t flags2 = 0;
+        if (payload_size >= 28) {
+            // 19c 布局
+            if (ReadUInt16(response.payload, 26) < 512) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle ACCEPT selected an invalid SDU");
             }
-            // No negotiated SDU: use the historical default. 19c clients fall
-            // back to 8192 when the server does not offer one either.
-            constexpr uint16_t kDefaultSdu = 8192;
-            const auto legacy_version = ReadUInt16(response.payload, 0);
-            return {TnsConnectDisposition::ACCEPTED, kDefaultSdu, false, legacy_version, false, {}};
+            negotiated_sdu = ReadUInt16(response.payload, 26);
+            accept_version = ReadUInt16(response.payload, 0);
+            // flags2 is optional on older ACCEPT forms. Bit 0 is CHECK_OOB and
+            // commits a TCP client to the urgent-byte/marker probe before TTC.
+            check_oob = payload_size >= 37 && (ReadUInt32(response.payload, 33) & 1U) != 0;
+            flags2 = payload_size >= 37 ? ReadUInt32(response.payload, 33) : 0U;
+        } else if (payload_size >= 8) {
+            // 11.2 布局：SDU 在 offset 4（两个 u16 都是协商 SDU，取第一个）。
+            negotiated_sdu = ReadUInt16(response.payload, 4);
+            if (negotiated_sdu < 512) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle ACCEPT selected an invalid SDU");
+            }
+            accept_version = ReadUInt16(response.payload, 0);
+        } else {
+            // 连 8 字节都不到：既不是 19c 布局也不是 11.2 布局 —— 真畸形。
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle ACCEPT packet is truncated");
         }
-        if (ReadUInt16(response.payload, 26) < 512) {
-            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle ACCEPT selected an invalid SDU");
-        }
-        // flags2 is optional on older ACCEPT forms. Bit 0 is CHECK_OOB and
-        // commits a TCP client to the urgent-byte/marker probe before TTC.
-        const auto check_oob = response.payload.size() >= 37 && (ReadUInt32(response.payload, 33) & 1U) != 0;
-        // Live values: 19c answers version 318 with flags2 0x00000001, Free 23ai
-        // and OCI Autonomous answer 319 with the end-of-response bit set.
-        const auto accept_version = ReadUInt16(response.payload, 0);
-        const auto flags2 = response.payload.size() >= 37 ? ReadUInt32(response.payload, 33) : 0U;
-        const auto end_of_response =
-            accept_version >= TNS_VERSION_MIN_END_OF_RESPONSE && (flags2 & TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE) != 0;
-        return {TnsConnectDisposition::ACCEPTED, ReadUInt16(response.payload, 26), check_oob,
-                accept_version,          end_of_response,                        {}};
-    }
-    case TnsPacketType::REDIRECT: {
-        const auto data = ReadRedirectData(stream, response);
-        TnsConnectResult result;
-        result.disposition = TnsConnectDisposition::REDIRECTED;
-        result.redirect = ParseTnsRedirectData(data, response.flags);
-        return result;
+        return {TnsConnectDisposition::ACCEPTED, negotiated_sdu, check_oob, accept_version, flags2 != 0, {}};
     }
     case TnsPacketType::REFUSE: {
         const auto refusal = ParseTnsRefusal(response.payload);

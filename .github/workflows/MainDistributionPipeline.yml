@@ -67,17 +67,24 @@ jobs:
       # whose only failures here have been its own strictness, with no user on
       # the other side of them. 132 of the 319 published community extensions
       # exclude it, so this is the ordinary choice rather than a retreat.
-      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
-      # 只构建本项目真正需要的平台。
+      # 只构建本项目真正需要的平台：windows_amd64（MSVC）。
       #
       # 这个仓库的产物是给 data-manager 平台的 DuckDB 联邦引擎用的，
-      # 那台机器是 Windows x64 —— 别的平台（linux/osx/arm）没有人下载，
+      # 那台机器是 Windows x64。别的平台（linux/osx/arm）没有人下载，
       # 却各要占一次矩阵构建的分钟数和时间。
       #
-      # opt_in_archs 是 ci-tools v2.0-cyanoptera 提供的显式白名单：
-      # 只构建列出的架构，exclude_archs 仍然生效（排除优先于选择）。
+      # **为什么用 exclude 而不是 opt_in**：
+      # ci-tools 的 `opt_in_archs` 不是白名单，而是「把 matrix.json 里
+      # 标了 opt_in 的 arch 额外放进来」——默认集（opt_in=false）照样全跑。
+      # 查 scripts/extbuild/internal/distmatrix/matrix.go 的 includeEntry：
+      #     if entry.OptIn { return arch 在 optInSet 里 }
+      #     if reducedCI && !entry.RunInReducedCIMode { return false }
+      #     return true
+      # 所以要真的只留一个平台，只能把其余全列进 exclude。
+      #
+      # 排除清单覆盖 ci-tools config/distribution_matrix.json 的全部 arch。
       # 要恢复全平台构建，把这一行删掉即可。
-      opt_in_archs: 'windows_amd64'
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_arm64;linux_amd64;linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64'
 
   # clang-tidy over this project's own sources. Not the reusable code-quality
   # workflow: its tidy target filters translation units with the regex

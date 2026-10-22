@@ -301,7 +301,21 @@ TnsConnectResult RunTnsConnect(TnsPacketStream &stream, const std::string &descr
             // 连 8 字节都不到：既不是 19c 布局也不是 11.2 布局 —— 真畸形。
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle ACCEPT packet is truncated");
         }
-        return {TnsConnectDisposition::ACCEPTED, negotiated_sdu, check_oob, accept_version, flags2 != 0, {}};
+        // Live values: 19c answers version 318 with flags2 0x00000001, Free 23ai
+        // and OCI Autonomous answer 319 with the end-of-response bit set.
+        // The flag only means end-of-response when the version is new enough
+        // to define it -- an old version that happens to carry a non-zero
+        // flags2 must not be read as promising the transport-level marker.
+        const auto end_of_response =
+            accept_version >= TNS_VERSION_MIN_END_OF_RESPONSE && (flags2 & TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE) != 0;
+        return {TnsConnectDisposition::ACCEPTED, negotiated_sdu, check_oob, accept_version, end_of_response, {}};
+    }
+    case TnsPacketType::REDIRECT: {
+        const auto data = ReadRedirectData(stream, response);
+        TnsConnectResult result;
+        result.disposition = TnsConnectDisposition::REDIRECTED;
+        result.redirect = ParseTnsRedirectData(data, response.flags);
+        return result;
     }
     case TnsPacketType::REFUSE: {
         const auto refusal = ParseTnsRefusal(response.payload);

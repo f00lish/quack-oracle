@@ -546,6 +546,36 @@ static void TestConnectHandshake() {
     auto result = RunTnsConnect(accepted_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))");
     CHECK(result.disposition == TnsConnectDisposition::ACCEPTED && result.negotiated_sdu == 8192 && result.check_oob);
 
+    const auto first_packet_length = ReadUInt16(accepted.output, 0);
+    CHECK(DecodeTnsPacket(std::vector<uint8_t>(accepted.output.begin(), accepted.output.begin() + first_packet_length), false).type ==
+           TnsPacketType::CONNECT);
+    CHECK(accepted.output.size() > first_packet_length);
+    CHECK(DecodeTnsPacket(std::vector<uint8_t>(accepted.output.begin() + first_packet_length,
+                                                accepted.output.begin() + 2 * first_packet_length), false)
+               .type == TnsPacketType::CONNECT);
+
+    // REDIRECT data is a UB2 length and then that many bytes. The redirect is
+    // only split here, not parsed: "(DESCRIPTION=(A))" is enough.
+    FragmentedStream redirected(EncodeTnsPacket(TnsPacketType::REDIRECT, 0,
+                                                {0x00, 0x11, '(', 'D', 'E', 'S', 'C', 'R', 'I', 'P', 'T', 'I', 'O',
+                                                 'N', '=', '(', 'A', ')', ')'}, false));
+    TnsPacketStream redirected_packets(redirected, false);
+    result = RunTnsConnect(redirected_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))");
+    CHECK(result.disposition == TnsConnectDisposition::REDIRECTED);
+    CHECK(result.redirect.address == "(DESCRIPTION=(A))" && result.redirect.reconnect_data.empty());
+
+    // The parser this replaced skipped forward to the first '(' and so read
+    // these two junk bytes as a harmless prefix. Read as what they are — a
+    // length of 0x7878 — they declare far more than the listener sends, and the
+    // connect waits for the rest rather than searching past them.
+    FragmentedStream prefixed(EncodeTnsPacket(TnsPacketType::REDIRECT, 0,
+                                              {'x', 'x', '(', 'D', 'E', 'S', 'C', 'R', 'I', 'P', 'T', 'I', 'O',
+                                               'N', '=', '(', 'A', ')', ')'}, false));
+    TnsPacketStream prefixed_packets(prefixed, false);
+    ExpectError(ProtocolErrorKind::TRUNCATED,
+                [&] { RunTnsConnect(prefixed_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))"); });
+
+
     // **11.2 and older ACCEPT layout.**
     //
     // 11.2 answers with a 24-byte ACCEPT payload whose negotiated SDU sits at
@@ -578,40 +608,13 @@ static void TestConnectHandshake() {
     TnsPacketStream tiny_packets(tiny_stream, false);
     ExpectError(ProtocolErrorKind::TRUNCATED,
                 [&] { RunTnsConnect(tiny_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))"); });
-    const auto first_packet_length = ReadUInt16(accepted.output, 0);
-    CHECK(DecodeTnsPacket(std::vector<uint8_t>(accepted.output.begin(), accepted.output.begin() + first_packet_length), false).type ==
-           TnsPacketType::CONNECT);
-    CHECK(accepted.output.size() > first_packet_length);
-    CHECK(DecodeTnsPacket(std::vector<uint8_t>(accepted.output.begin() + first_packet_length,
-                                                accepted.output.begin() + 2 * first_packet_length), false)
-               .type == TnsPacketType::CONNECT);
-
-    // REDIRECT data is a UB2 length and then that many bytes. The redirect is
-    // only split here, not parsed: "(DESCRIPTION=(A))" is enough.
-    FragmentedStream redirected(EncodeTnsPacket(TnsPacketType::REDIRECT, 0,
-                                                {0x00, 0x11, '(', 'D', 'E', 'S', 'C', 'R', 'I', 'P', 'T', 'I', 'O',
-                                                 'N', '=', '(', 'A', ')', ')'}, false));
-    TnsPacketStream redirected_packets(redirected, false);
-    result = RunTnsConnect(redirected_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))");
-    CHECK(result.disposition == TnsConnectDisposition::REDIRECTED);
-    CHECK(result.redirect.address == "(DESCRIPTION=(A))" && result.redirect.reconnect_data.empty());
-
-    // The parser this replaced skipped forward to the first '(' and so read
-    // these two junk bytes as a harmless prefix. Read as what they are — a
-    // length of 0x7878 — they declare far more than the listener sends, and the
-    // connect waits for the rest rather than searching past them.
-    FragmentedStream prefixed(EncodeTnsPacket(TnsPacketType::REDIRECT, 0,
-                                              {'x', 'x', '(', 'D', 'E', 'S', 'C', 'R', 'I', 'P', 'T', 'I', 'O',
-                                               'N', '=', '(', 'A', ')', ')'}, false));
-    TnsPacketStream prefixed_packets(prefixed, false);
-    ExpectError(ProtocolErrorKind::TRUNCATED,
-                [&] { RunTnsConnect(prefixed_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))"); });
 
     FragmentedStream refused(EncodeTnsPacket(TnsPacketType::REFUSE, 0, {}, false));
     TnsPacketStream refused_packets(refused, false);
     ExpectError(ProtocolErrorKind::INVALID_STATE,
                 [&] { RunTnsConnect(refused_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))"); });
 }
+
 
 static void TestTtcChannel() {
     const std::vector<uint8_t> message {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};

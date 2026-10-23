@@ -460,6 +460,23 @@ columns. Text comparisons are mostly refused because Oracle's collation and its
 blank-padded `CHAR` comparison depend on session settings this client does not
 negotiate.
 
+**Joins.** When an attached table is joined to something DuckDB reads itself — a
+Parquet file, a CSV, another database, a literal list — the keys the other side
+holds are sent to Oracle too, so
+`SELECT … FROM o.SALES s JOIN read_parquet('vip.parquet') v ON s.client_id = v.client_id`
+reads the 50 clients' rows (`WHERE "CLIENT_ID" IN (101, 205, …)`) and not the whole
+table. Few keys go as an `IN` list; more as the ranges of the key they fall in
+(`BETWEEN … OR …`, or the smallest and largest key), and a key range DuckDB
+describes only as a bloom filter is applied locally. It needs a numeric key and is
+only ever a narrowing: DuckDB still checks every row against the join.
+
+DuckDB can only choose that plan if it knows the Oracle table is the big side.
+It reads the table's row count from Oracle's optimizer statistics
+(`USER_TABLES.NUM_ROWS`), so a table that has never had statistics gathered looks
+tiny to it and may be built into the hash table instead of probed. Gather them
+(`BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'SALES'); END;` through
+`oracle_plsql`) for the tables you join.
+
 ---
 
 ## 5. Write data

@@ -155,6 +155,9 @@ struct OracleAttachedState {
     // leaves this empty rather than falling back to anything.
     mutable bool primary_keys_loaded = false;
     mutable std::unordered_map<std::string, std::vector<std::string>> primary_key_cache;
+    // NUM_ROWS from the optimizer statistics, for the tables that have any.
+    mutable bool row_estimates_loaded = false;
+    mutable std::unordered_map<std::string, uint64_t> row_estimates;
 
     void ConnectAndDiscoverSchema() {
         OracleMetadataLease session(transaction_pool, config, password);
@@ -620,6 +623,55 @@ struct OracleAttachedState {
         }
     }
 
+    // What Oracle's own statistics say the table holds (USER_TABLES.NUM_ROWS),
+    // read once for the whole schema. DuckDB plans joins from it: without an
+    // estimate it believes every attached table has one row, builds its hash
+    // table from the Oracle side, and cannot push a join's keys into the scan.
+    // It is an estimate (a table without statistics has none, and a stale one
+    // can be far off), so it only steers the plan and never a result. A failed
+    // read leaves the tables without estimates, as before.
+    std::optional<uint64_t> RowEstimate(const std::string &object_name) const {
+        std::lock_guard<std::mutex> lock(metadata_lock);
+        if (!row_estimates_loaded) {
+            row_estimates_loaded = true;
+            try {
+                OracleMetadataLease session(transaction_pool, config, password);
+                auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read table statistics", [&] {
+                    return session->Query("SELECT table_name, num_rows FROM " + View("tables") +
+                                              " WHERE num_rows IS NOT NULL" + OwnerCondition("owner", "AND"),
+                                          {});
+                });
+                for (;;) {
+                    const auto batch = TranslatingOracleErrors("Oracle ATTACH could not read table statistics",
+                                                               [&] { return cursor->Fetch(STANDARD_VECTOR_SIZE); });
+                    for (const auto &row : batch.rows) {
+                        if (row.size() < 2 || !row[0] || !row[1]) {
+                            continue;
+                        }
+                        try {
+                            const auto rows = std::stoull(oracle_scanner::DecodeOracleNumber(*row[1]));
+                            row_estimates[std::string(row[0]->begin(), row[0]->end())] = rows;
+                        } catch (const std::exception &) {
+                            continue;
+                        }
+                    }
+                    if (batch.exhausted) {
+                        break;
+                    }
+                }
+                cursor->Close();
+                session.Finish();
+            } catch (const std::exception &) {
+                row_estimates.clear();
+            }
+        }
+        const auto found = row_estimates.find(object_name);
+        if (found == row_estimates.end()) {
+            return std::nullopt;
+        }
+        return found->second;
+    }
+
     std::vector<std::string> PrimaryKeyColumns(const std::string &object_name) const {
         std::lock_guard<std::mutex> lock(metadata_lock);
         if (!primary_keys_loaded) {
@@ -711,6 +763,7 @@ struct OracleAttachedState {
         result->config = config;
         result->password = password;
         result->object_name = object_name;
+        result->estimated_rows = RowEstimate(object_name);
         result->schema_name = owner;
         result->secret_name = secret_name;
         // The table entry's own columns: they carry the number mapping chosen when
@@ -737,6 +790,18 @@ optional_ptr<TableCatalogEntry> OracleAttachedScanTableEntry(optional_ptr<const 
         throw InternalException("an attached Oracle scan has no table entry");
     }
     return bind.table_entry;
+}
+
+// The estimate PrepareScan read from the dictionary, for the optimizer.
+unique_ptr<NodeStatistics> OracleAttachedScanCardinality(ClientContext &, const FunctionData *bind_data) {
+	if (!bind_data) {
+		return nullptr;
+	}
+	const auto &bind = bind_data->Cast<OracleQueryBindData>();
+	if (!bind.estimated_rows) {
+		return nullptr;
+	}
+	return make_uniq<NodeStatistics>(static_cast<idx_t>(*bind.estimated_rows));
 }
 
 class OracleAttachedTableEntry final : public TableCatalogEntry {
@@ -810,6 +875,7 @@ public:
         function.filter_pushdown =
             context.TryGetCurrentSetting("oracle_filter_pushdown", pushdown) && BooleanValue::Get(pushdown);
         function.projection_pushdown = true;
+        function.cardinality = OracleAttachedScanCardinality;
         return function;
     }
 

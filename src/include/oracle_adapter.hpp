@@ -209,6 +209,9 @@ struct OracleQueryBindData final : TableFunctionData {
     // and can be pushed into the Oracle select list instead of being applied
     // after fetching every column.
     bool deferred_scan = false;
+    //! NUM_ROWS from Oracle's statistics when the dictionary has it; the optimizer's
+    //! only idea of how large the table is.
+    std::optional<uint64_t> estimated_rows;
     // Predicates translated from the pushed-down filter set, empty when nothing
     // was pushed. Built at init, where the filters and the read columns are
     // both known.

@@ -1400,7 +1400,8 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
     conjunction->child_filters.push_back(constant(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1)));
     conjunction->child_filters.push_back(
         constant(duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(0)));
-    CHECK(translate(0, std::move(conjunction)) == "(\"ID\" = 1 AND \"ID\" > 0)");
+    // A top-level AND is taken a conjunct at a time, so the parentheses go.
+    CHECK(translate(0, std::move(conjunction)) == "\"ID\" = 1 AND \"ID\" > 0");
 }
 
 // oracle_execute_many builds one Oracle batch out of the supplied rows, runs it
@@ -2465,6 +2466,52 @@ void TestXmlTypeColumnsAreText() {
     database.Run("UPDATE o.main.DOCS SET BODY = '<c/>';");
     CHECK(script->counted_executes.back().find("\"BODY\" = XMLPARSE(DOCUMENT :1)") != std::string::npos);
     std::cout << "an XMLTYPE column reads and writes as text" << std::endl;
+}
+
+// With Oracle's row count the optimizer puts the attached table on the probe
+// side of a join, and the keys the other side holds reach Oracle: as an IN list
+// when they are few, as ranges of the key otherwise.
+void TestJoinKeysReachOracle() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    // The statistics query comes before the object listing, which matches the same view.
+    script->routes.push_back({"num_rows IS NOT NULL", {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)},
+                                                       {{Text("FACTS"), Number("5000000")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary, {{Text("FACTS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["FACTS"] = {{Column("ID", 2, 10, 0)}, {{Number("1000")}, {Number("1100")}, {Number("1200")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+
+    // Five keys: an IN list.
+    auto few = database.Query("SELECT count(*) FROM o.main.FACTS f JOIN (SELECT unnest([1000, 1100, 1200, 9999]) k) v "
+                              "ON f.ID = v.k;");
+    CHECK(!few->HasError() && few->GetValue(0, 0).ToString() == "3");
+    CHECK(script->queries.back().find("WHERE") != std::string::npos &&
+          script->queries.back().find("1000") != std::string::npos);
+    // Many keys: the ranges they fall in, and the answer is the same.
+    auto many = database.Query("SELECT count(*) FROM o.main.FACTS f JOIN (SELECT 1000 + i * 100 AS k FROM range(300) t(i)) v "
+                               "ON f.ID = v.k;");
+    CHECK(!many->HasError() && many->GetValue(0, 0).ToString() == "3");
+    CHECK(script->queries.back().find("WHERE") != std::string::npos &&
+          (script->queries.back().find("BETWEEN") != std::string::npos ||
+           script->queries.back().find("IN (") != std::string::npos));
+    std::cout << "a join's keys reach Oracle as a WHERE clause" << std::endl;
 }
 
 void TestCallableArgumentsOfTheNewTypes() {
@@ -4181,6 +4228,7 @@ int main() {
     TestUntranslatableFiltersRunLocally();
     TestJsonAndVectorColumnsThroughSql();
     TestXmlTypeColumnsAreText();
+    TestJoinKeysReachOracle();
     TestCallableArgumentsOfTheNewTypes();
     TestParallelScanShardsOneSnapshot();
     TestParallelScanRangesDoNotOverflow();

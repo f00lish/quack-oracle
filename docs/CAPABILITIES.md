@@ -471,6 +471,17 @@ comparisons and `LIKE` (Oracle's collation and blank-padded `CHAR` comparison
 depend on session settings this client does not negotiate), predicates across
 several columns, `ROWID`, an `IN` list with one unprovable member.
 
+**Join keys.** A join against a table DuckDB reads itself hands the scan the keys
+of its other side as optional filters. A filter that is an `AND` of conjuncts is
+read one conjunct at a time: an `IN` list or a range goes into the `WHERE`
+clause, a prefix-range filter (DuckDB's bitmap of the keys) is turned back into
+the key intervals it admits by asking it which ranges may hold a key — exactly,
+as `IN` lists of single keys and `BETWEEN` ranges, up to 2,048 intervals, and as
+a superset when there are more — and a bloom filter, which has no SQL form, is
+dropped. All of them are hints, so dropping or widening one never changes an
+answer. The choice of plan depends on the row count the catalog passes DuckDB,
+`USER_TABLES.NUM_ROWS`; a table without statistics has none.
+
 ---
 
 ## 6. Writing and transactions

@@ -25,6 +25,7 @@
 #include "duckdb/planner/table_filter_set.hpp"
 
 #include <cstdio>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -367,6 +368,187 @@ std::string TranslateExpression(const Expression &expression, const OracleColumn
     }
 }
 
+// A join's build side reaches a scan as a prefix-range filter: a bitmap over the
+// span of the keys, which cannot be written as SQL as it is but can be asked
+// whether any key lies in a range. Asking it that, and halving the ranges that
+// say yes, recovers the key ranges as intervals — exactly, when there are few
+// enough, and as a superset otherwise. A superset is all an optional filter
+// needs, and Oracle then reads only those ranges instead of the table.
+constexpr size_t MAX_KEY_INTERVALS = 2048;
+constexpr size_t MAX_RANGE_QUESTIONS = 16384;
+
+std::optional<std::string> PrefixRangeSql(const BoundFunctionExpression &function, const OracleColumn &column,
+                                          const std::string &quoted_name) {
+    if (function.Function().GetName() != PrefixRangeScalarFun::NAME || !function.BindInfo() ||
+        function.GetChildren().size() != 1 || function.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+        return std::nullopt;
+    }
+    const auto &data = function.BindInfo()->Cast<PrefixRangeFunctionData>();
+    if (!data.filter || !data.filter->IsInitialized()) {
+        return std::nullopt;
+    }
+    int64_t domain_low;
+    int64_t domain_high;
+    switch (data.key_type.id()) {
+    case LogicalTypeId::TINYINT:
+        domain_low = NumericLimits<int8_t>::Minimum();
+        domain_high = NumericLimits<int8_t>::Maximum();
+        break;
+    case LogicalTypeId::SMALLINT:
+        domain_low = NumericLimits<int16_t>::Minimum();
+        domain_high = NumericLimits<int16_t>::Maximum();
+        break;
+    case LogicalTypeId::INTEGER:
+        domain_low = NumericLimits<int32_t>::Minimum();
+        domain_high = NumericLimits<int32_t>::Maximum();
+        break;
+    case LogicalTypeId::BIGINT:
+        domain_low = NumericLimits<int64_t>::Minimum();
+        domain_high = NumericLimits<int64_t>::Maximum();
+        break;
+    default:
+        return std::nullopt;
+    }
+    size_t questions = 0;
+    const auto may_hold = [&](int64_t low, int64_t high) {
+        questions++;
+        return data.filter->LookupRange(Value::Numeric(data.key_type, low), Value::Numeric(data.key_type, high)) !=
+               FilterPropagateResult::FILTER_ALWAYS_FALSE;
+    };
+    if (!may_hold(domain_low, domain_high)) {
+        return std::nullopt;
+    }
+    // The smallest and the largest key: the first point from which every range
+    // up to the top (or down from the bottom) still holds one.
+    int64_t low = domain_low;
+    int64_t high = domain_high;
+    {
+        int64_t lo = domain_low;
+        int64_t hi = domain_high;
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo) / 2 + ((hi - lo) % 2);
+            if (may_hold(mid, domain_high)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        high = lo; // the largest x such that [x, top] holds a key is the largest key
+    }
+    {
+        int64_t lo = domain_low;
+        int64_t hi = domain_high;
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            if (may_hold(domain_low, mid)) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        low = lo;
+    }
+    std::vector<std::pair<int64_t, int64_t>> intervals {{low, high}};
+    for (;;) {
+        // One level: halve every interval that has more than one point, and
+        // keep the halves that may hold a key. Stop before the list outgrows
+        // what is worth sending, or when nothing is left to halve.
+        std::vector<std::pair<int64_t, int64_t>> next;
+        bool split_any = false;
+        bool over_budget = false;
+        for (const auto &interval : intervals) {
+            if (interval.first == interval.second) {
+                next.push_back(interval);
+                continue;
+            }
+            split_any = true;
+            const int64_t mid = interval.first + (interval.second - interval.first) / 2;
+            if (questions + 2 > MAX_RANGE_QUESTIONS) {
+                over_budget = true;
+                break;
+            }
+            if (may_hold(interval.first, mid)) {
+                next.emplace_back(interval.first, mid);
+            }
+            if (may_hold(mid + 1, interval.second)) {
+                next.emplace_back(mid + 1, interval.second);
+            }
+        }
+        if (over_budget || next.size() > MAX_KEY_INTERVALS) {
+            break;
+        }
+        intervals = std::move(next);
+        if (!split_any) {
+            break;
+        }
+    }
+    // Neighbours that touch are one range.
+    std::vector<std::pair<int64_t, int64_t>> merged;
+    for (const auto &interval : intervals) {
+        if (!merged.empty() && merged.back().second != NumericLimits<int64_t>::Maximum() &&
+            merged.back().second + 1 == interval.first) {
+            merged.back().second = interval.second;
+        } else {
+            merged.push_back(interval);
+        }
+    }
+    const auto literal = [&](int64_t value) { return OracleLiteral(Value::BIGINT(value), column); };
+    // Single keys go in IN lists, as many to a list as Oracle allows; runs of
+    // keys are BETWEEN ranges.
+    std::vector<std::string> terms;
+    std::string list;
+    size_t in_list_size = 0;
+    const auto flush_list = [&] {
+        if (in_list_size > 0) {
+            terms.push_back(quoted_name + (in_list_size == 1 ? " = " + list : " IN (" + list + ")"));
+        }
+        list.clear();
+        in_list_size = 0;
+    };
+    for (const auto &interval : merged) {
+        if (interval.first == interval.second) {
+            if (in_list_size == MAX_IN_LIST_VALUES) {
+                flush_list();
+            }
+            list += (in_list_size == 0 ? "" : ", ") + literal(interval.first);
+            in_list_size++;
+        } else {
+            terms.push_back(quoted_name + " BETWEEN " + literal(interval.first) + " AND " + literal(interval.second));
+        }
+    }
+    flush_list();
+    std::string sql;
+    for (const auto &term : terms) {
+        sql += (sql.empty() ? "" : " OR ") + term;
+    }
+    return terms.size() == 1 ? sql : "(" + sql + ")";
+}
+
+// One conjunct of a filter, translated, or nothing when it is an optional hint
+// that could not be. A required conjunct that cannot be translated refuses.
+std::optional<std::string> TranslatePiece(const Expression &expression, const OracleColumn &column,
+                                          const std::string &quoted_name) {
+    if (!IsOptionalWrapper(expression)) {
+        return TranslateExpression(expression, column, quoted_name);
+    }
+    const auto *child = OptionalChild(expression);
+    if (!child) {
+        return std::nullopt;
+    }
+    if (child->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+        if (const auto ranges = PrefixRangeSql(child->Cast<BoundFunctionExpression>(), column, quoted_name)) {
+            return ranges;
+        }
+    }
+    try {
+        return TranslateExpression(*child, column, quoted_name);
+    } catch (const NotImplementedException &) {
+        // DuckDB does not need this one, so not sending it is correct rather
+        // than merely convenient.
+        return std::nullopt;
+    }
+}
+
 // Returns the translated predicate, or nothing when the filter is optional and
 // could not be translated. An optional filter is a hint DuckDB does not rely on
 // for correctness, so dropping one is allowed where dropping a required filter
@@ -379,21 +561,7 @@ std::optional<std::string> TranslateOptional(const TableFilter &filter, const Or
         Refuse("a filter that is not an expression (kind " + std::to_string(static_cast<int>(filter.filter_type)) +
                ")");
     }
-    const auto &expression = *filter.Cast<ExpressionFilter>().expr;
-    if (!IsOptionalWrapper(expression)) {
-        return TranslateExpression(expression, column, quoted_name);
-    }
-    const auto *child = OptionalChild(expression);
-    if (!child) {
-        return std::nullopt;
-    }
-    try {
-        return TranslateExpression(*child, column, quoted_name);
-    } catch (const NotImplementedException &) {
-        // DuckDB does not need this one, so not sending it is correct rather
-        // than merely convenient.
-        return std::nullopt;
-    }
+    return TranslatePiece(*filter.Cast<ExpressionFilter>().expr, column, quoted_name);
 }
 
 } // namespace
@@ -404,8 +572,9 @@ namespace {
 // are not sent to Oracle. The filter was written over a placeholder column
 // (index 0), or for a multi-column filter over indexes that column_indexes maps
 // to the scan's projection; either way they become positions in the output.
-unique_ptr<Expression> LocalExpression(const ExpressionFilter &filter, bool multi_column, idx_t projection) {
-    auto expression = filter.expr->Copy();
+unique_ptr<Expression> LocalExpression(const ExpressionFilter &filter, const Expression &source, bool multi_column,
+                                       idx_t projection) {
+    auto expression = source.Copy();
     ExpressionIterator::EnumerateExpression(expression, [&](unique_ptr<Expression> &node) {
         if (node->GetExpressionClass() != ExpressionClass::BOUND_REF) {
             return;
@@ -430,7 +599,8 @@ OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::v
         if (filter->filter_type != TableFilterType::EXPRESSION_FILTER) {
             Refuse("a filter that is not an expression");
         }
-        result.local.push_back(LocalExpression(filter->Cast<ExpressionFilter>(), true, 0));
+        result.local.push_back(
+            LocalExpression(filter->Cast<ExpressionFilter>(), *filter->Cast<ExpressionFilter>().expr, true, 0));
     }
     for (const auto &entry : filters) {
         const auto projection = entry.GetIndex().GetIndex();
@@ -439,39 +609,57 @@ OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::v
         }
         const auto column_index = scanned_columns[projection];
         const auto &filter = entry.Filter();
-        std::optional<std::string> translated;
-        bool local = false;
-        if (column_index >= columns.size()) {
-            local = true; // the ROWID pseudo-column
-        } else {
-            const auto &column = columns[column_index];
-            // A column this client cannot read cannot be reasoned about either.
-            RequireReadableColumn(column);
-            const auto quoted_name = KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
-            try {
-                translated = TranslateOptional(filter, column, quoted_name);
-            } catch (const NotImplementedException &) {
-                local = true;
+        if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+            Refuse("a filter that is not an expression");
+        }
+        const auto &expression_filter = filter.Cast<ExpressionFilter>();
+        // A filter that is an AND of conjuncts is taken one conjunct at a time.
+        // A join hands the scan its key range, an IN list and a bloom filter
+        // that way, all optional: the ones Oracle can be sent go, the rest are
+        // dropped, and a required conjunct that cannot be sent is evaluated here.
+        std::vector<const Expression *> pieces;
+        std::function<void(const Expression &)> flatten = [&](const Expression &expression) {
+            if (expression.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+                expression.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+                for (const auto &child : expression.Cast<BoundConjunctionExpression>().GetChildren()) {
+                    flatten(*child);
+                }
+            } else {
+                pieces.push_back(&expression);
             }
-        }
-        if (local) {
-            if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
-                Refuse("a filter that is not an expression");
+        };
+        flatten(*expression_filter.expr);
+        for (const auto *piece : pieces) {
+            std::optional<std::string> translated;
+            bool local = false;
+            if (column_index >= columns.size()) {
+                local = true; // the ROWID pseudo-column
+            } else {
+                const auto &column = columns[column_index];
+                // A column this client cannot read cannot be reasoned about either.
+                RequireReadableColumn(column);
+                const auto quoted_name = KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
+                try {
+                    translated = TranslatePiece(*piece, column, quoted_name);
+                } catch (const NotImplementedException &) {
+                    local = true;
+                }
             }
-            const auto &expression_filter = filter.Cast<ExpressionFilter>();
-            // An optional filter is a hint DuckDB does not rely on.
-            if (!IsOptionalWrapper(*expression_filter.expr)) {
-                result.local.push_back(LocalExpression(expression_filter, false, projection));
+            if (local) {
+                // An optional filter is a hint DuckDB does not rely on.
+                if (!IsOptionalWrapper(*piece)) {
+                    result.local.push_back(LocalExpression(expression_filter, *piece, false, projection));
+                }
+                continue;
             }
-            continue;
+            if (!translated) {
+                continue;
+            }
+            if (!result.where.empty()) {
+                result.where += " AND ";
+            }
+            result.where += *translated;
         }
-        if (!translated) {
-            continue;
-        }
-        if (!result.where.empty()) {
-            result.where += " AND ";
-        }
-        result.where += *translated;
     }
     return result;
 }

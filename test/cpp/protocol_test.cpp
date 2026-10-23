@@ -4109,9 +4109,13 @@ static void TestReconnectCarriesTheRedirectFlag() {
     auto packets = BuildTnsConnectPackets("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))", options);
     CHECK(packets.size() == 1 && packets[0].flags == TNS_PACKET_FLAG_REDIRECT);
     CHECK(EncodeTnsPacket(packets[0].type, packets[0].flags, packets[0].payload, false)[5] == 0x04);
-    // Long connect data: only the CONNECT carries the flag, as in both
-    // references; its DATA continuation does not.
+    // Connect data that still fits travels inside the CONNECT packet, so the
+    // flag rides on that one packet.
     packets = BuildTnsConnectPackets(std::string(300, 'x'), options);
+    CHECK(packets.size() == 1 && packets[0].flags == TNS_PACKET_FLAG_REDIRECT);
+    // Past the inline limit the descriptor moves to a DATA continuation, and
+    // only the CONNECT carries the flag, as in both references.
+    packets = BuildTnsConnectPackets(std::string(2049, 'x'), options);
     CHECK(packets.size() == 2 && packets[0].flags == TNS_PACKET_FLAG_REDIRECT && packets[1].flags == 0);
     CHECK(BuildTnsConnectPackets("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))")[0].flags == 0);
 }

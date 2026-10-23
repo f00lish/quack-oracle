@@ -2854,6 +2854,16 @@ void TestDsnSecretReachesTheSession() {
             "DSN cannot be combined with TNS_ALIAS or CONNECT_DESCRIPTOR");
     refused("DSN 'folder_db'", "names an alias, which needs CONFIG_DIR");
     refused("DSN 'a.example/svc', CONFIG_DIR '" + folder + "'", "CONFIG_DIR is only used to look up");
+    // TNS_ADMIN is where an alias is looked up when nothing else says, and
+    // CONFIG_DIR still wins over it.
+    CHECK(setenv("TNS_ADMIN", folder.c_str(), 1) == 0);
+    CHECK(!query("DSN 'folder_db'")->HasError());
+    CHECK(configs->back().service_name == "folder.example");
+    CHECK(!query("TNS_ALIAS 'folder_db'")->HasError());
+    CHECK(setenv("TNS_ADMIN", "/nonexistent_oracle_scanner_dir", 1) == 0);
+    CHECK(!query("DSN 'folder_db', CONFIG_DIR '" + folder + "'")->HasError());
+    refused("DSN 'folder_db'", "could not be resolved");
+    CHECK(unsetenv("TNS_ADMIN") == 0);
     refused("DSN 'missing_alias', CONFIG_DIR '" + folder + "'", "DSN could not be resolved");
     refused("DSN 'a.example:1521'", "DSN could not be resolved");
     refused("DSN 'a.example/svc?https_proxy=p'", "is not supported");

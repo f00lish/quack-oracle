@@ -97,8 +97,8 @@ ideographs — are untested, since none of the character sets above can hold one
 ### Secrets
 
 A connection is a DuckDB secret. The `DSN` field takes the same strings as
-python-oracledb's `dsn`; there is no `TNS_ADMIN` lookup, so a `tnsnames.ora`
-outside a wallet is named explicitly with `CONFIG_DIR`.
+python-oracledb's `dsn`. An alias is looked up in `CONFIG_DIR`, else in the
+wallet, else in the folder the `TNS_ADMIN` environment variable names.
 
 ```sql
 CREATE SECRET ora (

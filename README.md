@@ -294,7 +294,7 @@ that would promise otherwise are refused by name rather than ignored:
 | `PROTOCOL` | `tcp` (the default) or `tcps` for TLS |
 | `DSN` | One string in python-oracledb's forms: an Easy Connect string (`tcps://host:2484/service?retry_count=3`), a full `(DESCRIPTION=...)`, or an alias name. Use *instead of* HOST/PORT/SERVICE_NAME. See [CAPABILITIES](docs/CAPABILITIES.md) for the Easy Connect parameters |
 | `TNS_ALIAS` | An alias from the `tnsnames.ora` in `CONFIG_DIR`, or else inside the wallet — use *instead of* HOST/PORT/SERVICE_NAME |
-| `CONFIG_DIR` | A folder holding `tnsnames.ora` (or that file) for `TNS_ALIAS`, or for an alias given as `DSN` |
+| `CONFIG_DIR` | A folder holding `tnsnames.ora` (or that file) for `TNS_ALIAS`, or for an alias given as `DSN`. Without it, the wallet, then the `TNS_ADMIN` environment variable |
 | `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` given inline — use *instead of* HOST/PORT/SERVICE_NAME and TNS_ALIAS. See [Several addresses and listener redirects](#several-addresses-and-listener-redirects) |
 | `WALLET_FILE` | A cloud wallet ZIP, an unpacked wallet folder, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |
 | `WALLET_PASSWORD` | The password the wallet's encrypted `ewallet.pem` is locked with. Not needed when the wallet carries `cwallet.sso` — every wallet OCI hands out does |

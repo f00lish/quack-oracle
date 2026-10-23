@@ -2,6 +2,7 @@
 // the endpoint, TLS, and wallet field combinations validated before any
 // transport work.
 
+#include <cstdlib>
 #include "oracle_adapter.hpp"
 #include "oracle_io_deadline.hpp"
 
@@ -119,9 +120,13 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
         if (names_host) {
             throw BinderException("Oracle %s cannot be combined with HOST, PORT, or SERVICE_NAME", descriptor_source);
         }
-        if (!alias.empty() && wallet_pem_file.empty() && config_dir.empty()) {
-            throw BinderException("Oracle %s names an alias, which needs CONFIG_DIR (a folder or tnsnames.ora) or "
-                                  "WALLET_FILE to look it up in",
+        // As in python-oracledb, the TNS_ADMIN environment variable is where an
+        // alias is looked up when neither CONFIG_DIR nor a wallet says otherwise.
+        const char *tns_admin_env = std::getenv("TNS_ADMIN");
+        const std::string tns_admin = tns_admin_env ? tns_admin_env : "";
+        if (!alias.empty() && wallet_pem_file.empty() && config_dir.empty() && tns_admin.empty()) {
+            throw BinderException("Oracle %s names an alias, which needs CONFIG_DIR (a folder or tnsnames.ora), "
+                                  "WALLET_FILE or the TNS_ADMIN environment variable to look it up in",
                                   descriptor_source);
         }
         try {
@@ -130,7 +135,9 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
                 // tnsnames.ora comes from CONFIG_DIR when given, as in
                 // python-oracledb, and otherwise from the wallet.
                 descriptor = oracle_scanner::FindTnsAliasDescriptor(
-                    oracle_scanner::ReadTnsNamesSource(config_dir.empty() ? wallet_pem_file : config_dir), alias);
+                    oracle_scanner::ReadTnsNamesSource(!config_dir.empty() ? config_dir
+                                                       : (!wallet_pem_file.empty() ? wallet_pem_file : tns_admin)),
+                    alias);
             } else if (dsn_is_descriptor) {
                 descriptor = dsn;
             } else if (dsn_is_easy_connect) {

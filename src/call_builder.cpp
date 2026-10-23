@@ -267,7 +267,16 @@ std::string BuildOracleCallBlock(const OracleCallRequest &request) {
     if (request.kind != OracleCallableKind::DML_COMPOSITE && !request.dml_operations.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle callable request must not carry DML statements");
     }
+    if (request.kind != OracleCallableKind::ANONYMOUS_BLOCK && !request.block.empty()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle callable request must not carry a PL/SQL block");
+    }
     switch (request.kind) {
+    case OracleCallableKind::ANONYMOUS_BLOCK:
+        if (!request.qualified_name.empty() || request.return_bind.has_value()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                "Oracle anonymous block request must not name a callable or a return bind");
+        }
+        return NormalizeOracleAnonymousBlock(request.block);
     case OracleCallableKind::DML_COMPOSITE:
         if (!request.qualified_name.empty() || request.return_bind.has_value()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED,

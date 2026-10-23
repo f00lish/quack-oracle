@@ -112,7 +112,7 @@ struct OracleCallResult {
 // DML_COMPOSITE is not a stored callable: it is a bounded sequence of
 // validated INSERT, UPDATE and DELETE statements run as one anonymous block,
 // each followed by a server-side check of its exact row count.
-enum class OracleCallableKind { PROCEDURE, FUNCTION, DML_COMPOSITE };
+enum class OracleCallableKind { PROCEDURE, FUNCTION, DML_COMPOSITE, ANONYMOUS_BLOCK };
 
 // One statement of a DML_COMPOSITE request and the SQL%ROWCOUNT it must report.
 struct OracleDmlOperation {
@@ -128,6 +128,11 @@ struct OracleCallRequest {
     // DML_COMPOSITE only. The arguments are then the binds of every statement,
     // each name once, however many statements use it.
     std::vector<OracleDmlOperation> dml_operations;
+    // ANONYMOUS_BLOCK only: a BEGIN ... END; or DECLARE ... BEGIN ... END; block
+    // the caller wrote. The arguments are its binds, each by the name its
+    // placeholder uses; the OUT and IN OUT ones come back in the order the
+    // block first mentions them.
+    std::string block;
 };
 
 class OracleSession {

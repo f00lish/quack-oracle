@@ -142,6 +142,34 @@ void ValidateOracleDml(const std::string &sql, const std::vector<OracleBind> &bi
     ValidateOracleStatementBinds(sql, binds, OracleBindUse::DML);
 }
 
+std::string NormalizeOracleAnonymousBlock(const std::string &block) {
+    const auto keyword = FirstKeyword(block);
+    if (keyword != "BEGIN" && keyword != "DECLARE") {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "an anonymous PL/SQL block begins with BEGIN or DECLARE");
+    }
+    auto text = block;
+    const auto trim = [&text] {
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+            text.pop_back();
+        }
+    };
+    trim();
+    if (!text.empty() && text.back() == '/') {
+        const auto line_start = text.find_last_of("\r\n");
+        if (line_start != std::string::npos) {
+            const auto line = text.substr(line_start + 1);
+            if (line == "/") {
+                text.erase(line_start);
+                trim();
+            }
+        }
+    }
+    if (text.empty() || text.back() != ';') {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "an anonymous PL/SQL block ends with the ; after its last END");
+    }
+    return text;
+}
+
 void ValidateOracleAdmin(const std::string &sql) {
     RejectStatementTerminators(sql);
     const auto keyword = FirstKeyword(sql);

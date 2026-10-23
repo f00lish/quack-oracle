@@ -205,12 +205,10 @@ And, in **all** cases:
 
 The consequences are concrete and worth stating plainly:
 
-- **Anonymous PL/SQL blocks cannot be run at all.** `BEGIN … END;` fails twice
-  over: `BEGIN` is not an accepted first keyword for either function, and the
-  `;` that PL/SQL itself requires is refused. There is no third function that
-  takes a block. `oracle_execute_composite_transaction` does send one, but a
-  block it builds itself from statements that each passed the DML gate, with
-  nothing of the caller's between them.
+- **Anonymous PL/SQL blocks have their own functions.** `BEGIN … END;` fails
+  in the query and DML functions twice over: `BEGIN` is not an accepted first
+  keyword there, and the `;` that PL/SQL itself requires is refused. `oracle_plsql`
+  and `oracle_plsql_transaction` (§7) take a block; nothing else does.
 - **DDL goes only through `oracle_execute_admin`.** The query and DML
   functions refuse `CREATE`, `DROP`, `ALTER` and `TRUNCATE`. `oracle_execute_admin`
   takes one such command, on a session of its own and never inside an explicit
@@ -230,8 +228,8 @@ SELECT * FROM oracle_call_auto('ora', 'DBMS_UTILITY.EXEC_DDL_STATEMENT',
 `DBMS_UTILITY.EXEC_DDL_STATEMENT` is an ordinary Oracle procedure taking one
 `VARCHAR2`, so it goes through the callable path (§7) and never touches the SQL
 gate. The DDL text it carries is not parsed here at all. The same trick runs
-anything expressible as a single procedure call; it does **not** give you
-anonymous blocks, because the argument is a statement, not a block.
+anything expressible as a single procedure call. For anything longer, or any
+DDL, run a block with `oracle_plsql` (§7), which can `EXECUTE IMMEDIATE` it.
 
 This is a real limitation, not a policy statement dressed up as one. It exists
 because the gate is a whitelist of shapes whose bind, describe, and fetch
@@ -579,6 +577,12 @@ transaction, so their work commits and rolls back with it:
   `VARCHAR` arguments, `IN`, `OUT` or `IN OUT`, NULL included. No cursors, LOBs
   or objects. The procedure must not commit, run DDL or use an autonomous
   transaction.
+- `oracle_plsql_transaction` — an anonymous PL/SQL block on the pinned session,
+  with up to 64 binds (the same `STRUCT(name, direction, type, value)` as
+  `oracle_call_named`), `IN`, `OUT` or `IN OUT`, returning one row per `OUT`
+  bind. No cursors. The block must not commit, run DDL or use an autonomous
+  transaction. The session ends closed rather than reused afterwards, because a
+  block can change its state.
 - `oracle_transaction_status` — the outcome of the current or last transaction
   (`commit_outcome`, `connection_state`, `oracle_error_code`,
   `protocol_error_kind`), read locally without opening a session. DuckDB drops
@@ -665,7 +669,7 @@ the attached catalog's transactions reuse sessions as §6 describes.
 
 ## 11. Not supported, in one list
 
-Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
+DDL except through `oracle_execute_admin`, `DBMS_UTILITY.EXEC_DDL_STATEMENT` or a PL/SQL block ·
 LOB values past 1 GiB · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
 `LONG` and `ROWID` · object, collection and record
 types · several schemas in one attachment ·

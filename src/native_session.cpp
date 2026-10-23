@@ -674,7 +674,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
             binds.push_back(*request.return_bind);
         }
         binds.insert(binds.end(), request.arguments.begin(), request.arguments.end());
-        if (request.kind == OracleCallableKind::DML_COMPOSITE) {
+        if (request.kind == OracleCallableKind::DML_COMPOSITE || request.kind == OracleCallableKind::ANONYMOUS_BLOCK) {
             // A procedure block names its binds in argument order; a composite
             // names them in whatever order its statements do, and PL/SQL binds
             // by first occurrence, so the values follow the block.

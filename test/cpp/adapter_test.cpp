@@ -3080,6 +3080,37 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
             CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "P_TEXT" &&
                   result.GetValue(1, 0).ToString() == "Quack.");
         }};
+    cases["oracle_plsql"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["greeting"] = Text("hello world");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::ANONYMOUS_BLOCK && call.qualified_name.empty());
+            CHECK(call.block.find("BEGIN :greeting := 'hello ' || :who; END;") == 0);
+            CHECK(call.arguments.size() == 2 && call.arguments[0].name == "greeting" &&
+                  call.arguments[0].direction == BindDirection::BIND_OUT && call.arguments[1].name == "who" &&
+                  Decoded(call.arguments[1].value) == "world");
+            CHECK(script.commits == 1);
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "greeting" &&
+                  result.GetValue(1, 0).ToString() == "hello world");
+        }};
+    cases["oracle_plsql_transaction"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            script.call_echo_outputs = true;
+            script.call_output_values["n"] = Number("2");
+        },
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::ANONYMOUS_BLOCK && call.block == "BEGIN :n := 1 + 1; END;");
+            CHECK(call.arguments.size() == 1 && call.arguments[0].name == "n");
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "n" &&
+                  result.GetValue(1, 0).ToString() == "2");
+        }};
     cases["oracle_execute"] = {[](FakeScript &script) { script.affected_rows = 1; },
                                {},
                                [](FakeScript &script, MaterializedQueryResult &result) {
@@ -3330,7 +3361,7 @@ void TestFunctionExamplesRun() {
     auto cases = FunctionExampleCases();
     // The same set on both sides: a function added without an executable
     // example, or a case left for a function that is gone, fails here.
-    CHECK(examples.size() == cases.size() && examples.size() == 29);
+    CHECK(examples.size() == cases.size() && examples.size() == 31);
     for (const auto &example : examples) {
         const auto found = cases.find(example.first);
         if (found == cases.end()) {
@@ -3398,7 +3429,7 @@ void TestFunctionExamplesRun() {
 // bare RegisterFunction overloads set. Loading the extension twice would not
 // show it — DuckDB may skip the second load — and registering the same
 // signature again fails under either mode, so the infos the extension
-// registers are inspected directly, all twenty-nine of them.
+// registers are inspected directly, all thirty-one of them.
 void TestDocumentedRegistrationsAlterOnConflict() {
     std::vector<std::string> names;
     const auto check = [&](const duckdb::CreateFunctionInfo &info, const duckdb::Identifier &name) {
@@ -3416,7 +3447,7 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     }
     const auto parallel = duckdb::OracleParallelScanFunctionInfo();
     check(parallel, parallel.functions.name);
-    CHECK(names.size() == 29);
+    CHECK(names.size() == 31);
 
     // And what that mode means on a database that already has the functions:
     // an extra overload under an existing name is added to it, where

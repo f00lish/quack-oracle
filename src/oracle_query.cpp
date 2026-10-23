@@ -1928,6 +1928,227 @@ void OracleTransactionCallFunction(ClientContext &, TableFunctionInput &input, D
     state.next_row += count;
 }
 
+// Anonymous PL/SQL blocks. The binds are the same STRUCT(name, direction, type,
+// value) oracle_call_named takes, matched to the block's `:name` placeholders
+// by name; the rows that come back are the OUT and IN OUT ones, in the order
+// the block first mentions them.
+std::vector<oracle_scanner::OracleBind> PlsqlArguments(TableFunctionBindInput &input, const char *function_name) {
+    if (input.inputs.size() < 3 || input.inputs[2].IsNull()) {
+        return {};
+    }
+    const auto &value = input.inputs[2];
+    if (value.type().id() == LogicalTypeId::LIST && ListValue::GetChildren(value).empty()) {
+        return {};
+    }
+    try {
+        return CallArguments(value);
+    } catch (const std::exception &error) {
+        throw BinderException("%s binds are invalid: %s", function_name, error.what());
+    }
+}
+
+// Validates the block and its binds together and returns the binds in the order
+// the block mentions them, which is the order the server returns the outputs in.
+std::vector<oracle_scanner::OracleBind> OrderedPlsqlArguments(const std::string &block,
+                                                              std::vector<oracle_scanner::OracleBind> arguments,
+                                                              const char *function_name) {
+    try {
+        oracle_scanner::OracleCallRequest request;
+        request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+        request.block = block;
+        request.arguments = arguments;
+        const auto normalized = oracle_scanner::BuildOracleCallBlock(request);
+        return oracle_scanner::OrderOracleStatementBinds(normalized, arguments, oracle_scanner::OracleBindUse::CALL);
+    } catch (const std::exception &error) {
+        throw BinderException("%s: %s", function_name, error.what());
+    }
+}
+
+struct OraclePlsqlBindData final : TableFunctionData {
+    ConnectionConfig config;
+    std::string password;
+    std::string block;
+    std::vector<oracle_scanner::OracleBind> arguments;
+};
+
+unique_ptr<FunctionData> OraclePlsqlBind(ClientContext &context, TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+        throw BinderException("oracle_plsql secret and block cannot be NULL");
+    }
+    auto result = make_uniq<OraclePlsqlBindData>();
+    result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
+    result->block = input.inputs[1].GetValue<std::string>();
+    result->arguments = OrderedPlsqlArguments(result->block, PlsqlArguments(input, "oracle_plsql"), "oracle_plsql");
+    names = {"name", "value", "cursor_handle"};
+    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OraclePlsqlInit(ClientContext &context, TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OraclePlsqlBindData>();
+    try {
+        auto session = std::shared_ptr<OracleSession>(OpenOracleSession(bind.config, bind.password));
+        oracle_scanner::OracleCallRequest request;
+        request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+        request.block = bind.block;
+        request.arguments = bind.arguments;
+        auto result = session->Call(request);
+        if (!result.implicit_cursors.empty()) {
+            for (auto &cursor : result.explicit_cursors) {
+                cursor->Close();
+            }
+            for (auto &cursor : result.implicit_cursors) {
+                cursor->Close();
+            }
+            throw BinderException("oracle_plsql does not return implicit result sets; bind a REF CURSOR instead");
+        }
+        std::vector<OracleCallNamedRow> rows;
+        std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
+        std::vector<idx_t> cursor_rows;
+        size_t scalar_index = 0;
+        size_t cursor_index = 0;
+        for (const auto &argument : bind.arguments) {
+            if (argument.direction == oracle_scanner::BindDirection::BIND_IN) {
+                continue;
+            }
+            OracleCallNamedRow row;
+            row.name = argument.name;
+            if (argument.oracle_type == oracle_scanner::ORACLE_WIRE_TYPE_CURSOR) {
+                if (cursor_index >= result.explicit_cursors.size()) {
+                    throw BinderException("oracle_plsql cursor output count disagrees with Oracle response");
+                }
+                owned.emplace_back(
+                    std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
+                cursor_rows.push_back(rows.size());
+            } else {
+                if (scalar_index >= result.outputs.size() ||
+                    result.outputs[scalar_index].oracle_type != argument.oracle_type) {
+                    throw BinderException("oracle_plsql scalar output count disagrees with Oracle response");
+                }
+                const auto &output = result.outputs[scalar_index++];
+                if (output.value) {
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
+                }
+            }
+            rows.push_back(std::move(row));
+        }
+        if (scalar_index != result.outputs.size() || cursor_index != result.explicit_cursors.size()) {
+            throw BinderException("oracle_plsql received unexpected Oracle output values");
+        }
+        // Like oracle_execute, the work is the caller's to keep: a block that
+        // succeeded is committed, and one that failed is rolled back with the
+        // session. A block that commits or rolls back itself has already said so.
+        session->Commit();
+        if (!owned.empty()) {
+            const auto handles = CallRegistryFor(context).Register(std::move(owned));
+            for (idx_t index = 0; index < handles.size(); index++) {
+                rows[cursor_rows[index]].cursor_handle = oracle_scanner::FormatCursorHandle(handles[index]);
+            }
+        }
+        return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
+    } catch (const std::exception &error) {
+        throw IOException("oracle_plsql failed: %s", error.what());
+    }
+}
+
+struct OracleTransactionPlsqlBindData final : TableFunctionData {
+    std::string catalog_name;
+    std::string block;
+    std::vector<oracle_scanner::OracleBind> arguments;
+};
+
+unique_ptr<FunctionData> OracleTransactionPlsqlBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+        throw BinderException("oracle_plsql_transaction catalog and block cannot be NULL");
+    }
+    auto result = make_uniq<OracleTransactionPlsqlBindData>();
+    result->block = input.inputs[1].GetValue<std::string>();
+    auto arguments = PlsqlArguments(input, "oracle_plsql_transaction");
+    if (arguments.size() > 64) {
+        throw BinderException("oracle_plsql_transaction takes at most 64 binds");
+    }
+    size_t bytes = 0;
+    for (const auto &bind : arguments) {
+        if (bind.oracle_type == oracle_scanner::ORACLE_WIRE_TYPE_CURSOR) {
+            throw BinderException("oracle_plsql_transaction cannot return cursors; use oracle_plsql");
+        }
+        if (bind.value && bind.value->size() > 32767) {
+            throw BinderException("oracle_plsql_transaction scalar value exceeds 32767 bytes");
+        }
+        AddTransactionBindBytes(bytes, bind.name.size());
+        AddTransactionBindBytes(bytes, bind.value ? bind.value->size() : 0);
+        if (bind.direction != oracle_scanner::BindDirection::BIND_IN) {
+            AddTransactionBindBytes(bytes, bind.maximum_bytes);
+        }
+    }
+    result->arguments = OrderedPlsqlArguments(result->block, std::move(arguments), "oracle_plsql_transaction");
+    auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot run PL/SQL through an attached read-only Oracle catalog");
+    }
+    result->catalog_name = target.catalog_name;
+    names = {"name", "value"};
+    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OracleTransactionPlsqlInit(ClientContext &context, TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OracleTransactionPlsqlBindData>();
+    auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot run PL/SQL through an attached read-only Oracle catalog");
+    }
+    OracleCallerInterruptScope interrupt(context);
+    try {
+        auto &session = TransactionSession(context, target);
+        // A block can change package state, NLS or the current schema of the
+        // session itself; the session ends closed rather than reused.
+        TaintTransactionSession(context, target.catalog_name);
+        oracle_scanner::OracleCallRequest request;
+        request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+        request.block = bind.block;
+        request.arguments = bind.arguments;
+        auto result = session.Call(request);
+        if (!result.explicit_cursors.empty() || !result.implicit_cursors.empty()) {
+            for (auto &cursor : result.explicit_cursors) {
+                cursor->Close();
+            }
+            for (auto &cursor : result.implicit_cursors) {
+                cursor->Close();
+            }
+            throw BinderException("oracle_plsql_transaction cannot return cursors");
+        }
+        std::vector<OracleCallNamedRow> rows;
+        size_t position = 0;
+        for (const auto &argument : bind.arguments) {
+            if (argument.direction == oracle_scanner::BindDirection::BIND_IN) {
+                continue;
+            }
+            if (position == result.outputs.size() || result.outputs[position].oracle_type != argument.oracle_type) {
+                throw BinderException("oracle_plsql_transaction output shape mismatch");
+            }
+            OracleCallNamedRow row;
+            row.name = argument.name;
+            const auto &value = result.outputs[position++].value;
+            if (value) {
+                row.value = FormatCallScalar(argument.oracle_type, *value, argument.character_set_form);
+            }
+            rows.emplace_back(std::move(row));
+        }
+        if (position != result.outputs.size()) {
+            throw BinderException("oracle_plsql_transaction has unexpected outputs");
+        }
+        interrupt.Check();
+        return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
+    } catch (const std::exception &error) {
+        interrupt.Stop();
+        PoisonTransactionSession(context, target.catalog_name);
+        ThrowOracleAdapterError("oracle_plsql_transaction failed", error);
+    }
+}
+
 unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallNamedBindData>();
     try {
@@ -2479,6 +2700,33 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
          "exact_counts=false uses native array DML and returns one explicitly aggregate count with NULL row_index.",
          "SELECT * FROM oracle_execute_many_transaction('ora', 'DELETE FROM QUACK_DEMO_LOG WHERE LOG_ID = :id', [{id: 1}]);",
          {"oracle", "transaction"}}));
+    {
+        TableFunction plsql("oracle_plsql", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleCallNamedFunction,
+                            OraclePlsqlBind, OraclePlsqlInit);
+        plsql.GetSignature().AddArgs("binds", LogicalType::ANY);
+        infos.push_back(DocumentedTableFunctionInfo(
+            std::move(plsql),
+            {{"secret_name", "block", "binds"},
+             "Runs one anonymous PL/SQL block (BEGIN ... END; or DECLARE ... END;) on its own session and commits it "
+             "when it succeeds. Binds are STRUCT(name, direction, type, value) matched to the block's :name "
+             "placeholders; the OUT and IN OUT ones come back as rows, a REF CURSOR as a handle for oracle_cursor.",
+             "SELECT * FROM oracle_plsql('ora', 'BEGIN :greeting := ''hello '' || :who; END;', "
+             "[{name:'greeting',direction:'out',type:'varchar',value:NULL::VARCHAR}, "
+             "{name:'who',direction:'in',type:'varchar',value:'world'}]);",
+             {"oracle", "plsql"}}));
+        TableFunction plsql_transaction("oracle_plsql_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                        OracleTransactionCallFunction, OracleTransactionPlsqlBind,
+                                        OracleTransactionPlsqlInit);
+        plsql_transaction.GetSignature().AddArgs("binds", LogicalType::ANY);
+        infos.push_back(DocumentedTableFunctionInfo(
+            std::move(plsql_transaction),
+            {{"catalog_name", "block", "binds"},
+             "Runs one anonymous PL/SQL block on the caller transaction, with no adapter COMMIT. The block must not "
+             "commit, run DDL or use an autonomous transaction; REF CURSOR binds are refused.",
+             "SELECT * FROM oracle_plsql_transaction('ora', 'BEGIN :n := 1 + 1; END;', "
+             "[{name:'n',direction:'out',type:'number',value:NULL::VARCHAR}]);",
+             {"oracle", "transaction"}}));
+    }
     infos.push_back(DocumentedTableFunctionInfo(
         TableFunction("oracle_call_named_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
             OracleTransactionCallFunction, OracleTransactionCallBind, OracleTransactionCallInit),

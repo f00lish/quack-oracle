@@ -2139,7 +2139,7 @@ static void TestProcedureCallBuilder() {
     OracleBind return_bind {"return_value", 0, BindDirection::BIND_OUT, std::nullopt};
     CHECK(BuildOracleFunctionCallBlock("app.billing.invoice_total", return_bind, arguments) ==
            "BEGIN :return_value := app.billing.invoice_total(p_id => :p_id, p_result => :p_result); END;");
-    OracleCallRequest function_request {OracleCallableKind::FUNCTION, "app.answer", return_bind, {}, {}};
+    OracleCallRequest function_request {OracleCallableKind::FUNCTION, "app.answer", return_bind, {}, {}, {}};
     CHECK(BuildOracleCallBlock(function_request) == "BEGIN :return_value := app.answer; END;");
     function_request.return_bind.reset();
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildOracleCallBlock(function_request); });
@@ -2392,7 +2392,7 @@ static void TestValidatedSession() {
     session.Query("select * from invoices where id = :id", binds);
     session.Execute("delete from invoices where id = :id", binds);
     session.ExecuteBatch("update invoices set id = :id", {binds});
-    OracleCallRequest call {OracleCallableKind::PROCEDURE, "app.ping", std::nullopt, {}, {}};
+    OracleCallRequest call {OracleCallableKind::PROCEDURE, "app.ping", std::nullopt, {}, {}, {}};
     session.Call(call);
     CHECK(inner->queries == 1 && inner->executes == 1 && inner->batches == 1 && inner->calls == 1);
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { session.Execute("select * from invoices where id = :id", binds); });
@@ -8219,6 +8219,45 @@ static void TestEndToEndAttributesMatchPython() {
     std::cout << "end-to-end attributes match python-oracledb's" << std::endl;
 }
 
+// An anonymous block is sent as written, less a SQL*Plus terminator, and its
+// binds are matched to its placeholders by first mention.
+static void TestAnonymousBlocks() {
+    CHECK(NormalizeOracleAnonymousBlock("BEGIN NULL; END;") == "BEGIN NULL; END;");
+    CHECK(NormalizeOracleAnonymousBlock("  -- c\n declare x number; begin x := 1; end;  \n") ==
+          "  -- c\n declare x number; begin x := 1; end;");
+    CHECK(NormalizeOracleAnonymousBlock("BEGIN\n  NULL;\nEND;\n/\n") == "BEGIN\n  NULL;\nEND;");
+    // Not blocks, or not whole ones.
+    for (const char *text : {"SELECT 1 FROM dual", "CALL p()", "BEGIN NULL; END", "BEGIN NULL; END; /", ""}) {
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)NormalizeOracleAnonymousBlock(text); });
+    }
+    OracleCallRequest request;
+    request.kind = OracleCallableKind::ANONYMOUS_BLOCK;
+    request.block = "BEGIN :b := :a || 'x'; END;";
+    OracleBind a;
+    a.name = "a";
+    a.oracle_type = 1;
+    a.value = std::vector<uint8_t> {'1'};
+    OracleBind b;
+    b.name = "b";
+    b.oracle_type = 1;
+    b.direction = BindDirection::BIND_OUT;
+    b.maximum_bytes = 100;
+    request.arguments = {a, b};
+    CHECK(BuildOracleCallBlock(request) == "BEGIN :b := :a || 'x'; END;");
+    const auto ordered = OrderOracleStatementBinds(request.block, request.arguments, OracleBindUse::CALL);
+    CHECK(ordered.size() == 2 && ordered[0].name == "b" && ordered[1].name == "a");
+    // A bind the block does not mention, or a placeholder without a bind, is refused.
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] {
+        (void)OrderOracleStatementBinds(request.block, {a}, OracleBindUse::CALL);
+    });
+    request.qualified_name = "P";
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)BuildOracleCallBlock(request); });
+    request.qualified_name.clear();
+    request.kind = OracleCallableKind::PROCEDURE;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)BuildOracleCallBlock(request); });
+    std::cout << "anonymous PL/SQL blocks are normalised and their binds ordered" << std::endl;
+}
+
 // A VECTOR is written as its image in a locator, as python-oracledb Thin does,
 // and keeps its place among the binds when the statement has short ones after it.
 static void TestVectorBindsMatchPython() {
@@ -8431,6 +8470,7 @@ int main() {
     TestTemporaryLobsMatchPython();
     TestTemporaryLobScope();
     TestEndToEndAttributesMatchPython();
+    TestAnonymousBlocks();
     TestVectorBindsMatchPython();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();

@@ -798,6 +798,44 @@ SET VARIABLE oracle_close_handle =
 SELECT * FROM oracle_close_call(getvariable('oracle_close_handle'));
 ```
 
+### Anonymous PL/SQL blocks
+
+When the work is more than one procedure call, send the block itself:
+
+```sql
+SELECT * FROM oracle_plsql('ora', '
+    DECLARE s NUMBER := 0;
+    BEGIN
+        FOR i IN 1 .. :n LOOP s := s + i; END LOOP;
+        :total := s;
+    END;',
+    [{name: 'n',     direction: 'in',  type: 'number', value: '100'},
+     {name: 'total', direction: 'out', type: 'number', value: NULL::VARCHAR}]);
+-- total | 5050
+```
+
+The block begins with `BEGIN` or `DECLARE` and ends with the `;` after its last
+`END`; a `/` alone on a last line is dropped. The binds are the same
+`STRUCT(name, direction, type, value)` that `oracle_call_named` takes, matched to
+the block's `:name` placeholders by name: a bind the block does not mention, or a
+placeholder without a bind, is refused before anything is sent. The `OUT` and
+`IN OUT` ones come back as rows, in the order the block first mentions them, and a
+`REF CURSOR` as a handle for `oracle_cursor`. Binds are optional.
+
+`oracle_plsql` runs on a session of its own and **commits when the block
+succeeds**, like `oracle_execute`; a block that fails is rolled back with the
+session, and Oracle's error comes back as it is (`ORA-20001: boom`).
+`oracle_plsql_transaction('o', block, binds)` runs it on the attached catalog's
+pinned session instead and commits nothing, so DuckDB's `COMMIT` and `ROLLBACK`
+decide; there the block must not commit, run DDL or use an autonomous
+transaction, takes up to 64 binds, and cannot return cursors. It leaves that
+session closed afterwards, not reused, because a block can change a session's
+state. Both refuse a `READ_ONLY` catalog where one is involved.
+
+A block can run DDL with `EXECUTE IMMEDIATE`, which is how a procedure is
+created: `BEGIN EXECUTE IMMEDIATE 'CREATE OR REPLACE PROCEDURE …'; END;`.
+`DBMS_OUTPUT` is not collected; return what you want to see through an `OUT` bind.
+
 Every example is run by the adapter test suite against a scripted session,
 which checks the request each one sends. The six PL/SQL objects above have not
 yet been run against a live Oracle.
@@ -945,8 +983,8 @@ SELECT * FROM oracle_call_auto('ora', 'DBMS_UTILITY.EXEC_DDL_STATEMENT',
     ['CREATE TABLE t (id NUMBER(10), label VARCHAR2(50))']);
 ```
 
-The same route runs anything that is a single procedure call. Anonymous PL/SQL
-blocks (`BEGIN ... END;`) cannot be run at all.
+The same route runs anything that is a single procedure call. Anything longer
+is an anonymous block; see `oracle_plsql` in section 6.
 
 ### `ORA-20906: DML composite operation N affected row count mismatch`
 

@@ -1,6 +1,6 @@
 -- oracle_scanner demo schema.
 --
--- Creates the objects the README's "Try it yourself" section and the examples
+-- Creates the objects the README's examples
 -- in duckdb_functions() use. Safe to run more than once: existing demo tables
 -- are dropped first and the PL/SQL objects are replaced. Works on Oracle 19c,
 -- 23ai Free and OCI Autonomous, in whatever schema you connect as.

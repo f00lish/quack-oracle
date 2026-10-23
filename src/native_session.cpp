@@ -88,7 +88,7 @@ public:
                     [&](const std::vector<uint8_t> &locator,uint64_t offset,uint64_t amount) {
                         TtcLobRequest request;request.sequence=NextCursorSequence();request.locator=locator;
                         request.operation=LOB_OP_READ;request.offset=offset;request.amount=amount;
-                        return channel.LobOperation(request,server_field_version,connection->LegacySession());
+                        return channel.LobOperation(request,server_field_version,channel.LegacySession());
                     });
                 if (!content) { throw ProtocolError(ProtocolErrorKind::MALFORMED,"non-NULL prefetched LOB became NULL"); }
                 row[index]=character ? DecodeUtf16BeToUtf8(*content) : *content;
@@ -113,7 +113,7 @@ public:
                 request.sequence = NextCursorSequence();
                 request.locator = locator;
                 request.operation = LOB_OP_GET_LENGTH;
-                return channel.LobOperation(request, server_field_version, connection->LegacySession()).amount;
+                return channel.LobOperation(request, server_field_version, channel.LegacySession()).amount;
             });
         return is_character ? DecodeUtf16BeToUtf8(content) : content;
     }
@@ -161,8 +161,8 @@ public:
             auto response_limits=prefetch_limits;
             response_limits.maximum_rows=count;
             auto response=prefetch_active ?
-                channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,response_limits,server_field_version,previous_row,connection->LegacySession()) :
-                channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row,connection->LegacySession());
+                channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,response_limits,server_field_version,previous_row,channel.LegacySession()) :
+                channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row,channel.LegacySession());
             previous_row = response.last_row;
             exhausted = response.exhausted;
             OracleBatch decoded;decoded.rows=std::move(response.rows);ResolveLobs(decoded,prefetch_active);
@@ -322,7 +322,7 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
     }
     const auto response = channel->ReceiveDecodedExecuteResponse(handle, connection->TtcFieldVersion(),
                                                                   connection->TtcServerFieldVersion(),
-                                                                  connection->LegacySession());
+                                                                  channel->LegacySession());
     if (!response.completion || response.completion->cursor_id == 0) {
         statements.Poison(handle);
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query response has no cursor completion");
@@ -361,7 +361,7 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
         request.binds = ordered_binds;
         channel->ExecuteBinds(handle, request);
     }
-    const auto completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(), connection->LegacySession());
+    const auto completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(), channel->LegacySession());
     // The TTIOER completion names the server cursor this statement opened.
     // Recording it is what lets Close queue the piggybacked close; without it
     // the server keeps the cursor and a long run of statements on one session
@@ -406,7 +406,7 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
         channel->ExecuteBinds(handle, execute);
         const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
                                                         connection->TtcServerFieldVersion(),
-                                                        connection->LegacySession());
+                                                        channel->LegacySession());
         channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
         channel->Close(handle);
         if (!decoded.out_binds || decoded.out_binds->scalar_values.size() != 1 ||
@@ -457,7 +457,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
             channel->ExecuteBinds(handle, execute);
             TtcErrorInfo completion;
             try {
-                completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(), connection->LegacySession());
+                completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(), channel->LegacySession());
             } catch (const OracleDmlError &error) {
                 // The server reports the iteration it was on, zero-based and
                 // relative to this request; the caller counts from the start of the
@@ -500,7 +500,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
         channel->ExecuteBinds(handle, execute);
         const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
                                                           connection->TtcServerFieldVersion(),
-                                                          connection->LegacySession());
+                                                          channel->LegacySession());
         channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
         channel->Close(handle);
 
@@ -556,7 +556,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
         }
         const auto decoded = channel->ReceiveCallResponse(handle, binds, connection->TtcFieldVersion(),
                                                     connection->TtcServerFieldVersion(),
-                                                    connection->LegacySession());
+                                                    channel->LegacySession());
         channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
         channel->Close(handle);
 

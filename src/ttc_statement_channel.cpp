@@ -203,8 +203,7 @@ TtcErrorInfo TtcStatementChannel::ReceiveDmlResponse(OracleStatementHandle handl
 
 TtcPlsqlOutBindsResponse TtcStatementChannel::ReceivePlsqlOutBindsResponse(OracleStatementHandle handle,
                                                                              const std::vector<OracleBind> &binds,
-                                                                             uint8_t ttc_field_version,
-                                                                             bool legacy_session) {
+                                                                             uint8_t ttc_field_version) {
     try {
         auto response = channel.Receive();
         if (IsTtcErrorMessage(response)) {

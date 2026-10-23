@@ -6,6 +6,7 @@
 #include "oracle_scanner/descriptor_parser.hpp"
 #include "oracle_scanner/io_deadline_binding.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_db_version.hpp"
 #include "oracle_scanner/transport_factory.hpp"
 
 #include <algorithm>

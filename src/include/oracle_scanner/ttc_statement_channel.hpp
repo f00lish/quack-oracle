@@ -22,6 +22,13 @@ class TtcStatementChannel {
 public:
     TtcStatementChannel(TtcChannel &channel, OracleStatementRegistry &statements);
 
+    // Whether the server speaks the legacy (11.2) session dialect. Several
+    // TTC bodies -- the TTIOER error body above all -- have a different
+    // layout in that dialect, so a decoder has to know which one applies.
+    bool LegacySession() const {
+        return channel.LegacySession();
+    }
+
     //! Runs one LOB_OP and returns what it served. The end-of-call that
     //! follows the data is consumed here, so a caller sees a value or an
     //! error and never a half-read channel.
@@ -42,8 +49,7 @@ public:
                                     bool legacy_session = false);
     TtcPlsqlOutBindsResponse ReceivePlsqlOutBindsResponse(OracleStatementHandle handle,
                                                            const std::vector<OracleBind> &binds,
-                                                           uint8_t ttc_field_version = 12,
-                                                           bool legacy_session = false);
+                                                           uint8_t ttc_field_version = 12);
     TtcCallResponse ReceiveCallResponse(OracleStatementHandle handle, const std::vector<OracleBind> &binds,
                                         uint8_t ttc_field_version = 12, uint8_t server_field_version = 12,
                                         bool legacy_session = false);

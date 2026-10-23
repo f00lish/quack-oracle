@@ -5,6 +5,7 @@
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
 
+#include <optional>
 #include <string>
 
 namespace oracle_scanner {
@@ -23,7 +24,8 @@ TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message,
     std::vector<uint8_t> remainder(message.begin() + static_cast<std::ptrdiff_t>(describe.bytes_consumed), message.end());
     TtcFetchResponse fetch;
     try {
-        fetch = DecodeTtcFetchResponse(remainder, describe.columns, server_field_version);
+        fetch = DecodeTtcFetchResponse(remainder, describe.columns, server_field_version, std::nullopt,
+                                        legacy_session);
     } catch (const ProtocolError &error) {
         throw ProtocolError(error.Kind(), std::string("TTC execute response after DESCRIBE_INFO: ") + error.what());
     }

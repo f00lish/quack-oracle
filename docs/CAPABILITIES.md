@@ -3,9 +3,11 @@
 The support surface of `oracle_scanner`, stated precisely enough to plan against.
 [README.md](../README.md) is the introduction; this is the boundary.
 
-Every "works" below was run against a live Oracle — 19.3 EE, OCI Autonomous, and
-Free 23ai — and every "refused" is a refusal this extension raises by name, not
-a guess about what Oracle would do. Where the three servers differ, it says so.
+Every "works" below was run against a live Oracle, and every "refused" is a refusal
+this extension raises by name, not a guess about what Oracle would do. Up to 0.5.1 that
+meant 19.3 EE, OCI Autonomous and Free 23ai; the additions of 0.6.0 were run on 19c and
+Free 23ai, and not on Autonomous or over TCPS (see the
+[release notes](RELEASE_NOTES_0.6.0.md)). Where the servers differ, it says so.
 
 The governing rule behind most of the refusals: **anything this client cannot
 prove it will do identically to Oracle, it refuses instead of approximating.**
@@ -89,10 +91,10 @@ its columns:
 | `ZHS16GBK` | 2 bytes per character | UTF-8, 3 bytes | `数据库连接测试` |
 | `AL32UTF8` | UTF-8 | UTF-8 | — |
 
-Two limits remain, and neither depends on the database character set:
-`NCHAR`/`NVARCHAR2` are refused because their values travel as UTF-16 in the row
-(see §3), and characters outside the Basic Multilingual Plane — emoji, rare
-ideographs — are untested, since none of the character sets above can hold one.
+One limit remains, and it does not depend on the database character set: characters
+outside the Basic Multilingual Plane — emoji, rare ideographs — are untested, since none
+of the character sets above can hold one. `NCHAR` and `NVARCHAR2` are read and written
+(their values travel as UTF-16 in the row, see §3).
 
 ### Secrets
 
@@ -307,10 +309,12 @@ BIGINT)` for keys, `CAST(col AS DOUBLE)` where a ratio is enough. Declaring the
 column as `NUMBER(p[,s])` in Oracle removes the need entirely, and does so for
 every client, not just this one.
 
-There is no setting that changes this mapping. One was considered and refused:
-a mode that silently narrowed unconstrained `NUMBER` would make correctness
-depend on a flag, and a reconciliation that is exact in one session and two
-cents off in another is worse than one that always asks for a cast.
+The default never changes silently. `SET oracle_unconstrained_number = 'decimal(38,9)'`
+(or `'double'`) says once, for a session, what these columns become instead; it applies
+only to a `NUMBER` with no declared precision, is read when a query is bound or a table
+is first used, rounds what does not fit (a `DECIMAL` that cannot hold a value's integer
+digits raises), and is off until you set it, so that a reconciliation is exact unless you
+chose otherwise.
 
 **The session time zone is UTC.** Every session this extension opens sets
 `TIME_ZONE='+00:00'` at login, as python-oracledb Thin sets its own client's
@@ -451,10 +455,12 @@ user is the same as naming nothing. Only what the connected user can see is list
 | `CREATE TABLE`, `CREATE TABLE AS` | Refused — this extension issues no DDL |
 | `DROP TABLE` | Refused |
 | `CREATE SCHEMA`, `DROP SCHEMA` | Refused — one schema, and it is Oracle's |
-| Another user's schema | Not exposed; use `oracle_query` with a qualified name |
+| Another user's schema | `ATTACH … (SCHEMA 'owner')`, one schema per attachment |
 
 Identifiers arrive as Oracle stores them, which is upper case unless they were
-created quoted: `o.ITEMS`, not `o.items`.
+created quoted: `o.ITEMS`. A name typed in another case (`o.items`) finds the one
+object that matches ignoring case; a schema holding both `"items"` and `ITEMS` needs the
+exact spelling.
 
 ### Filter pushdown
 
@@ -465,9 +471,10 @@ must apply every one *exactly*. Each filter is translated into the Oracle
 `WHERE` clause only when its Oracle meaning is provably identical, and otherwise
 kept and evaluated by DuckDB's own expression over each fetched batch — a
 refusal costs speed, never an error. Translated: `=`, `<>`, `<`, `<=`, `>`, `>=`,
-`IS NULL`, `IS NOT NULL`, `IN` (up to 1 000 values), and `AND`/`OR` over those,
-on integer, decimal, date, and timestamp columns. Everything else is local: text
-comparisons and `LIKE` (Oracle's collation and blank-padded `CHAR` comparison
+`IS NULL`, `IS NOT NULL`, `IN` (up to 16 384 values, sent as lists of 1 000 joined by
+`OR`), and `AND`/`OR` over those, on integer, decimal, date, and timestamp columns, and
+`=`, `<>` and `IN` on `VARCHAR2` columns against a non-empty constant (equality does not
+depend on collation). Everything else is local: ordered comparisons of text, `LIKE` (Oracle's collation and blank-padded `CHAR` comparison
 depend on session settings this client does not negotiate), predicates across
 several columns, `ROWID`, an `IN` list with one unprovable member.
 
@@ -482,7 +489,46 @@ dropped. All of them are hints, so dropping or widening one never changes an
 answer. The choice of plan depends on the row count the catalog passes DuckDB,
 `USER_TABLES.NUM_ROWS`, and on each column's `NUM_DISTINCT` (the distinct count only,
 never a minimum, maximum or null count, which a stale statistic could make wrong in a
-way that drops rows); a table without statistics has neither.
+way that drops rows); a table without statistics has neither. DuckDB builds an `IN` list
+from the other side only up to its own `dynamic_or_filter_threshold` (50 by default);
+raise it to let a larger side through. A composite key is filtered column by column.
+
+### What else Oracle does
+
+Beyond filters, six rewrites hand work to Oracle. Each is exact or it does not happen:
+the plan is left as it was, never an error, and each has a setting to turn it off (§9).
+They share two conditions: every filter on the scan must have been sent to Oracle (a
+filter DuckDB applies itself would then see rows that are already cut or grouped), and
+the keys involved must be numbers, dates or timestamps, which compare the same in both
+engines. Text keys are left out because Oracle may compare text by collation or
+blank-padded `CHAR` rules where DuckDB compares bytes.
+
+| Rewrite | Covers | Left to DuckDB |
+| --- | --- | --- |
+| Top-N | `ORDER BY … LIMIT … OFFSET` becomes `ORDER BY … NULLS FIRST/LAST FETCH FIRST limit+offset ROWS ONLY`; DuckDB's `TOP_N` stays and re-sorts | text, computed or ROWID keys; a sample; a parallel scan |
+| Aggregates | `count(*)`, `count(col)`, `sum` of exact numbers, `min`, `max`, with or without `GROUP BY`; one statement replaces the aggregate and its scan | `DISTINCT`, `FILTER`, `ORDER BY`, `GROUPING SETS`, floating-point `sum`, text group keys |
+| Joins | an inner join of two attached tables of one database, on comparisons of number, date or timestamp columns, as one statement over two inline views carrying each side's filters | outer, semi and anti joins; text keys; LOB, JSON, VECTOR, XML or ROWID columns; a third table |
+| Heavy columns | when DuckDB applies a filter itself, `CLOB`/`BLOB`/`JSON`/`VECTOR`/`XMLTYPE` columns it does not read are fetched afterwards for the surviving rows, `WHERE ROWID IN (…)` in groups of 500, `AS OF SCN` at the change number the rows were read at | views, index-organized, clustered and temporary tables; a sample; a parallel scan; a transaction that has written; no flashback |
+| JSON paths | `json_extract_string(col, '$.a.b')` / `col->>'$.a[0]'` against a plain string, as `=`, an `OR` of them, or `IS NOT NULL`, on a native `JSON` column, narrowed with `JSON_VALUE … NULL ON ERROR` / `JSON_EXISTS`. DuckDB keeps its own test, so Oracle's predicate only has to be a superset | constants that could be a JSON number, `true`, `false`, `null`, an object or an array; paths with quoted keys, wildcards or filters |
+| Samples | `TABLESAMPLE SYSTEM`/`USING SAMPLE … (system)` becomes `SAMPLE (p)` (`SAMPLE BLOCK (p)` from 20 million estimated rows), `REPEATABLE` becomes `SEED` | a sample of a view, `BERNOULLI`, a sample taken after a filter |
+
+**One moment for a whole statement.** With `oracle_consistent_read` (off by default) the
+first scan of a statement takes a change number per catalog and every scan of that
+catalog in the statement — pushed joins and aggregates, each ROWID range of a parallel
+scan, deferred columns — reads `AS OF` it. A database that gives out no change number
+fails the statement instead of reading several moments. A transaction that has written
+reads through its own session and is not pinned.
+
+**Local snapshots.** `oracle_snapshot(catalog, table, query)` runs a DuckDB query over
+the catalog's attached tables with one change number pinned, on a connection of its own,
+and writes the result with `CREATE OR REPLACE TABLE`. The catalog, change number, time and
+query are kept in the table's comment; `oracle_snapshots()` lists them and
+`oracle_snapshot_refresh(table)` runs the query again. Only the named catalog is pinned.
+
+**What a scan reports.** `EXPLAIN ANALYZE` shows, on an attached scan, the statement sent
+(for a parallel scan the first range and a count of the rest), sessions, rows returned
+before DuckDB's filters, bytes and round trips on the scan's connections, fetch and
+conversion time, columns read after the filter, and the filters applied after fetching.
 
 ---
 
@@ -637,28 +683,24 @@ two candidates of the same arity — only the caller can say which was meant.
 
 A LOB is therefore **readable as a column but not passable as an argument.**
 
+**Anonymous blocks.** `oracle_plsql(secret, block, binds)` runs a block on a session of
+its own and commits when it succeeds, like `oracle_execute`; a block that fails is rolled
+back with the session. Binds are the same `STRUCT(name, direction, type, value)` list as
+`oracle_call_named`, up to 64, `IN`, `OUT` or `IN OUT`, one result row per `OUT` bind; no
+cursors. A block may run DDL through `EXECUTE IMMEDIATE`. `DBMS_OUTPUT` is not collected.
+`oracle_plsql_transaction` (§6) is the same on the attached transaction's pinned session.
+
 A procedure that commits internally is outside DuckDB's rollback guarantee, and
 runs in its own call scope for that reason.
 
 ---
 
-## 8a. Vector search
-
-`oracle_vector_search(secret, table, column, query_vector, k := 10, metric := 'COSINE',
-approximate := true)` returns the table's columns and `distance` for the `k` rows nearest
-to the query vector, ranked by Oracle's `VECTOR_DISTANCE` (23ai). It orders by the
-distance alias, which Oracle plans exactly as the expression: with a vector index the
-plan is an index probe, not a scan. `k` is 1 to 100,000, `metric` one of six words
-(never text from the caller), the identifiers are quoted. The query vector is sent in
-the column's storage format, read from `VECTOR_INFO`, because Oracle refuses
-`ORA-51812` on a mismatch; a `VECTOR(*,*)` column gets `FLOAT32` or `FLOAT64` by the
-element type given. A server without `VECTOR` answers with its own error. It runs on a
-pooled session of its own, not inside an attached transaction.
-
 ## 8. Parallel scan
 
-**Attached tables, automatically.** `SET oracle_parallel_scan = N` lets a scan of an
-attached table read through up to N sessions. It lists the table's extents
+**Attached tables, automatically.** By default (`oracle_parallel_scan = -1`) a scan of an
+attached table whose statistics say 500 000 rows or more reads through as many sessions
+as DuckDB has threads, up to 8; `SET oracle_parallel_scan = N` fixes the number (`0` or `1`
+is one stream). It lists the table's extents
 (`DBA_EXTENTS`, joined to `DBA_OBJECTS` for the data object), sorts them by ROWID order
 (object, file, block), cuts between extents into about 4N chunks of equal blocks, and each
 thread reads chunks as `ROWID >= lo AND ROWID < hi` (open at both ends) `AS OF SCN s`,
@@ -686,6 +728,19 @@ change to the table, Oracle's ORA-01466 is reported as such.
 Requires a `NUMBER` key column with integral bounds. Rows whose key is NULL get
 their own shard, so nothing is dropped.
 
+## 8a. Vector search
+
+`oracle_vector_search(secret, table, column, query_vector, k := 10, metric := 'COSINE',
+approximate := true)` returns the table's columns and `distance` for the `k` rows nearest
+to the query vector, ranked by Oracle's `VECTOR_DISTANCE` (23ai). It orders by the
+distance alias, which Oracle plans exactly as the expression: with a vector index the
+plan is an index probe, not a scan. `k` is 1 to 100,000, `metric` one of six words
+(never text from the caller), the identifiers are quoted. The query vector is sent in
+the column's storage format, read from `VECTOR_INFO`, because Oracle refuses
+`ORA-51812` on a mismatch; a `VECTOR(*,*)` column gets `FLOAT32` or `FLOAT64` by the
+element type given. A server without `VECTOR` answers with its own error. It runs on a
+pooled session of its own, not inside an attached transaction.
+
 ---
 
 ## 9. Settings
@@ -695,12 +750,11 @@ their own shard, so nothing is dropped.
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
 | `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
 | `oracle_filter_pushdown` | `true` | See §5. |
-| (JSON paths) | always | `json_extract_string`/`->>` of a simple path (`$.a.b`, `$.a[0]`) against a plain string constant, as `=`, `OR` of `=`, or `IS NOT NULL`, on a native JSON column is narrowed with `JSON_VALUE ... NULL ON ERROR` / `JSON_EXISTS`; DuckDB keeps its own test, so the narrowing only has to be a superset |
-| `oracle_consistent_read` | `false` | One change number per statement and catalog, taken at its first scan, added as `AS OF SCN` to every scan, pushed join and aggregate, and parallel range; fails if no change number can be had; skipped inside a transaction that has written |
-| `oracle_deferred_columns` | `true` | When DuckDB applies a filter itself, CLOB/BLOB/JSON/VECTOR/XMLTYPE columns the filter does not read are fetched afterwards for the surviving rows, `WHERE ROWID IN (...)` at the change number the rows were read at; not for views, IOT/clustered/temporary tables, samples, parallel scans or a transaction that wrote |
-| `oracle_join_pushdown` | `true` | An inner join of two attached tables of one database, compared on number, date or timestamp columns, becomes one statement over two inline views that carry each side's filters; not with a filter Oracle was not sent, a sample, or a LOB/JSON/VECTOR/XML/ROWID column |
-| `oracle_aggregate_pushdown` | `true` | An AGGREGATE over an attached table (`count`, `sum` of exact numbers, `min`/`max`, group keys of numbers, dates and timestamps; no DISTINCT/FILTER/GROUPING SETS) is replaced by one `GROUP BY` statement, when every filter was sent to Oracle |
-| `oracle_top_n_pushdown` | `true` | An `ORDER BY … LIMIT` over an attached table whose keys are all numbers, dates or timestamps is sent as `ORDER BY … NULLS FIRST/LAST FETCH FIRST (limit+offset) ROWS ONLY`; DuckDB's `TOP_N` still sorts the result. Not with a filter Oracle was not sent, a sample, or a parallel scan |
+| `oracle_consistent_read` | `false` | One change number per statement and catalog; see §5 |
+| `oracle_deferred_columns` | `true` | Read heavy columns after DuckDB's own filter; see §5 |
+| `oracle_join_pushdown` | `true` | Let Oracle join two attached tables; see §5 |
+| `oracle_aggregate_pushdown` | `true` | Let Oracle compute aggregates; see §5 |
+| `oracle_top_n_pushdown` | `true` | Let Oracle rank an `ORDER BY … LIMIT`; see §5 |
 | `oracle_parallel_scan` | `-1` | Sessions one scan of an attached table may use, reading ROWID ranges cut at extent boundaries, all at one SCN (§8). `-1`: automatic (DuckDB's thread count, up to 8, when `NUM_ROWS` says 500,000 or more, else one); `0` or `1`: one stream |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision (plain `NUMBER`, `SUM(x)`, `count(*)`) becomes: `'varchar'` (exact), `'double'`, or `'decimal(p,s)'` such as `'decimal(38,9)'`. Read when a query is bound or a table is first used; the lossy choices round what does not fit, and a DECIMAL that cannot hold a value's integer digits raises. A `DOUBLE` column then accepts `DOUBLE` on write |
 

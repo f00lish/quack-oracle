@@ -3432,7 +3432,7 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
              "Runs one anonymous PL/SQL block (BEGIN ... END; or DECLARE ... END;) on its own session and commits it "
              "when it succeeds. Binds are STRUCT(name, direction, type, value) matched to the block's :name "
              "placeholders; the OUT and IN OUT ones come back as rows, a REF CURSOR as a handle for oracle_cursor.",
-             "SELECT * FROM oracle_plsql('ora', 'BEGIN :greeting := ''hello '' || :who; END;', "
+             "SELECT * FROM oracle_plsql('demo', 'BEGIN :greeting := ''hello '' || :who; END;', "
              "[{name:'greeting',direction:'out',type:'varchar',value:NULL::VARCHAR}, "
              "{name:'who',direction:'in',type:'varchar',value:'world'}]);",
              {"oracle", "plsql"}}));

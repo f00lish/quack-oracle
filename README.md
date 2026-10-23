@@ -13,10 +13,12 @@ CREATE SECRET ora (TYPE oracle, HOST 'db.example.com', PORT 1521,
 SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 ```
 
-> **Status:** version 0.5.1, for DuckDB v2.0.0, published to DuckDB Community
+> **Status:** version 0.6.0, for DuckDB v2.0.0, published to DuckDB Community
 > Extensions — one `INSTALL` and you are done, see [Install](#1-install).
 > Reads, writes, procedure calls and TLS are verified against live Oracle 19c,
-> Oracle Free 23ai, and OCI Autonomous Database.
+> Oracle Free 23ai, and OCI Autonomous Database; the 0.6 additions were verified
+> on 19c and Free 23ai. What changed since 0.5.1:
+> [release notes](docs/RELEASE_NOTES_0.6.0.md).
 
 ---
 
@@ -74,6 +76,7 @@ kind.
 5. [Write data](#5-write-data)
 6. [Call procedures and functions](#6-call-procedures-and-functions)
 7. [Read a big table faster](#7-read-a-big-table-faster)
+   - 7a. [Nearest-neighbour search on Oracle 23ai vectors](#7a-nearest-neighbour-search-on-oracle-23ai-vectors)
 8. [Settings](#8-settings)
 9. [Which Oracle types work](#9-which-oracle-types-work)
 10. [Troubleshooting](#10-troubleshooting)
@@ -94,7 +97,7 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.5.1 targets **DuckDB v2.0.0**, and new releases are built for DuckDB 2.0
+Version 0.6.0 targets **DuckDB v2.0.0**, and new releases are built for DuckDB 2.0
 only. An extension loads only into the DuckDB version it was built for, so a
 DuckDB 2.0 pre-release cannot load it; upgrade to v2.0.0. On **DuckDB v1.5.6**
 the same command installs 0.4.0, the last release built for it; on v1.5.5,
@@ -129,8 +132,9 @@ WHERE extension_name = 'oracle_scanner';
 ## 2. Connect to a database
 
 A connection is stored as a DuckDB **secret**. You create it once per session
-and then refer to it by name. There is no connection string and no
-`tnsnames.ora` on disk to configure.
+and then refer to it by name. Give it the host, port and service name, or one
+connection string (`DSN`), or an alias from a `tnsnames.ora`; none of them needs
+anything configured on disk.
 
 ### The usual case
 
@@ -147,6 +151,55 @@ CREATE SECRET ora (
 
 `ora` is just a name you pick; every function below takes it as its first
 argument. Make several secrets if you use several databases.
+
+### The shortest form: one connection string
+
+If you already have a connection string — the kind SQL\*Plus, SQLcl or
+python-oracledb take — put it in `DSN` and skip `HOST`, `PORT` and
+`SERVICE_NAME`:
+
+```sql
+CREATE SECRET ora (
+    TYPE oracle,
+    DSN 'db.example.com:1521/ORCLPDB1',
+    USER 'scott',
+    PASSWORD 'tiger'
+);
+```
+
+`DSN` takes three shapes, told apart by how they look:
+
+| You write | It is read as |
+| --- | --- |
+| `host:port/service` (also `//host/service`, `tcps://host:2484/service`, several hosts separated by commas, and `?retry_count=3`-style parameters) | An Easy Connect string |
+| `(DESCRIPTION=...)` | A full descriptor, the same as `CONNECT_DESCRIPTOR` |
+| `mydb_low` (a bare name) | An alias from `tnsnames.ora`. It is looked up in `CONFIG_DIR` if you give one, then in the wallet, then in the folder the `TNS_ADMIN` environment variable names |
+
+For an encrypted connection, write `tcps://` and name the certificate to
+check:
+
+```sql
+CREATE SECRET ora_tls (
+    TYPE oracle,
+    DSN 'tcps://db.example.com:2484/sales.example.com',
+    USER 'app_user', PASSWORD '...',
+    TLS_SERVER_NAME 'db.example.com'
+);
+```
+
+An alias with a `tnsnames.ora` you keep in a folder of your own:
+
+```sql
+CREATE SECRET ora_alias (
+    TYPE oracle, DSN 'sales', USER 'scott', PASSWORD 'tiger',
+    CONFIG_DIR '/etc/oracle/network/admin'
+);
+```
+
+`DSN` is used *instead of* `HOST`/`PORT`/`SERVICE_NAME`, `TNS_ALIAS` and
+`CONNECT_DESCRIPTOR`; combining them is refused. The Easy Connect parameters
+that are read are listed in
+[CAPABILITIES](docs/CAPABILITIES.md); any other parameter is refused by name.
 
 ### Oracle Autonomous Database, or anything with a wallet
 
@@ -451,12 +504,35 @@ own expression over each fetched batch. (Before 0.6.0 the second kind raised
 an error and pushdown was off by default.)
 
 Pushed down: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN`
-(up to 1,000 values), and `AND`/`OR` of those, on number, date and timestamp
-columns. Text comparisons are mostly refused because Oracle's collation and its
-blank-padded `CHAR` comparison depend on session settings this client does not
-negotiate.
+(up to 16,384 values, as lists of 1,000), and `AND`/`OR` of those, on number, date and timestamp
+columns, and `=`, `<>` and `IN` on `VARCHAR2` columns against a non-empty constant
+(equality does not depend on collation). Ordered comparisons of text, `LIKE`, and any
+comparison on a `CHAR` or `NVARCHAR2` column are applied by DuckDB to the rows that come
+back, because Oracle's collation and its blank-padded `CHAR` comparison depend on session
+settings this client does not negotiate.
 
-**Joins.** When an attached table is joined to something DuckDB reads itself — a
+### What else goes to Oracle
+
+Besides the filters above, these are done by Oracle, where its answer is provably the one
+DuckDB would give. Each has a setting to turn it off, and what it does not cover is stated
+in its own paragraph.
+
+| What | Example | Setting |
+| --- | --- | --- |
+| [Keys of a join](#joining-to-something-duckdb-reads) | `JOIN read_parquet('vip.parquet') ON …` reads only the matching rows | `oracle_filter_pushdown` |
+| [Joining two attached tables](#joining-two-attached-tables) | `FROM o.ORDERS x JOIN o.CUSTOMERS y ON …` is one statement | `oracle_join_pushdown` |
+| [Aggregates](#aggregates) | `SELECT region, count(*), sum(amount) … GROUP BY region` | `oracle_aggregate_pushdown` |
+| [Top-N](#top-n) | `ORDER BY amount DESC LIMIT 100` | `oracle_top_n_pushdown` |
+| [JSON paths](#json-paths) | `WHERE doc->>'$.customer.id' = 'c42'` | `oracle_filter_pushdown` |
+| [Samples](#samples-and-limit) | `TABLESAMPLE SYSTEM (1%)` | — |
+| [Heavy columns after the filter](#heavy-columns-after-the-filter) | LOBs are read only for the rows that pass | `oracle_deferred_columns` |
+| [One moment for a whole statement](#one-moment-for-a-whole-statement) | every table of a statement `AS OF` one SCN | `oracle_consistent_read` (off by default) |
+| [Local snapshots](#local-snapshots) | a DuckDB table built from Oracle at one SCN | `oracle_snapshot(…)` |
+| [A scan's own report](#what-a-scan-sent-and-moved-explain-analyze) | `EXPLAIN ANALYZE` shows the SQL sent and what came back | — |
+
+#### Joining to something DuckDB reads
+
+When an attached table is joined to something DuckDB reads itself — a
 Parquet file, a CSV, another database, a literal list — the keys the other side
 holds are sent to Oracle too, so
 `SELECT … FROM o.SALES s JOIN read_parquet('vip.parquet') v ON s.client_id = v.client_id`
@@ -466,7 +542,9 @@ table. Few keys go as an `IN` list; more as the ranges of the key they fall in
 describes only as a bloom filter is applied locally. It needs a numeric key and is
 only ever a narrowing: DuckDB still checks every row against the join.
 
-**Join keys.** When one side of a join is an attached table, DuckDB sends the other side's keys to
+#### Keys of a join, text keys, long lists
+
+When one side of a join is an attached table, DuckDB sends the other side's keys to
 the scan once they are known; they reach Oracle as `IN` lists (numbers also as `BETWEEN` ranges),
 so a small build side reads a few rows instead of the table. Text keys of `VARCHAR2` columns work
 the same way, because equality does not depend on collation. DuckDB builds an `IN` list only up to
@@ -476,7 +554,111 @@ lists joined by `OR`, up to 16384 values (more than that is read unfiltered, as 
 composite key is filtered column by column, never as a tuple, since DuckDB hands the scan one
 filter per column.
 
-**Local snapshots.** To keep a copy of Oracle data in DuckDB that you control, build it explicitly:
+DuckDB can only choose that plan if it knows the Oracle table is the big side.
+It reads the table's row count from Oracle's optimizer statistics
+(`USER_TABLES.NUM_ROWS`), so a table that has never had statistics gathered looks
+tiny to it and may be built into the hash table instead of probed. Gather them
+(`BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'SALES'); END;` through
+`oracle_plsql`) for the tables you join. The same statistics give each column's
+distinct-value count (`NUM_DISTINCT`), which sizes `GROUP BY`s and joins on it.
+Only counts are passed on: a statistic can be stale, and a stale minimum, maximum
+or null count could make DuckDB skip rows, where a stale count only misjudges a plan.
+
+#### Joining two attached tables
+
+An inner join of two tables attached from the same Oracle database
+(`SELECT … FROM o.ORDERS x JOIN o.CUSTOMERS y ON x.cust = y.id WHERE …`) is one statement,
+`FROM (SELECT … WHERE <x's filters>) a JOIN (SELECT … WHERE <y's filters>) b ON …`, so the join's
+result travels and not both tables. Conditions are comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`)
+between columns of the same number, date or timestamp type; all filters on both sides must have
+gone to Oracle, neither side may be a sample, and the columns read must not be LOB, JSON, VECTOR,
+XML or ROWID. Outer, semi and anti joins, text keys and joins of more than two tables (a join of
+three comes out as a pushed pair joined by DuckDB to the third) are left to DuckDB.
+`SET oracle_join_pushdown = false` turns it off. 40 random joins (equality, inequality, composite
+conditions, self-joins, NULLs, pushed filters on both sides) returned the same rows with and
+without it on 19c and 23ai.
+
+#### Aggregates
+
+`SELECT region, count(*), sum(amount), max(day) FROM o.SALES WHERE … GROUP BY region`
+is computed by Oracle (`SELECT "REGION", CAST(COUNT(*) …), …, MAX("DAY") FROM "SALES" WHERE … GROUP BY "REGION"`),
+so the groups travel, not the rows. Covered: `count(*)`, `count(col)`, `sum`, `min`, `max`, with
+or without `GROUP BY`, without `DISTINCT`, `FILTER`, `ORDER BY` or `GROUPING SETS`. `sum` is
+pushed for exact numbers only (integers arrive as text and are read as `HUGEINT`, fixed-scale
+decimals as `DECIMAL(38,s)`, the types DuckDB itself returns); `min`, `max` and group keys for
+numbers, dates and timestamps. Text keys and floating point are left to DuckDB (Oracle may
+group and order text by a collation or blank-padding where DuckDB compares bytes, and the order of
+addition changes a floating-point sum). Every filter must have gone to Oracle too, and the scan
+must have no sample and no join filter coming later; otherwise the plan is unchanged.
+`SET oracle_aggregate_pushdown = false` turns it off. 60 random aggregate queries (up to two
+group keys, NULLs, ties, decimals, dates, timestamps, pushed filters) returned the same rows with
+and without it on 19c and 23ai.
+
+#### Top-N
+
+`SELECT … FROM o.SALES WHERE … ORDER BY amount DESC LIMIT 100` is ranked by
+Oracle (`ORDER BY "AMOUNT" DESC NULLS LAST FETCH FIRST 100 ROWS ONLY`), so 100 rows
+travel, not the table; the `TOP_N` stays in DuckDB's plan and sorts what came back, so
+Oracle only has to return rows that include the true first 100 (an `OFFSET` counts: it
+asks for limit plus offset). Every sort key has to be a number, a date or a timestamp
+column, because those compare the same in both engines, and `NULLS FIRST`/`LAST` is always
+written out; a text key, a computed key, a join, or any filter Oracle was not sent (the
+rows would be cut before the filter) leaves the scan reading everything, as before.
+`SET oracle_top_n_pushdown = false` turns it off. 40 random `ORDER BY … LIMIT … OFFSET`
+queries over a table with NULLs and ties, with and without pushed filters, returned the same
+rows with and without it on 19c and 23ai.
+
+#### Samples and `LIMIT`
+
+`SELECT … FROM o.BIG TABLESAMPLE SYSTEM (1%)` and
+`USING SAMPLE 1000 ROWS (system)` are taken by Oracle (`SAMPLE (p)`, or `SAMPLE BLOCK (p)`
+for tables of tens of millions of rows, with `SEED` for `REPEATABLE`), so 1% of a
+2,000,000-row table sends 20,000 rows, not 2,000,000. Block sampling on a table of a few
+hundred thousand rows came back as 0 rows in some runs, so smaller tables are sampled by
+row. A sample of a view, a `BERNOULLI` sample and a sample taken after a filter inside
+the sampled query stay in DuckDB. `LIMIT` needs nothing of the kind: the scan reads one
+batch of 2,048 rows and stops (`SELECT * FROM o.BIG LIMIT 10` moved 2,048 rows of 2,000,000).
+
+#### JSON paths
+
+A test of a path in a native `JSON` column
+(`WHERE doc->>'$.customer.id' = 'c42'`, also `json_extract_string`, an `IN` list as `OR`, `IS NOT NULL`) is
+narrowed in Oracle with `JSON_VALUE(doc, '$.customer.id' RETURNING VARCHAR2(4000) NULL ON ERROR) = 'c42'`
+or `JSON_EXISTS`, so only candidate documents are read and decoded, and DuckDB still applies its own test
+to them. The Oracle predicate is a superset on purpose: DuckDB renders a number as the document wrote it and an
+object as JSON text, Oracle does neither, so a constant that could be a JSON number, `true`, `false`,
+`null`, an object or an array is not narrowed, and neither is a path with a quoted key, a wildcard or a
+filter (`$.a`, `$.a.b` and `$.a[0]` are). The answer is always DuckDB's: on 20,000 documents, with numbers,
+booleans, nulls, objects, quotes and non-ASCII text as values, the same rows came back with the pushdown
+on and off. A comparison with an `OR` of paths narrows only if every branch can be. Needs Oracle 21c or later
+for the `JSON` type; `VARCHAR2`/`CLOB` columns with `IS JSON` are not narrowed.
+
+#### Heavy columns after the filter
+
+When a filter has to be applied by DuckDB (one Oracle was not
+sent, such as an ordered comparison of text) and the query also reads CLOB, BLOB, JSON, VECTOR or
+XMLTYPE columns the filter never looks at, the scan reads the other columns plus each row's
+ROWID first, applies the filter, and then fetches the heavy columns only for the rows that passed,
+`WHERE ROWID IN (…)` in groups of 500. Both steps read `AS OF SCN` at one change number, so the second
+sees the rows the first did; a table that cannot be pinned that way (a view, an index-organized,
+clustered or temporary table, no flashback privilege, or a transaction that has written) is read
+the ordinary way. On a 5,000-row table with 8 KB of LOB per row, a filter keeping 900 rows moved
+12.5 MiB instead of 68.9 MiB, with identical results on 19c and 23ai. `EXPLAIN ANALYZE` shows
+*Columns read after the filter*. `SET oracle_deferred_columns = false` turns it off.
+
+#### One moment for a whole statement
+
+A statement that reads several attached tables (a join DuckDB
+does itself, a union, a subquery) normally reads each at the moment its scan starts. `SET
+oracle_consistent_read = true` takes one change number when the statement's first scan starts and reads
+every attached table of it `AS OF SCN` that number, including the pushed-down joins and aggregates
+and each ROWID range of a parallel scan. It needs flashback on the tables and undo that reaches back
+that far; a database that gives out no change number fails the statement rather than reading several
+moments, and a transaction that has written reads through its own session as before. Off by default.
+
+#### Local snapshots
+
+To keep a copy of Oracle data in DuckDB that you control, build it explicitly:
 
 ```sql
 SELECT * FROM oracle_snapshot('o', 'sales_eu', 'SELECT * FROM o.main.SALES WHERE region = ''EU''');
@@ -495,93 +677,25 @@ attached catalogs in the same query are read as they are now. It runs on a conne
 be part of the transaction that asked for it; the Oracle user needs flashback on the tables. Fewer moving parts
 than a materialized view, and unlike one it never changes by itself.
 
-**JSON paths.** A test of a path in a native `JSON` column
-(`WHERE doc->>'$.customer.id' = 'c42'`, also `json_extract_string`, an `IN` list as `OR`, `IS NOT NULL`) is
-narrowed in Oracle with `JSON_VALUE(doc, '$.customer.id' RETURNING VARCHAR2(4000) NULL ON ERROR) = 'c42'`
-or `JSON_EXISTS`, so only candidate documents are read and decoded, and DuckDB still applies its own test
-to them. The Oracle predicate is a superset on purpose: DuckDB renders a number as the document wrote it and an
-object as JSON text, Oracle does neither, so a constant that could be a JSON number, `true`, `false`,
-`null`, an object or an array is not narrowed, and neither is a path with a quoted key, a wildcard or a
-filter (`$.a`, `$.a.b` and `$.a[0]` are). The answer is always DuckDB's: on 20,000 documents, with numbers,
-booleans, nulls, objects, quotes and non-ASCII text as values, the same rows came back with the pushdown
-on and off. A comparison with an `OR` of paths narrows only if every branch can be. Needs Oracle 21c or later
-for the `JSON` type; `VARCHAR2`/`CLOB` columns with `IS JSON` are not narrowed.
+### What a scan sent and moved: `EXPLAIN ANALYZE`
 
-**One moment for a whole statement.** A statement that reads several attached tables (a join DuckDB
-does itself, a union, a subquery) normally reads each at the moment its scan starts. `SET
-oracle_consistent_read = true` takes one change number when the statement's first scan starts and reads
-every attached table of it `AS OF SCN` that number, including the pushed-down joins and aggregates
-and each ROWID range of a parallel scan. It needs flashback on the tables and undo that reaches back
-that far; a database that gives out no change number fails the statement rather than reading several
-moments, and a transaction that has written reads through its own session as before. Off by default.
+`EXPLAIN ANALYZE` on a query over an attached table shows, on the scan:
 
-**Heavy columns after the filter.** When a filter has to be applied by DuckDB (one Oracle was not
-sent, such as an ordered comparison of text) and the query also reads CLOB, BLOB, JSON, VECTOR or
-XMLTYPE columns the filter never looks at, the scan reads the other columns plus each row's
-ROWID first, applies the filter, and then fetches the heavy columns only for the rows that passed,
-`WHERE ROWID IN (…)` in groups of 500. Both steps read `AS OF SCN` at one change number, so the second
-sees the rows the first did; a table that cannot be pinned that way (a view, an index-organized,
-clustered or temporary table, no flashback privilege, or a transaction that has written) is read
-the ordinary way. On a 5,000-row table with 8 KB of LOB per row, a filter keeping 900 rows moved
-12.5 MiB instead of 68.9 MiB, with identical results on 19c and 23ai. `EXPLAIN ANALYZE` shows
-*Columns read after the filter*. `SET oracle_deferred_columns = false` turns it off.
+```
+Oracle SQL: SELECT "GRP", "PAD", "ID" FROM "MT" WHERE "GRP" < 10
+Oracle sessions: 1
+Oracle rows returned: 100000
+Oracle network: 1.2 MiB received, 1.0 KiB sent, 50 round trips
+Oracle fetch time: 0.056 s
+Value conversion time: 0.004 s
+Filters applied after fetching: ((#1 >= 'x') AND (#1 < 'y'))
+```
 
-**Top-N.** `SELECT … FROM o.SALES WHERE … ORDER BY amount DESC LIMIT 100` is ranked by
-Oracle (`ORDER BY "AMOUNT" DESC NULLS LAST FETCH FIRST 100 ROWS ONLY`), so 100 rows
-travel, not the table; the `TOP_N` stays in DuckDB's plan and sorts what came back, so
-Oracle only has to return rows that include the true first 100 (an `OFFSET` counts: it
-asks for limit plus offset). Every sort key has to be a number, a date or a timestamp
-column, because those compare the same in both engines, and `NULLS FIRST`/`LAST` is always
-written out; a text key, a computed key, a join, or any filter Oracle was not sent (the
-rows would be cut before the filter) leaves the scan reading everything, as before.
-`SET oracle_top_n_pushdown = false` turns it off. 40 random `ORDER BY … LIMIT … OFFSET`
-queries over a table with NULLs and ties, with and without pushed filters, returned the same
-rows with and without it on 19c and 23ai.
-
-**Aggregates.** `SELECT region, count(*), sum(amount), max(day) FROM o.SALES WHERE … GROUP BY region`
-is computed by Oracle (`SELECT "REGION", CAST(COUNT(*) …), …, MAX("DAY") FROM "SALES" WHERE … GROUP BY "REGION"`),
-so the groups travel, not the rows. Covered: `count(*)`, `count(col)`, `sum`, `min`, `max`, with
-or without `GROUP BY`, without `DISTINCT`, `FILTER`, `ORDER BY` or `GROUPING SETS`. `sum` is
-pushed for exact numbers only (integers arrive as text and are read as `HUGEINT`, fixed-scale
-decimals as `DECIMAL(38,s)`, the types DuckDB itself returns); `min`, `max` and group keys for
-numbers, dates and timestamps. Text keys and floating point are left to DuckDB (Oracle may
-group and order text by a collation or blank-padding where DuckDB compares bytes, and the order of
-addition changes a floating-point sum). Every filter must have gone to Oracle too, and the scan
-must have no sample and no join filter coming later; otherwise the plan is unchanged.
-`SET oracle_aggregate_pushdown = false` turns it off. 60 random aggregate queries (up to two
-group keys, NULLs, ties, decimals, dates, timestamps, pushed filters) returned the same rows with
-and without it on 19c and 23ai.
-
-**Joins.** An inner join of two tables attached from the same Oracle database
-(`SELECT … FROM o.ORDERS x JOIN o.CUSTOMERS y ON x.cust = y.id WHERE …`) is one statement,
-`FROM (SELECT … WHERE <x's filters>) a JOIN (SELECT … WHERE <y's filters>) b ON …`, so the join's
-result travels and not both tables. Conditions are comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`)
-between columns of the same number, date or timestamp type; all filters on both sides must have
-gone to Oracle, neither side may be a sample, and the columns read must not be LOB, JSON, VECTOR,
-XML or ROWID. Outer, semi and anti joins, text keys and joins of more than two tables (a join of
-three comes out as a pushed pair joined by DuckDB to the third) are left to DuckDB.
-`SET oracle_join_pushdown = false` turns it off. 40 random joins (equality, inequality, composite
-conditions, self-joins, NULLs, pushed filters on both sides) returned the same rows with and
-without it on 19c and 23ai.
-
-**Samples.** `SELECT … FROM o.BIG TABLESAMPLE SYSTEM (1%)` and
-`USING SAMPLE 1000 ROWS (system)` are taken by Oracle (`SAMPLE (p)`, or `SAMPLE BLOCK (p)`
-for tables of tens of millions of rows, with `SEED` for `REPEATABLE`), so 1% of a
-2,000,000-row table sends 20,000 rows, not 2,000,000. Block sampling on a table of a few
-hundred thousand rows came back as 0 rows in some runs, so smaller tables are sampled by
-row. A sample of a view, a `BERNOULLI` sample and a sample taken after a filter inside
-the sampled query stay in DuckDB. `LIMIT` needs nothing of the kind: the scan reads one
-batch of 2,048 rows and stops (`SELECT * FROM o.BIG LIMIT 10` moved 2,048 rows of 2,000,000).
-
-DuckDB can only choose that plan if it knows the Oracle table is the big side.
-It reads the table's row count from Oracle's optimizer statistics
-(`USER_TABLES.NUM_ROWS`), so a table that has never had statistics gathered looks
-tiny to it and may be built into the hash table instead of probed. Gather them
-(`BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'SALES'); END;` through
-`oracle_plsql`) for the tables you join. The same statistics give each column's
-distinct-value count (`NUM_DISTINCT`), which sizes `GROUP BY`s and joins on it.
-Only counts are passed on: a statistic can be stale, and a stale minimum, maximum
-or null count could make DuckDB skip rows, where a stale count only misjudges a plan.
+The statement is the one Oracle ran (the first of the ROWID ranges, with a count of the
+rest, for a parallel scan); the rows are what Oracle returned before DuckDB filtered them;
+the network line is the bytes and request/response round trips on the connections the
+scan used; fetch time is the wait for Oracle plus decoding its answer, conversion time is
+turning that into DuckDB values; and the last line is every filter Oracle was *not* sent.
 
 ---
 
@@ -889,18 +1003,36 @@ assume:
 
 - the extension is loaded;
 - an Oracle secret named `demo` exists (see [Connect to a database](#2-connect-to-a-database));
-- [`examples/demo_setup.sql`](examples/demo_setup.sql) has been run in that
-  schema. Besides the demo tables and procedures, it creates one
-  small PL/SQL object for each `oracle_call_*` shape: `QUACK_DEMO_ANSWER`,
-  `QUACK_DEMO_COUNT_DEPARTMENTS`, `QUACK_DEMO_MOTTO`, `QUACK_DEMO_DOUBLE`,
-  `QUACK_DEMO_SHOUT` and `QUACK_DEMO_IMPLICIT`.
+- [`examples/demo_setup.sql`](examples/demo_setup.sql) has been run in the schema
+  you connect as. It creates twelve objects, is safe to run again (it drops its own
+  tables first and replaces its PL/SQL objects), and works unchanged on 19c, 23ai Free
+  and Autonomous: the tables `QUACK_DEMO_DEPARTMENTS` (four rows), `QUACK_DEMO_LOG`
+  (to write to) and `QUACK_DEMO_TYPES` (one column of every type in
+  [section 9](#9-which-oracle-types-work)), and one small PL/SQL object for each
+  `oracle_call_*` shape: `QUACK_DEMO_ADD`, `QUACK_DEMO_GREET`, `QUACK_DEMO_LIST`,
+  `QUACK_DEMO_ANSWER`, `QUACK_DEMO_COUNT_DEPARTMENTS`, `QUACK_DEMO_MOTTO`,
+  `QUACK_DEMO_DOUBLE`, `QUACK_DEMO_SHOUT` and `QUACK_DEMO_IMPLICIT`.
+
+Run it with SQL\*Plus or SQLcl as that user, for example in a container:
+
+```sh
+docker cp examples/demo_setup.sql oracle-demo:/tmp/
+docker exec -i oracle-demo bash -c \
+    'sqlplus -s system/$ORACLE_PASSWORD@localhost:1521/FREEPDB1 @/tmp/demo_setup.sql'
+```
+
+or `sqlplus admin/<password>@<name>_low @examples/demo_setup.sql` with a wallet in
+`$TNS_ADMIN` (on Autonomous, *Database Actions → SQL* works too: paste the file and run it).
+It ends by listing what it made, twelve rows, all `VALID`.
 
 The `oracle_execute` and `oracle_execute_many` examples write to
 `QUACK_DEMO_LOG` and commit in Oracle as they run.
 
-The `*_transaction` functions and `oracle_transaction_status` take an
+The `*_transaction` functions, `oracle_transaction_status` and `oracle_snapshot` take an
 attached catalog rather than a secret; their examples assume
-`ATTACH 'demo' AS ora (TYPE oracle_scanner)`. The
+`ATTACH 'demo' AS ora (TYPE oracle_scanner)`. `oracle_snapshot_refresh` and
+`oracle_snapshots` have something to show only after `oracle_snapshot` has run
+(its example makes `departments_snapshot`). The
 `oracle_execute_composite_transaction` example inserts one `QUACK_DEMO_LOG` row
 and deletes it again, so its counts `[1, 1]` hold as long as no row is already
 labelled `composite example`. The `oracle_execute_admin`
@@ -960,58 +1092,10 @@ created: `BEGIN EXECUTE IMMEDIATE 'CREATE OR REPLACE PROCEDURE …'; END;`.
 `DBMS_OUTPUT` is not collected; return what you want to see through an `OUT` bind.
 
 Every example is run by the adapter test suite against a scripted session,
-which checks the request each one sends. The six PL/SQL objects above have not
-yet been run against a live Oracle.
-
-### What a scan sent and moved: `EXPLAIN ANALYZE`
-
-`EXPLAIN ANALYZE` on a query over an attached table shows, on the scan:
-
-```
-Oracle SQL: SELECT "GRP", "PAD", "ID" FROM "MT" WHERE "GRP" < 10
-Oracle sessions: 1
-Oracle rows returned: 100000
-Oracle network: 1.2 MiB received, 1.0 KiB sent, 50 round trips
-Oracle fetch time: 0.056 s
-Value conversion time: 0.004 s
-Filters applied after fetching: ((#1 >= 'x') AND (#1 < 'y'))
-```
-
-The statement is the one Oracle ran (the first of the ROWID ranges, with a count of the
-rest, for a parallel scan); the rows are what Oracle returned before DuckDB filtered them;
-the network line is the bytes and request/response round trips on the connections the
-scan used; fetch time is the wait for Oracle plus decoding its answer, conversion time is
-turning that into DuckDB values; and the last line is every filter Oracle was *not* sent.
-
----
-
-## 7a. Nearest-neighbour search on Oracle 23ai vectors
-
-A `VECTOR` column is read and written as a DuckDB array (see the type table above). To find the rows
-nearest to a query vector without pulling the table over, let Oracle rank them:
-
-```sql
-SELECT id, title, distance
-FROM oracle_vector_search('ora', 'DOCS', 'EMBEDDING', (SELECT embedding FROM my_questions WHERE id = 1)::FLOAT[768],
-                          k := 10, metric := 'COSINE');
-```
-
-It returns every column of the table plus `distance`, for the `k` nearest rows
-(1 to 100,000; default 10). The statement is
-`SELECT t.*, VECTOR_DISTANCE(t.col, :1, metric) AS DISTANCE FROM tbl t ORDER BY DISTANCE
-FETCH APPROX FIRST k ROWS ONLY`, so Oracle uses a vector index (HNSW or IVF) when the
-table has one — checked against an IVF index on 23ai, where the plan goes through the
-index's centroid tables — and only `k` rows travel. `metric` is `COSINE` (default),
-`EUCLIDEAN`, `EUCLIDEAN_SQUARED`, `DOT`, `MANHATTAN` or `HAMMING`; `approximate := false`
-asks for the exact top `k`. The table is `'T'` or `'OWNER.T'`; a name without quotes is
-read in upper case as Oracle reads it, and one in double quotes is kept as written.
-
-The query vector is a list or array of numbers. Oracle will not compare vectors of two
-storage formats, so it is sent in the column's own (`FLOAT32`, `FLOAT64`, `INT8` or
-`BINARY`, read from the dictionary); for a column declared `VECTOR(*, *)` it goes as
-`FLOAT32` when your numbers are `FLOAT` and `FLOAT64` otherwise. Filter after the
-function, not before: `WHERE` on its result narrows the `k` rows, it does not pick
-the `k` from a subset.
+which checks the request each one sends, and has also been run against a live
+Oracle 19c and Oracle Free 23ai with the demo schema above. The exceptions are
+`oracle_vector_search`, which needs a table with a `VECTOR` column (23ai only), and
+`oracle_cursor` and `oracle_close_call`, which need a cursor handle from an earlier call.
 
 ---
 
@@ -1069,20 +1153,50 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 
 ---
 
+## 7a. Nearest-neighbour search on Oracle 23ai vectors
+
+A `VECTOR` column is read and written as a DuckDB array (see the type table above). To find the rows
+nearest to a query vector without pulling the table over, let Oracle rank them:
+
+```sql
+SELECT id, title, distance
+FROM oracle_vector_search('ora', 'DOCS', 'EMBEDDING', (SELECT embedding FROM my_questions WHERE id = 1)::FLOAT[768],
+                          k := 10, metric := 'COSINE');
+```
+
+It returns every column of the table plus `distance`, for the `k` nearest rows
+(1 to 100,000; default 10). The statement is
+`SELECT t.*, VECTOR_DISTANCE(t.col, :1, metric) AS DISTANCE FROM tbl t ORDER BY DISTANCE
+FETCH APPROX FIRST k ROWS ONLY`, so Oracle uses a vector index (HNSW or IVF) when the
+table has one — checked against an IVF index on 23ai, where the plan goes through the
+index's centroid tables — and only `k` rows travel. `metric` is `COSINE` (default),
+`EUCLIDEAN`, `EUCLIDEAN_SQUARED`, `DOT`, `MANHATTAN` or `HAMMING`; `approximate := false`
+asks for the exact top `k`. The table is `'T'` or `'OWNER.T'`; a name without quotes is
+read in upper case as Oracle reads it, and one in double quotes is kept as written.
+
+The query vector is a list or array of numbers. Oracle will not compare vectors of two
+storage formats, so it is sent in the column's own (`FLOAT32`, `FLOAT64`, `INT8` or
+`BINARY`, read from the dictionary); for a column declared `VECTOR(*, *)` it goes as
+`FLOAT32` when your numbers are `FLOAT` and `FLOAT64` otherwise. Filter after the
+function, not before: `WHERE` on its result narrows the `k` rows, it does not pick
+the `k` from a subset.
+
+---
+
 ## 8. Settings
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
-| `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
-| `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF SCN` one change number |
-| `oracle_deferred_columns` | `true` | Read LOB/JSON/VECTOR/XML columns only for the rows that pass a filter DuckDB applies itself, by ROWID at one change number |
-| `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (inner join on number, date or timestamp columns) |
-| `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`/`sum`/`min`/`max` with `GROUP BY` over number, date and timestamp keys |
-| `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key; see [section 4](#pushing-filters-down-to-oracle) |
-| `oracle_parallel_scan` | `-1` | How many sessions one scan of an attached table may read through at once; see [section 7](#7-read-a-big-table-faster) |
-| `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use |
+| `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use. See [section 9](#9-which-oracle-types-work). |
+| `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle, and narrow JSON path tests. See [Pushing filters down](#pushing-filters-down-to-oracle). |
+| `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key. See [Top-N](#top-n). |
+| `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`, `sum`, `min`, `max` and `GROUP BY` over number, date and timestamp keys. See [Aggregates](#aggregates). |
+| `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (an inner join on number, date or timestamp columns). See [Joining two attached tables](#joining-two-attached-tables). |
+| `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
+| `oracle_parallel_scan` | `-1` | How many sessions one scan of an attached table may read through at once: `-1` chooses (DuckDB's thread count, up to 8, for a table of 500,000 rows or more), `0` or `1` is one session. See [section 7](#7-read-a-big-table-faster). |
+| `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS
 handshake and an authentication round trip: against a cloud endpoint that was
@@ -1168,7 +1282,8 @@ a `DECIMAL` that cannot hold a value's integer digits raises instead.
 row carries only a pointer, and fetching the content costs extra round trips per
 value. Measured: 2,000 rows with a 2,000-character CLOB took **1.22 s**, against
 **0.004 s** for the same rows without that column. Select a LOB column only when
-you need it. Writing is cheap by comparison: a LOB value goes out as an ordinary bind up to 8 MiB, and past that through a temporary LOB, up to 1 GiB each.
+you need it; when a filter DuckDB applies itself narrows the rows first, the LOBs are
+read for the survivors only (see [Heavy columns after the filter](#heavy-columns-after-the-filter)). Writing is cheap by comparison: a LOB value goes out as an ordinary bind up to 8 MiB, and past that through a temporary LOB, up to 1 GiB each.
 
 ---
 
@@ -1341,14 +1456,11 @@ cannot inspect the binary.
   boundary: every type, every refusal and its reason, what `ATTACH` can and
   cannot do, and the full list of what is not supported. Read this before
   planning a migration around the extension.
+- **[docs/RELEASE_NOTES_0.6.0.md](docs/RELEASE_NOTES_0.6.0.md)** — what changed since 0.5.1.
 - **[docs/RELEASING.md](docs/RELEASING.md)** — where the version lives and what
   a Community Extensions submission needs.
 - **[PROVENANCE.md](PROVENANCE.md)** — what this project reuses and from where,
   plus every byte of recorded wire traffic in the tree with its SHA-256.
-- **[Moving Oracle to PostgreSQL with a Single `INSERT`](https://medium.com/@rudenko.s/moving-oracle-to-postgresql-with-a-single-insert-no-oracle-client-no-python-3efc99baaa40)**
-  — a worked write-up of the whole pattern: the load as one statement, sharding
-  the read across sessions under one snapshot, and reconciling both databases
-  without dragging the tables across the network.
 
 Guarantees that hold by construction: no Oracle client is linked or loaded (CI
 checks the shipped binary on every build); no password, wallet password, key or

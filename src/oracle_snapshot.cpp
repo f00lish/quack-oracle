@@ -257,14 +257,15 @@ vector<CreateTableFunctionInfo> OracleSnapshotFunctionInfos() {
         {{"catalog_name", "table_name", "source_sql"},
          "Builds a local DuckDB table from a query over attached Oracle tables, reading every table of that catalog "
          "AS OF one SCN, and records the SCN and the query in the table's comment so it can be listed and refreshed.",
-         "SELECT * FROM oracle_snapshot('ora', 'sales_snapshot', 'SELECT * FROM ora.main.SALES WHERE region = ''EU''');",
+         "SELECT * FROM oracle_snapshot('ora', 'departments_snapshot', "
+         "'SELECT * FROM ora.main.QUACK_DEMO_DEPARTMENTS WHERE department_id > 10');",
          {"oracle", "snapshot"}}));
     TableFunction refresh("oracle_snapshot_refresh", {LogicalType::VARCHAR}, SnapshotFunction, SnapshotBind, SnapshotInit);
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(refresh),
         {{"table_name"},
          "Runs the query of a table made by oracle_snapshot again, at a new SCN, and replaces its rows.",
-         "SELECT * FROM oracle_snapshot_refresh('sales_snapshot');", {"oracle", "snapshot"}}));
+         "SELECT * FROM oracle_snapshot_refresh('departments_snapshot');", {"oracle", "snapshot"}}));
     TableFunction list("oracle_snapshots", {}, SnapshotFunction, SnapshotListBind, SnapshotListInit);
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(list),

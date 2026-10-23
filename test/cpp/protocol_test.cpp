@@ -1455,7 +1455,8 @@ static void TestLegacyExecuteRequestLayout() {
     // The SQL text follows immediately, and the al8i4 array closes the request.
     const auto text_at = std::search(encoded.begin(), encoded.end(), sql.begin(), sql.end());
     CHECK(text_at != encoded.end());
-    CHECK(static_cast<size_t>(text_at - encoded.begin()) == expected.size());
+    // The SQL text is preceded by its own one-byte length.
+    CHECK(static_cast<size_t>(text_at - encoded.begin()) == expected.size() + 1);
     // The al8i4 array the JDBC driver writes for the same statement, which is
     // the one that succeeds against this server.
     const std::vector<uint8_t> al8i4 = {0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,

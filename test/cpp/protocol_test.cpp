@@ -128,10 +128,15 @@
 using namespace oracle_scanner;
 using namespace duckdb_miniz;
 
+static int g_expect_error_counter = 0;
+
 template <class FUNCTION>
 static void ExpectError(ProtocolErrorKind kind, FUNCTION function) {
+    const int call_id = ++g_expect_error_counter;
     try {
         function();
+        std::cerr << "[expect-error] call #" << call_id << " was expected to raise "
+                  << static_cast<int>(kind) << " but returned normally" << std::endl;
         CHECK(false && "expected ProtocolError");
     } catch (const ProtocolError &error) {
         CHECK(error.Kind() == kind);
@@ -7148,13 +7153,21 @@ int main() {
     TestTtcRowDataCodec();
     TestLegacyAnoNegotiation();
     TestTtcNegotiation();
+    std::cerr << "[progress] TestO5LogonFlow (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestO5LogonFlow();
+    std::cerr << "[progress] TestO5Logon11GVerifier (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestO5Logon11GVerifier();
+    std::cerr << "[progress] TestO5Logon11GRejectsTheWrongVerifier (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestO5Logon11GRejectsTheWrongVerifier();
+    std::cerr << "[progress] TestO5Logon11GRejectsMalformedChallenges (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestO5Logon11GRejectsMalformedChallenges();
+    std::cerr << "[progress] TestO5LogonVerifierAcceptance (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestO5LogonVerifierAcceptance();
+    std::cerr << "[progress] TestLegacyChunkEncoding (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestLegacyChunkEncoding();
+    std::cerr << "[progress] TestLegacy11GChallengeParameters (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestLegacy11GChallengeParameters();
+    std::cerr << "[progress] TestO5Logon11GPhaseTwoParameters (expect-error calls so far: " << g_expect_error_counter << ")" << std::endl;
     TestO5Logon11GPhaseTwoParameters();
     TestConnectDescriptor();
     TestConnectDescriptorStaysInline();

@@ -3875,12 +3875,12 @@ static void TestConnectRunsThroughTheTransportSeam() {
     }
     const auto &second = written[1];
     const std::string second_text(second.begin(), second.end());
-    CHECK(second_text.find("(HOST=10.0.0.9)(PORT=1522)") != std::string::npos);
+    CHECK(second_text.find("(PORT=1522)(HOST=10.0.0.9)") != std::string::npos);
     CHECK(second_text.find("(SERVICE_NAME=svc)") != std::string::npos);
     // The re-CONNECT carries the redirect flag; the first CONNECT does not.
     CHECK(written[0][5] == 0x00 && second[5] == TNS_PACKET_FLAG_REDIRECT);
     // And O5LOGON will still name what the user configured.
-    CHECK(connection->AuthConnectString().find("(HOST=first.example)") != std::string::npos);
+    CHECK(connection->AuthConnectString().find("(PORT=1521)(HOST=first.example)") != std::string::npos);
     CHECK(connection->AuthConnectString().find("(CID=") == std::string::npos);
 }
 
@@ -4659,7 +4659,7 @@ static void TestRedirectWithoutReconnectDataIsRebuilt() {
     // The new address, the original service and instance: the address part of
     // a redirect says where to go, not what to ask for.
     CHECK(second.flags == TNS_PACKET_FLAG_REDIRECT);
-    CHECK(second.data.find("(HOST=node2)(PORT=1525)") != std::string::npos);
+    CHECK(second.data.find("(PORT=1525)(HOST=node2)") != std::string::npos);
     CHECK(second.data.find("(SERVICE_NAME=svc)(INSTANCE_NAME=svc2)") != std::string::npos);
     CHECK(second.data.find("elsewhere") == std::string::npos);
 }

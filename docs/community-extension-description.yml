@@ -14,6 +14,6 @@ repo:
   github: krokozyab/quack-oracle
   # The commit tagged v0.6.0, built for DuckDB v2.0.0, pinned by SHA so what is
   # built cannot move.
-  ref: d85b3717701b325809602e8919e1a8736735dbfb
+  ref: 62a2d77685c8365c80639e8f6110d68efb83660b
   # DuckDB 1.5.6 stays on v0.4.0, the last release built for that line.
   variegata: d4aa50f9bf23ca44b44f0df48fb0065ba751f5be

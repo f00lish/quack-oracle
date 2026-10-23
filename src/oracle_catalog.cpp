@@ -285,6 +285,7 @@ struct OracleAttachedState {
         // by shape and leave everything the mapping does not name at zero.
         uint16_t oracle_type = 0;
         uint8_t character_set_form = 0;
+        bool xml = false;
         if (type == "NUMBER") {
             oracle_type = 2;
         } else if (type == "DATE") {
@@ -318,6 +319,11 @@ struct OracleAttachedState {
             character_set_form = 2;
         } else if (type == "BLOB") {
             oracle_type = 113;
+        } else if (type == "XMLTYPE") {
+            // Read and written as its serialized text, so it is a CLOB on the
+            // wire; the flag makes the SQL wrap the column.
+            oracle_type = 112;
+            xml = true;
         } else if (type == "BOOLEAN") {
             oracle_type = 252;
         } else if (type == "JSON") {
@@ -352,13 +358,15 @@ struct OracleAttachedState {
         if (byte_width < 0) {
             throw IOException("Oracle ATTACH received negative USER_TAB_COLUMNS DATA_LENGTH");
         }
-        return {name,
-                oracle_type,
-                static_cast<uint32_t>(byte_width),
-                number(row[offset + 3], 0),
-                number(row[offset + 4], 0),
-                std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
-                character_set_form};
+        OracleColumn column {name,
+                             oracle_type,
+                             static_cast<uint32_t>(byte_width),
+                             number(row[offset + 3], 0),
+                             number(row[offset + 4], 0),
+                             std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
+                             character_set_form};
+        column.xml = xml;
+        return column;
     }
 
     // VECTOR_INFO reads `VECTOR(3,FLOAT32,DENSE)`, `VECTOR(*,*,DENSE)`,
@@ -1067,6 +1075,19 @@ std::string OracleObjectReference(const std::string &schema_name, const std::str
     return schema_name.empty() ? object : KeywordHelper::WriteQuotedAndEscaped(schema_name, '"') + "." + object;
 }
 
+std::string OracleSelectExpression(const OracleColumn &column) {
+	const auto quoted = KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
+	return column.xml ? "XMLSERIALIZE(CONTENT " + quoted + " AS CLOB) " + quoted : quoted;
+}
+
+std::string OracleBindExpression(const OracleColumn &column, size_t bind_position) {
+	const auto placeholder = ":" + std::to_string(bind_position);
+	// XMLTYPE(:n) raises ORA-19032 for a NULL, and answering the NULL first needs
+	// the placeholder twice, which a statement that is not PL/SQL counts as two
+	// binds. XMLPARSE gives NULL for NULL and takes the placeholder once.
+	return column.xml ? "XMLPARSE(DOCUMENT " + placeholder + ")" : placeholder;
+}
+
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
                        std::vector<OracleColumn> &columns) {
@@ -1079,7 +1100,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
             select_list += ORACLE_ROWID_EXPRESSION;
             continue;
         }
-        select_list += KeywordHelper::WriteQuotedAndEscaped(bind.columns[column_id].name, '"');
+        select_list += OracleSelectExpression(bind.columns[column_id]);
     }
     auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
     // The translated predicates, when filter pushdown is enabled and every

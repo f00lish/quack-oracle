@@ -1319,7 +1319,7 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
             value_list += ", ";
         }
         column_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
-        value_list += ":" + std::to_string(bound_columns.size() + 1);
+        value_list += OracleBindExpression(columns[position], bound_columns.size() + 1);
         source_indexes.push_back(source_index);
         bound_columns.push_back(columns[position]);
     }
@@ -1393,7 +1393,7 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
         if (op.expressions[index]->GetExpressionType() != ExpressionType::BOUND_REF) {
             throw NotImplementedException("Oracle UPDATE cannot evaluate this SET expression");
         }
-        assignments += ":" + std::to_string(set_columns.size() + 1);
+        assignments += OracleBindExpression(columns[position], set_columns.size() + 1);
         source_indexes.push_back(op.expressions[index]->Cast<BoundReferenceExpression>().Index());
         set_columns.push_back(columns[position]);
     }

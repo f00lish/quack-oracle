@@ -535,7 +535,8 @@ std::vector<oracle_scanner::OracleBind> CallArguments(const Value &value) {
         // The value encoding is shared with the signature-driven path so the
         // two cannot disagree about what a value means.
         auto encoded = EncodeOracleCallableArgument(type, bind_direction, value_child, name, "oracle_call_named");
-        result.push_back({name, encoded.oracle_type, bind_direction, std::move(encoded.value), encoded.maximum_bytes});
+        result.push_back({name, encoded.oracle_type, bind_direction, std::move(encoded.value), encoded.maximum_bytes,
+                          encoded.character_set_form});
     }
     if (result.empty()) {
         throw BinderException("oracle_call_named requires at least one argument");
@@ -1497,6 +1498,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
             result_bind.direction = oracle_scanner::BindDirection::BIND_OUT;
             result_bind.oracle_type = argument.oracle_type;
             result_bind.maximum_bytes = argument.maximum_bytes;
+            result_bind.character_set_form = argument.bind_type_name == "nvarchar" ? 2 : 0;
             return_bind = std::move(result_bind);
             continue;
         }
@@ -1509,7 +1511,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
         auto encoded = EncodeOracleCallableArgument(argument.bind_type_name, argument.direction,
                                                     bind.values[value_index++], argument.name, "oracle_call_auto");
         arguments.push_back({argument.name, encoded.oracle_type, argument.direction, std::move(encoded.value),
-                             encoded.maximum_bytes});
+                             encoded.maximum_bytes, encoded.character_set_form});
     }
     if (value_index != bind.values.size()) {
         throw BinderException("oracle_call_auto: %s takes %llu arguments but %llu values were supplied", bind.callable,
@@ -1549,7 +1551,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
                     throw BinderException("oracle_call_auto return value disagrees with Oracle response");
                 }
                 if (result.outputs[0].value) {
-                    return_row.value = FormatCallScalar(return_bind->oracle_type, *result.outputs[0].value);
+                    return_row.value = FormatCallScalar(return_bind->oracle_type, *result.outputs[0].value, return_bind->character_set_form);
                 }
                 scalar_index = 1;
             }
@@ -1575,7 +1577,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
                 }
                 const auto &output = result.outputs[scalar_index++];
                 if (output.value) {
-                    row.value = FormatCallScalar(argument.oracle_type, *output.value);
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
                 }
             }
             rows.push_back(std::move(row));
@@ -1897,7 +1899,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
             OracleCallNamedRow row;
             row.name = argument.name;
             const auto &value = result.outputs[position++].value;
-            if (value) { row.value = FormatCallScalar(argument.oracle_type, *value); }
+            if (value) { row.value = FormatCallScalar(argument.oracle_type, *value, argument.character_set_form); }
             rows.emplace_back(std::move(row));
         }
         if (position != result.outputs.size()) {
@@ -1961,7 +1963,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context,
                 }
                 const auto &output = result.outputs[scalar_index++];
                 if (output.value) {
-                    row.value = FormatCallScalar(argument.oracle_type, *output.value);
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
                 }
             }
             rows.push_back(std::move(row));
@@ -2078,7 +2080,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
                 std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
             cursor_rows.push_back(rows.size());
         } else if (result.outputs[0].value) {
-            return_row.value = FormatCallScalar(bind.return_bind.oracle_type, *result.outputs[0].value);
+            return_row.value = FormatCallScalar(bind.return_bind.oracle_type, *result.outputs[0].value, bind.return_bind.character_set_form);
         }
         rows.push_back(std::move(return_row));
         for (const auto &argument : bind.arguments) {
@@ -2099,7 +2101,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
                 }
                 const auto &output = result.outputs[scalar_index++];
                 if (output.value) {
-                    row.value = FormatCallScalar(argument.oracle_type, *output.value);
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
                 }
             }
             rows.push_back(std::move(row));

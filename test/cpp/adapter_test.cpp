@@ -7,6 +7,7 @@
 #endif
 
 #include "oracle_scanner/oracle_vector.hpp"
+#include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/io_deadline.hpp"
 #include "oracle_scanner/session.hpp"
@@ -15,6 +16,7 @@
 #include "oracle_scanner_extension.hpp"
 #include "core_functions_extension.hpp"
 #include "oracle_adapter.hpp"
+#include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
 
@@ -243,7 +245,12 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
             selected.push_back((std::numeric_limits<size_t>::max)());
             result.columns.push_back(Column("rowid", 1));
         } else {
-            const auto name = item.size() >= 2 && item.front() == '"' ? item.substr(1, item.size() - 2) : item;
+            // An XMLTYPE column is selected as XMLSERIALIZE(CONTENT "X" AS CLOB) "X".
+            const std::string serialized = "XMLSERIALIZE(CONTENT ";
+            const auto bare = item.compare(0, serialized.size(), serialized) == 0
+                                  ? item.substr(serialized.size(), item.find(" AS CLOB)") - serialized.size())
+                                  : item;
+            const auto name = bare.size() >= 2 && bare.front() == '"' ? bare.substr(1, bare.size() - 2) : bare;
             size_t index = 0;
             for (; index < table->second.columns.size(); index++) {
                 if (table->second.columns[index].name == name) {
@@ -2312,6 +2319,78 @@ void TestAttachToAnotherSchema() {
     std::cout << "an attached catalog can read another user's schema" << std::endl;
 }
 
+void TestXmlTypeColumnsAreText() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("DOCS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary,
+          {{Text("DOCS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("DOCS"), Text("BODY"), Text("XMLTYPE"), Number("2000"), std::nullopt, std::nullopt, Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["DOCS"] = {{Column("ID", 2, 10, 0), Column("BODY", 112)}, {{Number("1"), Text("<a/>")}}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+
+    // The column is text on the DuckDB side, and the scan asks Oracle to serialize it.
+    auto described = database.Query("SELECT data_type FROM duckdb_columns() WHERE column_name = 'BODY';");
+    CHECK(!described->HasError() && described->GetValue(0, 0).ToString() == "VARCHAR");
+    auto scanned = database.Query("SELECT BODY FROM o.main.DOCS;");
+    CHECK(!scanned->HasError() && scanned->GetValue(0, 0).ToString() == "<a/>");
+    CHECK(script->queries.back().find("XMLSERIALIZE(CONTENT \"BODY\" AS CLOB) \"BODY\"") != std::string::npos);
+    // A write binds the text through XMLPARSE, once per placeholder.
+    database.Run("INSERT INTO o.main.DOCS VALUES (2, '<b/>');");
+    CHECK(script->counted_executes.back() == "INSERT INTO \"DOCS\" (\"ID\", \"BODY\") VALUES (:1, XMLPARSE(DOCUMENT :2))");
+    database.Run("UPDATE o.main.DOCS SET BODY = '<c/>';");
+    CHECK(script->counted_executes.back().find("\"BODY\" = XMLPARSE(DOCUMENT :1)") != std::string::npos);
+    std::cout << "an XMLTYPE column reads and writes as text" << std::endl;
+}
+
+void TestCallableArgumentsOfTheNewTypes() {
+    using oracle_scanner::BindDirection;
+    const auto encode = [](const char *type, const char *text) {
+        return duckdb::EncodeOracleCallableArgument(type, BindDirection::BIND_IN, duckdb::Value(text), "P", "test");
+    };
+    const auto national = encode("nvarchar", "ab");
+    CHECK(national.oracle_type == 1 && national.character_set_form == 2);
+    CHECK(national.value && *national.value == oracle_scanner::EncodeUtf8ToUtf16Be("ab"));
+    CHECK(encode("boolean", "TRUE").value == std::vector<uint8_t>({1, 1}));
+    CHECK(encode("boolean", "0").value == std::vector<uint8_t>({1, 0}));
+    CHECK(encode("interval_ym", "2 years 3 months").value == oracle_scanner::EncodeOracleIntervalYearMonth(2, 3));
+    CHECK(encode("interval_ds", "1 day 02:03:04").oracle_type == 183);
+    // A local-zone value is bound as the TIMESTAMP of its UTC wall time.
+    const auto local_zone = encode("timestamp_ltz", "2024-03-01 10:00:00+02");
+    CHECK(local_zone.oracle_type == 180 && local_zone.value && local_zone.value->size() == 11);
+    const auto null_out = duckdb::EncodeOracleCallableArgument("nvarchar", BindDirection::BIND_OUT, duckdb::Value(),
+                                                               "P", "test");
+    CHECK(!null_out.value && null_out.character_set_form == 2);
+    bool refused = false;
+    try {
+        encode("boolean", "maybe");
+    } catch (const duckdb::BinderException &error) {
+        refused = std::string(error.what()).find("not a valid BOOLEAN") != std::string::npos;
+    }
+    CHECK(refused);
+    CHECK(duckdb::FormatCallScalar(1, oracle_scanner::EncodeUtf8ToUtf16Be("\xD0\xB0"), 2) == "\xD0\xB0");
+    CHECK(duckdb::FormatCallScalar(252, {1, 1}) == "true");
+    CHECK(duckdb::FormatCallScalar(182, oracle_scanner::EncodeOracleIntervalYearMonth(2, 3)) == "2 years 3 months");
+    std::cout << "callable arguments cover national text, BOOLEAN, intervals and local-zone timestamps" << std::endl;
+}
+
 void TestAttachedWritesAgainstAFakeSession() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -3921,6 +4000,8 @@ int main() {
     TestAttachToAnotherSchema();
     TestUntranslatableFiltersRunLocally();
     TestJsonAndVectorColumnsThroughSql();
+    TestXmlTypeColumnsAreText();
+    TestCallableArgumentsOfTheNewTypes();
     TestParallelScanShardsOneSnapshot();
     TestParallelScanRangesDoNotOverflow();
     TestWriteBindsFollowTheOracleColumnType();

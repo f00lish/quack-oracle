@@ -54,6 +54,11 @@ struct OracleColumn {
     // column is then framed differently, and this is what the row decoder
     // reads to know which way. Never set on a describe.
     bool inline_lob_cells = false;
+    // Set by a catalog on a column whose dictionary type is XMLTYPE. It reaches
+    // the wire as a CLOB: a scan selects XMLSERIALIZE(CONTENT col AS CLOB) and a
+    // write binds a CLOB inside XMLTYPE(:n), so the column is only ever text on
+    // this side. Never set on a describe.
+    bool xml = false;
 };
 
 struct OracleBatch {

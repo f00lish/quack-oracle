@@ -249,7 +249,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         if (!select_list.empty()) {
             select_list += ", ";
         }
-        select_list += KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
+        select_list += OracleSelectExpression(column);
     }
 
     // Ranges are half-open except the last, which closes on the maximum, so

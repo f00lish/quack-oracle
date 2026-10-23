@@ -707,8 +707,20 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
     through_value();
 }
 
-std::string FormatCallScalar(uint16_t oracle_type, const std::vector<uint8_t> &wire) {
+std::string FormatCallScalar(uint16_t oracle_type, const std::vector<uint8_t> &wire, uint8_t character_set_form) {
+    if (oracle_type == 1 && character_set_form == 2) {
+        const auto text = oracle_scanner::DecodeUtf16BeToUtf8(wire);
+        return std::string(text.begin(), text.end());
+    }
     switch (oracle_type) {
+    case 182:
+    case 183:
+    case 252: {
+        // The column reader already knows how these print.
+        OracleColumn column;
+        column.oracle_type = oracle_type;
+        return ValueFor(column, wire).ToString();
+    }
     case 2:
         return oracle_scanner::DecodeOracleNumber(wire);
     case 12:

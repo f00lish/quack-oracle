@@ -50,6 +50,29 @@ bool BindableFor(const std::string &dictionary_type, BindableType &result) {
         result = {1, 32767, "varchar"};
         return true;
     }
+    if (dictionary_type == "NVARCHAR2" || dictionary_type == "NCHAR") {
+        // Bound in the national character set form, as UTF-16BE.
+        result = {1, 32767, "nvarchar"};
+        return true;
+    }
+    if (dictionary_type == "PL/SQL BOOLEAN" || dictionary_type == "BOOLEAN") {
+        result = {252, 4, "boolean"};
+        return true;
+    }
+    if (dictionary_type == "INTERVAL YEAR TO MONTH") {
+        result = {182, 5, "interval_ym"};
+        return true;
+    }
+    if (dictionary_type == "INTERVAL DAY TO SECOND") {
+        result = {183, 11, "interval_ds"};
+        return true;
+    }
+    if (dictionary_type == "TIMESTAMP WITH LOCAL TIME ZONE") {
+        // Bound as the TIMESTAMP of its UTC wall time, which is what the
+        // session time zone (UTC) makes it.
+        result = {180, 11, "timestamp_ltz"};
+        return true;
+    }
     if (dictionary_type == "DATE") {
         result = {12, 7, "date"};
         return true;
@@ -84,25 +107,16 @@ std::string UnsupportedReason(const std::string &dictionary_type) {
         dictionary_type == "BFILE") {
         return "LOB locators are outside this version's boundary";
     }
-    if (dictionary_type == "NCHAR" || dictionary_type == "NVARCHAR2") {
-        return "NCHAR and NVARCHAR2 arguments cannot be bound in this version, though columns of those types are read and written";
-    }
     if (dictionary_type == "OBJECT" || dictionary_type == "TABLE" || dictionary_type == "VARRAY" ||
         dictionary_type == "PL/SQL RECORD" || dictionary_type == "PL/SQL TABLE" ||
         dictionary_type == "REF" || dictionary_type == "OPAQUE/XMLTYPE") {
         return "object, record and collection types are outside this version's boundary";
     }
-    if (dictionary_type == "PL/SQL BOOLEAN") {
-        return "a PL/SQL BOOLEAN has no SQL type to bind it as; a SQL BOOLEAN column is read and written, but a procedure argument is not";
-    }
-    if (dictionary_type.rfind("INTERVAL", 0) == 0) {
-        return "INTERVAL arguments cannot be bound in this version, though columns of those types are read and written";
-    }
     if (dictionary_type.rfind("TIMESTAMP WITH", 0) == 0) {
         // The column policy reads TIMESTAMP WITH TIME ZONE, but a bind also has
         // to be written, and nothing on the DuckDB side of this mapping carries
         // an offset to write from.
-        return "TIMESTAMP WITH TIME ZONE and WITH LOCAL TIME ZONE cannot be bound in this version";
+        return "TIMESTAMP WITH TIME ZONE cannot be bound in this version, though the column is read; WITH LOCAL TIME ZONE can";
     }
     if (dictionary_type.empty()) {
         return "the dictionary reports no type for this argument";
@@ -253,13 +267,68 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
             throw BinderException("%s %s %s must be a finite decimal value", function_name, upper, name);
         }
     }
+    if (type_name == "nvarchar" || type_name == "boolean" || type_name == "interval_ym" || type_name == "interval_ds" ||
+        type_name == "timestamp_ltz") {
+        // These are bound the way a column of the type is written, so the value
+        // goes through the one encoder that knows them; only the text spelling
+        // is parsed here.
+        OracleColumn column;
+        LogicalType target = LogicalType::VARCHAR;
+        const char *upper = "NVARCHAR2";
+        uint32_t maximum_bytes = 32767;
+        column.oracle_type = 1;
+        if (type_name == "nvarchar") {
+            column.character_set_form = 2;
+        } else if (type_name == "boolean") {
+            column.oracle_type = 252;
+            target = LogicalType::BOOLEAN;
+            upper = "BOOLEAN";
+            maximum_bytes = 4;
+        } else if (type_name == "interval_ym" || type_name == "interval_ds") {
+            column.oracle_type = type_name == "interval_ym" ? 182 : 183;
+            target = LogicalType::INTERVAL;
+            upper = type_name == "interval_ym" ? "INTERVAL YEAR TO MONTH" : "INTERVAL DAY TO SECOND";
+            maximum_bytes = type_name == "interval_ym" ? 5 : 11;
+        } else {
+            column.oracle_type = 231;
+            target = LogicalType::TIMESTAMP_TZ;
+            upper = "TIMESTAMP WITH LOCAL TIME ZONE";
+            maximum_bytes = 11;
+        }
+        column.name = name;
+        const auto wire_type = static_cast<uint16_t>(column.oracle_type == 231 ? 180 : column.oracle_type);
+        const uint8_t form = column.character_set_form;
+        if (require_out_is_null(upper) || value.IsNull()) {
+            return {wire_type, maximum_bytes, std::nullopt, form};
+        }
+        auto text = require_value(upper);
+        Value typed;
+        try {
+            if (type_name == "boolean") {
+                const auto lowered = StringUtil::Lower(text);
+                if (lowered == "true" || lowered == "t" || lowered == "1") {
+                    typed = Value::BOOLEAN(true);
+                } else if (lowered == "false" || lowered == "f" || lowered == "0") {
+                    typed = Value::BOOLEAN(false);
+                } else {
+                    throw BinderException("not a boolean");
+                }
+            } else {
+                typed = Value(text).DefaultCastAs(target);
+            }
+        } catch (const std::exception &) {
+            throw BinderException("%s %s %s is not a valid %s value", function_name, upper, name, upper);
+        }
+        auto bind = OracleBindForColumn(typed, column, name);
+        return {bind.oracle_type, maximum_bytes, std::move(bind.value), bind.character_set_form};
+    }
     if (type_name == "cursor") {
         if (direction != BindDirection::BIND_OUT || !value.IsNull()) {
             throw BinderException("%s cursor %s must be OUT with NULL value", function_name, name);
         }
         return {oracle_scanner::ORACLE_WIRE_TYPE_CURSOR, 4, std::nullopt};
     }
-    throw BinderException("%s type for %s must be number, varchar, date, timestamp, raw, float, double, or cursor",
+    throw BinderException("%s type for %s must be number, varchar, nvarchar, boolean, date, timestamp, timestamp_ltz, interval_ym, interval_ds, raw, float, double, or cursor",
                           function_name, name);
 }
 

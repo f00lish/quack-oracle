@@ -94,7 +94,8 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
 //! A unique DuckDB output name for a described column.
 std::string OutputName(const OracleColumn &column, idx_t index, std::unordered_set<std::string> &used);
 //! Renders one scalar OUT bind value as text for the callable surface.
-std::string FormatCallScalar(uint16_t oracle_type, const std::vector<uint8_t> &wire);
+// `character_set_form` 2 marks a national character value, which arrives as UTF-16BE.
+std::string FormatCallScalar(uint16_t oracle_type, const std::vector<uint8_t> &wire, uint8_t character_set_form = 0);
 //! Refuses a statement that cannot run inside an explicit DuckDB transaction.
 void RequireAutoCommit(ClientContext &context, const char *function_name);
 //! Resolves a named Oracle secret into a connection config, validating the
@@ -303,6 +304,7 @@ struct OracleCallableBind {
     uint16_t oracle_type = 0;
     uint32_t maximum_bytes = 0;
     std::optional<std::vector<uint8_t>> value;
+    uint8_t character_set_form = 0;
 };
 
 //! Encodes one callable argument from its text spelling. Shared by the
@@ -342,6 +344,12 @@ struct OracleWriteTarget {
 //! The name a statement uses for a table: quoted, and qualified by its owner when
 //! the catalog was attached to a schema other than the connected user's.
 std::string OracleObjectReference(const std::string &schema_name, const std::string &object_name);
+// The select-list item that reads one column: its quoted name, or for an XMLTYPE
+// column the serialization of it as a CLOB under the same name.
+std::string OracleSelectExpression(const OracleColumn &column);
+// The value expression a write puts a bind in: the placeholder itself, wrapped
+// in XMLTYPE(...) for an XMLTYPE column.
+std::string OracleBindExpression(const OracleColumn &column, size_t bind_position);
 
 OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::string &catalog_name);
 void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name);

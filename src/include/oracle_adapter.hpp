@@ -241,6 +241,8 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     // columns and gets a chunk of exactly those.
     size_t chunk_columns = 0;
     std::string catalog_name;
+    //! Filters Oracle was not sent, applied to each fetched chunk (see SplitOracleFilters).
+    unique_ptr<Expression> local_filter;
 };
 
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input);
@@ -249,9 +251,19 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
 //! Refuses any column this client cannot read.
 void RequireReadableColumn(const OracleColumn &column);
 
-//! Translates a pushed-down filter set into an Oracle WHERE clause, refusing
-//! any filter whose Oracle meaning is not provably identical to DuckDB's.
+//! Splits a pushed-down filter set. What can be translated into an Oracle WHERE
+//! clause with a provably identical meaning goes there; every other filter comes
+//! back as an expression over the scan's output chunk, for the scan to apply to
+//! the rows Oracle returns, because DuckDB has already dropped it from its plan.
 //! `scanned_columns` maps a filter's index to a described column.
+struct OracleFilterSplit {
+    std::string where;
+    vector<unique_ptr<Expression>> local;
+};
+OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
+                                     const std::vector<column_t> &scanned_columns);
+//! The strict form of the same translation: a filter that cannot be translated
+//! throws NotImplementedException instead of being left for the scan.
 std::string OracleWhereClause(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
                               const std::vector<column_t> &scanned_columns);
 

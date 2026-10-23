@@ -18,6 +18,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -397,13 +398,39 @@ std::optional<std::string> TranslateOptional(const TableFilter &filter, const Or
 
 } // namespace
 
-std::string OracleWhereClause(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
-                              const std::vector<column_t> &scanned_columns) {
-    std::string predicate;
-    if (filters.HasMultiColumnFilters()) {
-        // A predicate over several columns binds each as its own reference;
-        // this translator proves things about one column at a time.
-        Refuse("a predicate over more than one column");
+namespace {
+
+// A filter as an expression over the scan's output chunk, for the filters that
+// are not sent to Oracle. The filter was written over a placeholder column
+// (index 0), or for a multi-column filter over indexes that column_indexes maps
+// to the scan's projection; either way they become positions in the output.
+unique_ptr<Expression> LocalExpression(const ExpressionFilter &filter, bool multi_column, idx_t projection) {
+    auto expression = filter.expr->Copy();
+    ExpressionIterator::EnumerateExpression(expression, [&](unique_ptr<Expression> &node) {
+        if (node->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+            return;
+        }
+        const auto &reference = node->Cast<BoundReferenceExpression>();
+        const auto position = multi_column ? filter.column_indexes.at(reference.Index()).GetIndex() : projection;
+        node = make_uniq<BoundReferenceExpression>(reference.GetReturnType(), position);
+    });
+    return expression;
+}
+
+} // namespace
+
+OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
+                                     const std::vector<column_t> &scanned_columns) {
+    OracleFilterSplit result;
+    // What Oracle is not sent, DuckDB's own expression evaluates over the rows
+    // that come back. That is what makes a refusal here cost speed and nothing
+    // else: DuckDB has already taken the filter out of its plan, and the scan
+    // applies it instead.
+    for (const auto &filter : filters.GetMultiColumnFilters()) {
+        if (filter->filter_type != TableFilterType::EXPRESSION_FILTER) {
+            Refuse("a filter that is not an expression");
+        }
+        result.local.push_back(LocalExpression(filter->Cast<ExpressionFilter>(), true, 0));
     }
     for (const auto &entry : filters) {
         const auto projection = entry.GetIndex().GetIndex();
@@ -411,23 +438,64 @@ std::string OracleWhereClause(const TableFilterSet &filters, const std::vector<O
             Refuse("a filter on a column this scan does not read");
         }
         const auto column_index = scanned_columns[projection];
+        const auto &filter = entry.Filter();
+        std::optional<std::string> translated;
+        bool local = false;
         if (column_index >= columns.size()) {
-            Refuse("a filter on a virtual column");
+            local = true; // the ROWID pseudo-column
+        } else {
+            const auto &column = columns[column_index];
+            // A column this client cannot read cannot be reasoned about either.
+            RequireReadableColumn(column);
+            const auto quoted_name = KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
+            try {
+                translated = TranslateOptional(filter, column, quoted_name);
+            } catch (const NotImplementedException &) {
+                local = true;
+            }
         }
-        const auto &column = columns[column_index];
-        // A column this client cannot read cannot be reasoned about either.
-        RequireReadableColumn(column);
-        const auto quoted_name = KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
-        const auto translated = TranslateOptional(entry.Filter(), column, quoted_name);
+        if (local) {
+            if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+                Refuse("a filter that is not an expression");
+            }
+            const auto &expression_filter = filter.Cast<ExpressionFilter>();
+            // An optional filter is a hint DuckDB does not rely on.
+            if (!IsOptionalWrapper(*expression_filter.expr)) {
+                result.local.push_back(LocalExpression(expression_filter, false, projection));
+            }
+            continue;
+        }
         if (!translated) {
             continue;
         }
-        if (!predicate.empty()) {
-            predicate += " AND ";
+        if (!result.where.empty()) {
+            result.where += " AND ";
         }
-        predicate += *translated;
+        result.where += *translated;
     }
-    return predicate;
+    return result;
+}
+
+std::string OracleWhereClause(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
+                              const std::vector<column_t> &scanned_columns) {
+    // The strict form: what cannot be translated is an error rather than left
+    // for the scan. It is the translator's contract, kept testable on its own.
+    const auto strict = [&]() {
+        for (const auto &entry : filters) {
+            const auto projection = entry.GetIndex().GetIndex();
+            if (projection >= scanned_columns.size() || scanned_columns[projection] >= columns.size()) {
+                Refuse("a filter on a column this scan does not read");
+            }
+            const auto &column = columns[scanned_columns[projection]];
+            RequireReadableColumn(column);
+            (void)TranslateOptional(entry.Filter(), column, KeywordHelper::WriteQuotedAndEscaped(column.name, '"'));
+        }
+        if (filters.HasMultiColumnFilters()) {
+            Refuse("a predicate over more than one column");
+        }
+    };
+    strict();
+    return SplitOracleFilters(filters, columns, scanned_columns).where;
 }
 
 } // namespace duckdb

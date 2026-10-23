@@ -447,16 +447,18 @@ created quoted: `o.ITEMS`, not `o.items`.
 
 ### Filter pushdown
 
-Off by default. `SET oracle_filter_pushdown = true` sends `WHERE` predicates to
-Oracle.
+On by default; `SET oracle_filter_pushdown = false` turns it off.
 
-It is opt-in because DuckDB removes a filter from the plan once it hands it to
-a scan, so the scan must then apply it *exactly*. This translator refuses
-anything whose Oracle meaning it cannot prove identical — and with pushdown on,
-a refusal is an error rather than a slower plan. Translated: `=`, `<>`, `<`,
-`<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN` (up to 1 000 values), and
-`AND`/`OR` over those, on integer, decimal, date, and timestamp columns.
-Anything else — and any `IN` list with one unprovable member — raises.
+DuckDB removes a filter from the plan once it hands it to a scan, so the scan
+must apply every one *exactly*. Each filter is translated into the Oracle
+`WHERE` clause only when its Oracle meaning is provably identical, and otherwise
+kept and evaluated by DuckDB's own expression over each fetched batch — a
+refusal costs speed, never an error. Translated: `=`, `<>`, `<`, `<=`, `>`, `>=`,
+`IS NULL`, `IS NOT NULL`, `IN` (up to 1 000 values), and `AND`/`OR` over those,
+on integer, decimal, date, and timestamp columns. Everything else is local: text
+comparisons and `LIKE` (Oracle's collation and blank-padded `CHAR` comparison
+depend on session settings this client does not negotiate), predicates across
+several columns, `ROWID`, an `IN` list with one unprovable member.
 
 ---
 
@@ -632,7 +634,7 @@ their own shard, so nothing is dropped.
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
 | `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
-| `oracle_filter_pushdown` | `false` | See §5. |
+| `oracle_filter_pushdown` | `true` | See §5. |
 
 Pooling matters more than it looks: opening a session costs a full TNS handshake
 and authentication. Callables through a secret always open their own session;

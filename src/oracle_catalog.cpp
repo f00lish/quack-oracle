@@ -1144,8 +1144,9 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_filter_pushdown",
                             "Send WHERE predicates on an attached Oracle table to Oracle. Only filters whose Oracle "
-                            "meaning is provably identical are translated; anything else raises.",
-                            LogicalType::BOOLEAN, Value::BOOLEAN(false));
+                            "meaning is provably identical are translated; the rest are applied by the scan to the "
+                            "rows Oracle returns.",
+                            LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_transaction_pool_size",
                             "How many idle Oracle sessions an attached catalog keeps between its transactions, so a "

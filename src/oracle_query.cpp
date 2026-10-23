@@ -3,6 +3,9 @@
 #include <thread>
 #include "oracle_adapter.hpp"
 
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+
 #include "oracle_scanner/auth_crypto.hpp"
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/call_builder.hpp"
@@ -2244,15 +2247,27 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     }
     // Counting rows needs no column values, but Oracle needs a select list, so
     // one column is fetched and none is emitted.
+    unique_ptr<Expression> local_filter;
     auto selected = input.column_ids;
     const auto chunk_columns = selected.size();
     if (selected.empty()) {
         selected.push_back(0);
     }
     if (input.filters) {
-        // DuckDB drops a filter from the plan once it hands it over, so a
-        // filter that reaches here has to be translated exactly or refused.
-        bind.where_clause = OracleWhereClause(*input.filters, bind.columns, selected);
+        // DuckDB drops a filter from the plan once it hands it over, so each
+        // one is either translated exactly into the Oracle statement or
+        // applied here to the rows that come back.
+        auto split = SplitOracleFilters(*input.filters, bind.columns, selected);
+        bind.where_clause = std::move(split.where);
+        if (split.local.size() == 1) {
+            local_filter = std::move(split.local[0]);
+        } else if (!split.local.empty()) {
+            local_filter = std::move(split.local[0]);
+            for (idx_t index = 1; index < split.local.size(); index++) {
+                local_filter = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+                                                                     std::move(local_filter), std::move(split.local[index]));
+            }
+        }
     }
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
@@ -2263,8 +2278,10 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     for (const auto &column : columns) {
         types.push_back(TypeFor(column));
     }
-    return make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
-                                             std::move(types), std::move(input.column_ids), chunk_columns);
+    auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
+                                                   std::move(types), std::move(input.column_ids), chunk_columns);
+    state->local_filter = std::move(local_filter);
+    return std::move(state);
 }
 
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -2274,51 +2291,69 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
     if (!state.catalog_name.empty()) {
         interrupt = std::make_unique<OracleCallerInterruptScope>(context);
     }
-    const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
-        try {
-            return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
-        } catch (...) {
-            if (interrupt) {
-                interrupt->Stop();
+    for (;;) {
+        const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
+            try {
+                return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
+            } catch (...) {
+                if (interrupt) {
+                    interrupt->Stop();
+                }
+                // Same rule as at bind: a failed fetch leaves the channel in a
+                // state this side cannot describe, so the session is not reused.
+                state.session.Poison();
+                if (!state.catalog_name.empty()) {
+                    state.cursor.reset();
+                    PoisonTransactionSession(context, state.catalog_name);
+                }
+                throw;
             }
-            // Same rule as at bind: a failed fetch leaves the channel in a
-            // state this side cannot describe, so the session is not reused.
-            state.session.Poison();
-            if (!state.catalog_name.empty()) {
-                state.cursor.reset();
-                PoisonTransactionSession(context, state.catalog_name);
+        });
+        // Every vector of the chunk has to be written: one left unset is
+        // uninitialized memory that DuckDB reads back in DataChunk::Verify. The
+        // fetched row and the chunk are in the same order, so vector i is column i;
+        // a row can carry one more column than the chunk when nothing is projected
+        // and only the row count is wanted.
+        if (output.ColumnCount() != state.chunk_columns) {
+            throw InternalException("oracle_query output chunk does not match its describe metadata");
+        }
+        for (idx_t row_index = 0; row_index < batch.rows.size(); row_index++) {
+            const auto &row = batch.rows[row_index];
+            if (row.size() != state.columns.size()) {
+                throw InternalException("oracle_query row has a different column count from its describe metadata");
             }
-            throw;
+            for (idx_t vector_index = 0; vector_index < state.chunk_columns; vector_index++) {
+                TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
+                    WriteOracleValue(output.data[vector_index], row_index, state.columns[vector_index],
+                                     row[vector_index]);
+                    return true;
+                });
+            }
         }
-    });
-    // Every vector of the chunk has to be written: one left unset is
-    // uninitialized memory that DuckDB reads back in DataChunk::Verify. The
-    // fetched row and the chunk are in the same order, so vector i is column i;
-    // a row can carry one more column than the chunk when nothing is projected
-    // and only the row count is wanted.
-    if (output.ColumnCount() != state.chunk_columns) {
-        throw InternalException("oracle_query output chunk does not match its describe metadata");
+        // SetChildCardinality, not SetCardinality. In DuckDB 2.0 every vector
+        // carries its own size, and SetValue does not advance it; SetCardinality
+        // sets the chunk's count only, leaving each vector at size 0. A consumer
+        // then reads the validity mask by the vector's size and sees no NULL at
+        // all: `col IS NULL` matched every row, and count(col) counted them. The
+        // compiler cannot see that; the adapter suite now does.
+        output.SetChildCardinality(batch.rows.size());
+        if (state.local_filter && !batch.rows.empty()) {
+            // The filters Oracle was not sent. A chunk they empty is not the end of
+            // the scan — an empty chunk means that — so fetch on until one has rows
+            // or Oracle has no more.
+            ExpressionExecutor executor(context, *state.local_filter);
+            SelectionVector selection(STANDARD_VECTOR_SIZE);
+            const auto kept = executor.SelectExpression(output, selection);
+            if (kept != batch.rows.size()) {
+                output.Slice(selection, kept);
+            }
+            if (kept == 0 && !batch.exhausted) {
+                output.Reset();
+                continue;
+            }
+        }
+        return;
     }
-    for (idx_t row_index = 0; row_index < batch.rows.size(); row_index++) {
-        const auto &row = batch.rows[row_index];
-        if (row.size() != state.columns.size()) {
-            throw InternalException("oracle_query row has a different column count from its describe metadata");
-        }
-        for (idx_t vector_index = 0; vector_index < state.chunk_columns; vector_index++) {
-            TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
-                WriteOracleValue(output.data[vector_index], row_index, state.columns[vector_index],
-                                 row[vector_index]);
-                return true;
-            });
-        }
-    }
-    // SetChildCardinality, not SetCardinality. In DuckDB 2.0 every vector
-    // carries its own size, and SetValue does not advance it; SetCardinality
-    // sets the chunk's count only, leaving each vector at size 0. A consumer
-    // then reads the validity mask by the vector's size and sees no NULL at
-    // all: `col IS NULL` matched every row, and count(col) counted them. The
-    // compiler cannot see that; the adapter suite now does.
-    output.SetChildCardinality(batch.rows.size());
 }
 
 

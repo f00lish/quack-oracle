@@ -420,11 +420,11 @@ int main() {
         auto too_long = admin.Query("INSERT INTO raw.T_WRITE (id, nv) VALUES (9, repeat('x', 41));");
         Check(too_long->HasError() && std::string(too_long->GetError()).find("ORA-12899") != std::string::npos,
               "Oracle's own length check applies to a national column");
-        // A pushed-down filter on a national column is still not translated.
+        // A filter on a national column is not translated; with pushdown on it
+        // is applied to the rows that come back, and gives the same answer.
         Run(admin, "SET oracle_filter_pushdown = true;", "pushdown on");
-        auto filtered = admin.Query("SELECT * FROM raw.T_WRITE WHERE nv = 'new\xc3\xa9';");
-        Check(filtered->HasError() && filtered->GetError().find("national character set column") != std::string::npos,
-              "filtering on a national column is refused when pushed down");
+        auto filtered = Run(admin, "SELECT count(*) FROM raw.T_WRITE WHERE nv = 'new\xc3\xa9';", "local filter when pushed");
+        Check(filtered->GetValue(0, 0).ToString() == "1", "a national-column filter runs locally when pushdown is on");
         Run(admin, "SET oracle_filter_pushdown = false;", "pushdown off");
         auto unfiltered = Run(admin, "SELECT count(*) FROM raw.T_WRITE WHERE nv = 'new\xc3\xa9';", "local filter");
         Check(unfiltered->GetValue(0, 0).ToString() == "1", "the same filter runs in DuckDB when it is not pushed down");

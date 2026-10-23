@@ -1892,8 +1892,8 @@ void TestAttachedCatalogAgainstAFakeSession() {
     CHECK(projection_sql.find("SELECT \"LABEL\" FROM \"ITEMS\"") == 0);
     CHECK(projection_sql.find("\"ID\"") == std::string::npos);
 
-    // Filter pushdown is off by default, so nothing reaches Oracle until it is
-    // asked for.
+    // Filter pushdown is on by default; switched off, nothing reaches Oracle.
+    database.Run("SET oracle_filter_pushdown = false;");
     auto unpushed = database.Query("SELECT LABEL FROM ora.main.ITEMS WHERE ID = 1;");
     CHECK(!unpushed->HasError());
     CHECK(script->queries.back().find("WHERE") == std::string::npos);
@@ -2189,6 +2189,58 @@ void TestJsonAndVectorColumnsThroughSql() {
     auto wrong_shape = database.Query("INSERT INTO ora.main.DOCS (ID, EMB) VALUES (5, [1, 2]);");
     CHECK(wrong_shape->HasError());
     std::cout << "JSON and VECTOR columns read, write and attach against a fake session" << std::endl;
+}
+
+// With filter pushdown on, a filter Oracle is not sent is applied to the rows
+// that come back rather than refused. The fake answers every WHERE with all the
+// rows, so only the local evaluation can narrow them.
+void TestUntranslatableFiltersRunLocally() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->two_batch_fetch = true;
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("ITEMS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("ITEMS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1)},
+                               {{Number("1"), Text("first")}, {Number("2"), Text("second")}, {Number("3"), Text("third")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    database.Run("SET oracle_filter_pushdown = true;");
+
+    const auto ids = [&](const std::string &where) {
+        auto result = database.Query("SELECT ID FROM ora.main.ITEMS WHERE " + where + " ORDER BY ID;");
+        CHECK(!result->HasError());
+        std::string joined;
+        for (duckdb::idx_t row = 0; row < result->RowCount(); row++) {
+            joined += (joined.empty() ? "" : ",") + result->GetValue(0, row).ToString();
+        }
+        return joined;
+    };
+    // LIKE is not translated: Oracle's LIKE, escape and collation rules differ.
+    CHECK(ids("LABEL LIKE 'sec%'") == "2");
+    CHECK(script->queries.back().find("WHERE") == std::string::npos);
+    // One filter sent and one kept: both hold.
+    CHECK(ids("ID >= 2 AND LABEL LIKE 'th%'") == "3");
+    CHECK(script->queries.back().find("WHERE \"ID\" >= 2") != std::string::npos);
+    // A predicate across two columns.
+    CHECK(ids("ID = 1 OR LABEL = 'third'") == "1,3");
+    // Every row dropped by the local filter in the first batch must not end the scan.
+    CHECK(ids("LABEL LIKE 'zzz%'").empty());
+    std::cout << "filters Oracle is not sent are applied locally" << std::endl;
 }
 
 // ATTACH ... (SCHEMA 'x') lists another user's tables through the ALL_ views,
@@ -3840,6 +3892,7 @@ int main() {
     TestAttachedWritesAgainstAFakeSession();
     TestAttachedCatalogNamesTheNewTypes();
     TestAttachToAnotherSchema();
+    TestUntranslatableFiltersRunLocally();
     TestJsonAndVectorColumnsThroughSql();
     TestParallelScanShardsOneSnapshot();
     TestParallelScanRangesDoNotOverflow();

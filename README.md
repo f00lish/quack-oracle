@@ -433,17 +433,20 @@ again, under another alias, for a second.
 
 ### Pushing filters down to Oracle
 
-By default DuckDB fetches the rows and filters them itself. To have Oracle do
-the filtering:
+Filters on an attached table are sent to Oracle where that is provably the same
+answer, and applied by the extension to the returned rows where it is not, so a
+query never fails for lack of a translation — it is only slower. To switch it off
+and have DuckDB filter everything itself:
 
 ```sql
-SET oracle_filter_pushdown = true;
+SET oracle_filter_pushdown = false;
 ```
 
-It is off by default on purpose. Once DuckDB hands a filter to the scan it
-removes it from its own plan, so the scan has to apply it *exactly* — and this
-extension refuses any filter whose Oracle meaning it cannot prove identical.
-With pushdown on, such a filter raises an error instead of just being slower.
+It is on by default. Once DuckDB hands a filter to the scan it removes it from
+its own plan, so the scan applies every one: those whose Oracle meaning it can
+prove identical go into the `WHERE` clause, and the rest are evaluated by DuckDB's
+own expression over each fetched batch. (Before 0.6.0 the second kind raised
+an error and pushdown was off by default.)
 
 Pushed down: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN`
 (up to 1,000 values), and `AND`/`OR` of those, on number, date and timestamp
@@ -810,7 +813,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
-| `oracle_filter_pushdown` | `false` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
+| `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS
 handshake and an authentication round trip: against a cloud endpoint that was

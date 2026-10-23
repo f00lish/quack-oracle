@@ -81,6 +81,13 @@ captures = [
     ("python_vector_int8_bind", "test/cpp/protocol_test.cpp", "python_vector_int8_bind"),
     ("python_vector_sparse_bind", "test/cpp/protocol_test.cpp", "python_vector_sparse_bind"),
     ("python_vector_update_row", "test/cpp/protocol_test.cpp", "python_vector_update_row"),
+    ("python_lob_create_temp_clob", "test/cpp/protocol_test.cpp", "python_lob_create_temp_clob"),
+    ("python_lob_create_temp_blob", "test/cpp/protocol_test.cpp", "python_lob_create_temp_blob"),
+    ("python_lob_create_temp_response", "test/cpp/protocol_test.cpp", "python_lob_create_temp_response"),
+    ("python_lob_write_clob_request", "test/cpp/protocol_test.cpp", "python_lob_write_clob_request"),
+    ("python_lob_write_response", "test/cpp/protocol_test.cpp", "python_lob_write_response"),
+    ("python_lob_free_piggyback", "test/cpp/protocol_test.cpp", "python_lob_free_piggyback"),
+    ("python_lob_locator_binds", "test/cpp/protocol_test.cpp", "python_lob_locator_binds"),
 ]
 
 for name, path, identifier in captures:

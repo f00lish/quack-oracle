@@ -12,6 +12,7 @@
 // not negotiate.
 
 #include "oracle_adapter.hpp"
+#include "oracle_scanner/temp_lob.hpp"
 #include "duckdb/catalog/catalog.hpp"
 
 #include <optional>
@@ -386,7 +387,7 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
 
 // One bind carries at most this much (the TTC bind limit). Writing a LOB through
 // an ordinary bind therefore stops here.
-constexpr size_t MAX_LOB_WRITE_BYTES = 16U << 20U;
+constexpr size_t MAX_LOB_WRITE_BYTES = oracle_scanner::TEMP_LOB_MAXIMUM_BYTES;
 constexpr size_t MAX_JSON_WRITE_BYTES = MAX_LOB_WRITE_BYTES;
 
 namespace {
@@ -518,6 +519,13 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     }
     if ((column.oracle_type == 1 || column.oracle_type == 96) && column.character_set_form == 2) {
         bind.character_set_form = 2;
+    }
+    // Set before the NULL test as well: array DML binds a column the same way in
+    // every row, so a NULL row has to say it stands for a LOB too.
+    if (column.oracle_type == 112 || column.oracle_type == 119) {
+        bind.lob_content = 112;
+    } else if (column.oracle_type == 113) {
+        bind.lob_content = 113;
     }
     if (value.IsNull()) {
         return bind;
@@ -651,9 +659,8 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
             // An empty CLOB value is NULL on the way in, like any empty string.
             return bind;
         }
-        if (bytes.size() >= MAX_LOB_WRITE_BYTES) {
-            RefuseValue(column, "a LOB value is limited to " + std::to_string(MAX_LOB_WRITE_BYTES >> 20U) +
-                                    " MiB in this version; larger values need a temporary LOB, which is not implemented");
+        if (bytes.size() > MAX_LOB_WRITE_BYTES) {
+            RefuseValue(column, "a LOB value is limited to " + std::to_string(MAX_LOB_WRITE_BYTES >> 20U) + " MiB");
         }
         bind.value = std::vector<uint8_t>(bytes.begin(), bytes.end());
         return bind;
@@ -666,9 +673,9 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
         if (text.empty()) {
             return bind;
         }
-        if (text.size() >= MAX_JSON_WRITE_BYTES) {
+        if (text.size() > MAX_JSON_WRITE_BYTES) {
             RefuseValue(column, "a JSON value is limited to " + std::to_string(MAX_JSON_WRITE_BYTES >> 20U) +
-                                    " MiB of text in this version");
+                                    " MiB of text");
         }
         bind.value = std::vector<uint8_t>(text.begin(), text.end());
         return bind;

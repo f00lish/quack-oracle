@@ -245,10 +245,10 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
             selected.push_back((std::numeric_limits<size_t>::max)());
             result.columns.push_back(Column("rowid", 1));
         } else {
-            // An XMLTYPE column is selected as XMLSERIALIZE(CONTENT "X" AS CLOB) "X".
+            // An XMLTYPE column is selected as XMLSERIALIZE(CONTENT "X" AS CLOB NO INDENT) "X".
             const std::string serialized = "XMLSERIALIZE(CONTENT ";
             const auto bare = item.compare(0, serialized.size(), serialized) == 0
-                                  ? item.substr(serialized.size(), item.find(" AS CLOB)") - serialized.size())
+                                  ? item.substr(serialized.size(), item.find(" AS CLOB") - serialized.size())
                                   : item;
             const auto name = bare.size() >= 2 && bare.front() == '"' ? bare.substr(1, bare.size() - 2) : bare;
             size_t index = 0;
@@ -1530,8 +1530,17 @@ void TestWriteBindsFollowTheOracleColumnType() {
     CHECK(bind_for(blob, duckdb::Value(duckdb::LogicalType::BLOB)).oracle_type == 23);
     unsupported(clob, duckdb::Value::BIGINT(1), "takes VARCHAR");
     unsupported(blob, duckdb::Value("text"), "takes BLOB");
-    unconvertible(clob, duckdb::Value(std::string((16U << 20U), 'x')), "16 MiB");
-    CHECK(bind_for(clob, duckdb::Value(std::string((16U << 20U) - 1, 'x'))).value->size() == (16U << 20U) - 1);
+    // A LOB bind says it stands for LOB content, in every row including a NULL
+    // one, so the session can send a large value through a temporary LOB and
+    // keep an array DML's bind metadata the same for all rows.
+    CHECK(bind_for(clob, duckdb::Value("text")).lob_content == 112);
+    CHECK(bind_for(clob, duckdb::Value(duckdb::LogicalType::VARCHAR)).lob_content == 112);
+    CHECK(bind_for(clob, duckdb::Value("")).lob_content == 112);
+    CHECK(bind_for(blob, duckdb::Value::BLOB("\x01")).lob_content == 113);
+    CHECK(bind_for(Column("J", 119), duckdb::Value("{}")).lob_content == 112);
+    CHECK(bind_for(Column("N", 1), duckdb::Value("x")).lob_content == 0);
+    // Past the old 16 MiB limit, which the temporary LOB lifted.
+    CHECK(bind_for(clob, duckdb::Value(std::string((16U << 20U) + 1, 'x'))).value->size() == (16U << 20U) + 1);
 
     // BOOLEAN is the two bytes python-oracledb sends.
     const auto boolean_column = Column("FLAG", 252);
@@ -2351,7 +2360,7 @@ void TestXmlTypeColumnsAreText() {
     CHECK(!described->HasError() && described->GetValue(0, 0).ToString() == "VARCHAR");
     auto scanned = database.Query("SELECT BODY FROM o.main.DOCS;");
     CHECK(!scanned->HasError() && scanned->GetValue(0, 0).ToString() == "<a/>");
-    CHECK(script->queries.back().find("XMLSERIALIZE(CONTENT \"BODY\" AS CLOB) \"BODY\"") != std::string::npos);
+    CHECK(script->queries.back().find("XMLSERIALIZE(CONTENT \"BODY\" AS CLOB NO INDENT) \"BODY\"") != std::string::npos);
     // A write binds the text through XMLPARSE, once per placeholder.
     database.Run("INSERT INTO o.main.DOCS VALUES (2, '<b/>');");
     CHECK(script->counted_executes.back() == "INSERT INTO \"DOCS\" (\"ID\", \"BODY\") VALUES (:1, XMLPARSE(DOCUMENT :2))");

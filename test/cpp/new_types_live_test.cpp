@@ -121,7 +121,7 @@ int main() {
     const std::string emoji = "\xf0\x9f\x98\x80";
     try {
         Run(admin, "CREATE SECRET admin (" + Secret(Env("ORA19C_USER"), Env("ORA19C_PASSWORD")) + ");", "admin secret");
-        Run(admin, Admin("CREATE USER " + user + " IDENTIFIED BY \"" + password + "\" QUOTA 64M ON USERS"), "create user");
+        Run(admin, Admin("CREATE USER " + user + " IDENTIFIED BY \"" + password + "\" QUOTA 512M ON USERS"), "create user");
         created = true;
         Run(admin, Admin("GRANT CREATE SESSION, CREATE TABLE TO " + user), "grant");
         const auto table = [&](const std::string &definition, const std::string &stage) {
@@ -147,6 +147,7 @@ int main() {
               "create write");
         table("T_CHAR (ID NUMBER(3), C CHAR(4))", "create char");
         table("T_LOBW (ID NUMBER(5) PRIMARY KEY, C CLOB, B BLOB, N NCLOB)", "create lobw");
+        table("T_XML (ID NUMBER(5) PRIMARY KEY, X XMLTYPE)", "create xml");
         // BOOLEAN exists from 23ai. A server without it refuses the type, and the
         // stage is skipped rather than failed.
         bool has_boolean = true;
@@ -479,12 +480,69 @@ int main() {
                      "DBMS_LOB.GETLENGTH(N) AS S FROM T_LOBW WHERE ID = 1');",
                      "lob update check") == "70000/2/50000",
               "UPDATE replaces LOB content");
-        auto oversize = admin.Query("INSERT INTO raw.T_LOBW (id, c) VALUES (9, repeat('x', 17000000));");
-        Check(oversize->HasError() && oversize->GetError().find("16 MiB") != std::string::npos, "an oversize LOB is refused by name");
+        // Past what an ordinary bind carries a LOB goes through a temporary LOB,
+        // inside a transaction so the session that wrote it can be asked what it
+        // still holds: nothing, once the statement is done.
+        const auto temporary_lobs = "SELECT * FROM oracle_query('admin', 'SELECT NVL(SUM(T.CACHE_LOBS + T.NOCACHE_LOBS + "
+                                    "T.ABSTRACT_LOBS), 0) AS S FROM V$TEMPORARY_LOBS T JOIN V$SESSION S ON S.SID = T.SID "
+                                    "WHERE S.USERNAME = ''" + user + "''');";
+        Run(admin, "BEGIN;", "temporary lob begin");
+        Run(admin,
+            "INSERT INTO raw.T_LOBW (id, c, b) VALUES (9, repeat('x', 17000000), repeat('\\x05'::BLOB, 9000000));",
+            "temporary lob insert");
+        Check(Scalar(admin, temporary_lobs, "temporary lobs held") == "0", "the temporary LOBs are released after the statement");
+        Run(admin, "COMMIT;", "temporary lob commit");
+        // One batch, one column: a row that needs the temporary LOB, a short one, a NULL and an empty one.
+        Run(admin,
+            "INSERT INTO raw.T_LOBW (id, c, n) VALUES (11, repeat(chr(128512) || 'e', 5000000), repeat('n', 9000000)), "
+            "(12, 'short', 'short'), (13, NULL, NULL), (14, '', '');",
+            "temporary lob batch");
+        {
+            auto result = Run(admin,
+                              "SELECT id, lc, lb, ln FROM oracle_query('rt', 'SELECT ID, DBMS_LOB.GETLENGTH(C) AS LC, "
+                              "DBMS_LOB.GETLENGTH(B) AS LB, DBMS_LOB.GETLENGTH(N) AS LN FROM T_LOBW WHERE ID IN (9, 11, 12, 13, 14) "
+                              "ORDER BY ID') ORDER BY id;",
+                              "temporary lob lengths");
+            Check(result->RowCount() == 5, "temporary lob rows");
+            // 11: 5,000,000 pairs of (U+1F600, 'e') is 3 UTF-16 units each.
+            const std::vector<std::string> lc = {"17000000", "15000000", "5", "NULL", "NULL"};
+            const std::vector<std::string> lb = {"9000000", "NULL", "NULL", "NULL", "NULL"};
+            const std::vector<std::string> ln = {"NULL", "9000000", "5", "NULL", "NULL"};
+            for (idx_t row = 0; row < 5; row++) {
+                Check(result->GetValue(1, row).ToString() == lc[row] && result->GetValue(2, row).ToString() == lb[row] &&
+                          result->GetValue(3, row).ToString() == ln[row],
+                      "temporary lob lengths as Oracle counts them");
+            }
+        }
+        {
+            auto result = Run(admin,
+                              "SELECT md5(c) = md5(repeat(chr(128512) || 'e', 5000000)), md5(n) = md5(repeat('n', 9000000)) "
+                              "FROM raw.T_LOBW WHERE id = 11;",
+                              "temporary lob read back");
+            Check(result->GetValue(0, 0).ToString() == "true" && result->GetValue(1, 0).ToString() == "true",
+                  "a CLOB written through a temporary LOB reads back identical, surrogate pairs and all");
+        }
+        Run(admin, "UPDATE raw.T_LOBW SET c = repeat('u', 12000000) WHERE id = 12;", "temporary lob update");
+        Check(Scalar(admin, "SELECT * FROM oracle_query('rt', 'SELECT DBMS_LOB.GETLENGTH(C) AS S FROM T_LOBW WHERE ID = 12');",
+                     "temporary lob update check") == "12000000",
+              "UPDATE writes a large LOB through a temporary LOB");
+        // XMLTYPE as text, small and past the inline limit.
+        Run(admin, "INSERT INTO raw.T_XML VALUES (1, '<a><b>one</b></a>'), (2, NULL), (3, '<r>' || repeat('t', 10000000) || '</r>');",
+            "xml insert");
+        {
+            auto result = Run(admin, "SELECT id, length(x), x LIKE '<a>%' FROM raw.T_XML ORDER BY id;", "xml read");
+            Check(result->RowCount() == 3 && result->GetValue(1, 0).ToString() == "17" && result->GetValue(1, 1).IsNull() &&
+                      result->GetValue(1, 2).ToString() == "10000007" && result->GetValue(2, 0).ToString() == "true",
+                  "XMLTYPE reads back as the serialized document");
+        }
+        Run(admin, "UPDATE raw.T_XML SET x = '<changed/>' WHERE id = 1;", "xml update");
+        Check(Scalar(admin, "SELECT x FROM raw.T_XML WHERE id = 1;", "xml update check") == "<changed/>", "XMLTYPE can be updated");
+        auto bad_xml = admin.Query("INSERT INTO raw.T_XML VALUES (4, '<unclosed');");
+        Check(bad_xml->HasError() && bad_xml->GetError().find("ORA-31011") != std::string::npos, "malformed XML is Oracle's to refuse");
         auto lob_returning = admin.Query("INSERT INTO raw.T_LOBW (id) VALUES (10) RETURNING id;");
         Check(lob_returning->HasError() && lob_returning->GetError().find("cannot return the LOB, JSON or VECTOR column") != std::string::npos,
               "RETURNING over a LOB table says why it cannot");
-        std::cout << "PASS CLOB, NCLOB and BLOB are written, whole and updated\n";
+        std::cout << "PASS CLOB, NCLOB and BLOB are written, whole and updated; large ones and XMLTYPE too\n";
 
         if (has_boolean) {
             Run(admin, "SELECT * FROM oracle_execute_transaction('raw', 'INSERT INTO T_BOOL VALUES (1, TRUE)');", "bool 1");

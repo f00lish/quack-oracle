@@ -849,8 +849,6 @@ public:
         return result;
     }
 
-    // GetDefaultEntries enumerates; this answers "is this one name mine?", and
-        // a null answer means it is not.
     // GetDefaultEntries above enumerates the schema; this answers the different
     // question of whether one particular name is ours, and a null answer means
     // it is not.
@@ -1077,7 +1075,7 @@ std::string OracleObjectReference(const std::string &schema_name, const std::str
 
 std::string OracleSelectExpression(const OracleColumn &column) {
 	const auto quoted = KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
-	return column.xml ? "XMLSERIALIZE(CONTENT " + quoted + " AS CLOB) " + quoted : quoted;
+	return column.xml ? "XMLSERIALIZE(CONTENT " + quoted + " AS CLOB NO INDENT) " + quoted : quoted;
 }
 
 std::string OracleBindExpression(const OracleColumn &column, size_t bind_position) {

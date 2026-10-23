@@ -59,6 +59,7 @@
 #include "oracle_scanner/ttc_define.hpp"
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
+#include "oracle_scanner/temp_lob.hpp"
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include "oracle_scanner/lob_prefetch_reader.hpp"
 #include "oracle_scanner/io_deadline_binding.hpp"
@@ -7828,6 +7829,334 @@ static void TestRequestHeadersCarryATokenFromFieldVersion18() {
     std::cout << "request headers carry a token from field version 18" << std::endl;
 }
 
+// A value past what an ordinary bind carries is written into a temporary LOB,
+// and the statement binds its locator. Every request here is checked against
+// python-oracledb Thin 4.0.1 creating, writing and releasing temporary LOBs and
+// inserting them (see PROVENANCE.md).
+static void TestTemporaryLobsMatchPython() {
+    const std::vector<uint8_t> python_lob_create_temp_clob {
+        0x03, 0x60, 0x03, 0x00, 0x01, 0x01, 0x28, 0x00, 0x01, 0x0a, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x02, 0x01, 0x10, 0x00, 0x00, 0x01, 0x01, 0x01, 0x70,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x03, 0x69,
+    };
+    const std::vector<uint8_t> python_lob_create_temp_blob {
+        0x03, 0x60, 0x05, 0x00, 0x01, 0x01, 0x28, 0x00, 0x01, 0x0a, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x02, 0x01, 0x10, 0x00, 0x00, 0x00, 0x01, 0x71, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03,
+        0x69,
+    };
+    const std::vector<uint8_t> python_lob_create_temp_response {
+        0x08, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03, 0x00, 0x02, 0xe9,
+        0xb9, 0x00, 0x00, 0x00, 0xdf, 0x00, 0x00, 0x00, 0x01, 0x03, 0x69, 0x00,
+        0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x03, 0x69, 0x20, 0x04, 0x01, 0x01,
+        0x02, 0x97, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d,
+    };
+    const std::vector<uint8_t> python_lob_write_clob_request {
+        0x03, 0x60, 0x04, 0x00, 0x01, 0x01, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03,
+        0x00, 0x02, 0xe9, 0xb9, 0x00, 0x00, 0x00, 0xdf, 0x00, 0x00, 0x00, 0x01,
+        0x03, 0x69, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e,
+        0xab, 0xb1, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0e, 0xc8, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+    };
+    const std::vector<uint8_t> python_lob_write_response {
+        0x08, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03, 0x00, 0x02, 0xe9,
+        0xb9, 0x00, 0x00, 0x00, 0xdf, 0x00, 0x00, 0x00, 0x01, 0x03, 0x69, 0x00,
+        0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0x97, 0x13, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x1d,
+    };
+    const std::vector<uint8_t> python_lob_free_piggyback {
+        0x11, 0x60, 0x09, 0x00, 0x01, 0x01, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x08, 0x01, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08,
+        0x80, 0x03, 0x00, 0x02, 0x31, 0x31, 0x00, 0x00, 0x00, 0x39, 0x00, 0x00,
+        0x00, 0x01, 0x03, 0x69, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0xec, 0x1e, 0xab, 0xb1, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x26,
+        0x00, 0x01, 0x81, 0x08, 0x00, 0x03, 0x00, 0x01, 0x31, 0x31, 0x00, 0x00,
+        0x00, 0x39, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00,
+    };
+    const std::vector<uint8_t> python_lob_locator_binds {
+        0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x01, 0x16, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x00, 0x00, 0x01,
+        0x70, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69,
+        0x01, 0x00, 0x00, 0x71, 0x01, 0x00, 0x00, 0x01, 0x70, 0x00, 0x04, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0xc1,
+        0x4e, 0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03,
+        0x00, 0x02, 0x31, 0x31, 0x00, 0x00, 0x00, 0x39, 0x00, 0x00, 0x00, 0x01,
+        0x03, 0x69, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e,
+        0xab, 0xb1, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x28, 0x28, 0x00,
+        0x26, 0x00, 0x01, 0x81, 0x08, 0x00, 0x03, 0x00, 0x01, 0x31, 0x31, 0x00,
+        0x00, 0x00, 0x39, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00,
+    };
+
+    // python writes a token byte after the sequence number; this client's
+    // channel adds it when it sends, so the encoders leave it out.
+    const auto without_token = [](std::vector<uint8_t> bytes) {
+        bytes.erase(bytes.begin() + 3);
+        return bytes;
+    };
+    CHECK(EncodeTtcCreateTempLob(3, TtcTempLobKind::CLOB) == without_token(python_lob_create_temp_clob));
+    CHECK(EncodeTtcCreateTempLob(5, TtcTempLobKind::BLOB) == without_token(python_lob_create_temp_blob));
+
+    const std::vector<uint8_t> created_locator(python_lob_create_temp_response.begin() + 1,
+                                               python_lob_create_temp_response.begin() + 41);
+    CHECK(DecodeCompleteTtcLocatorCall(python_lob_create_temp_response, 1, true, 27) == created_locator);
+    // The reply must be whole: half of it is a request for more, not a locator.
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] {
+        (void)DecodeCompleteTtcLocatorCall(std::vector<uint8_t>(python_lob_create_temp_response.begin(),
+                                                                python_lob_create_temp_response.begin() + 60),
+                                           1, true, 27);
+    });
+
+    const std::vector<uint8_t> locator(python_lob_write_clob_request.begin() + 28, python_lob_write_clob_request.begin() + 68);
+    std::vector<uint8_t> hundred_x;
+    for (size_t index = 0; index < 100; index++) {
+        hundred_x.push_back(0x00);
+        hundred_x.push_back('x');
+    }
+    CHECK(EncodeTtcWriteLob(4, locator, 1, hundred_x) == without_token(python_lob_write_clob_request));
+    const std::vector<uint8_t> written_locator(python_lob_write_response.begin() + 1, python_lob_write_response.begin() + 41);
+    CHECK(DecodeCompleteTtcLocatorCall(python_lob_write_response, 1, false, 27) == written_locator);
+
+    // Releasing two at once: python sends the same body in a piggyback.
+    const std::vector<uint8_t> first_free(python_lob_free_piggyback.end() - 80, python_lob_free_piggyback.end() - 40);
+    const std::vector<uint8_t> second_free(python_lob_free_piggyback.end() - 40, python_lob_free_piggyback.end());
+    const auto release = EncodeTtcFreeTempLobs(9, {first_free, second_free});
+    // python writes the operation code 0x80111 as four bytes with a leading
+    // zero; this client writes the shortest form, which is the same number.
+    std::vector<uint8_t> piggyback_body(python_lob_free_piggyback.begin() + 4, python_lob_free_piggyback.end());
+    const std::vector<uint8_t> wide_operation {0x04, 0x00, 0x08, 0x01, 0x11};
+    const auto operation_at = std::search(piggyback_body.begin(), piggyback_body.end(), wide_operation.begin(),
+                                          wide_operation.end());
+    CHECK(operation_at != piggyback_body.end());
+    const auto narrowed_at =
+        piggyback_body.erase(operation_at, operation_at + static_cast<std::ptrdiff_t>(wide_operation.size()));
+    piggyback_body.insert(narrowed_at, {0x03, 0x08, 0x01, 0x11});
+    CHECK(release[1] == python_lob_free_piggyback[1] && release[2] == python_lob_free_piggyback[2]);
+    CHECK(std::vector<uint8_t>(release.begin() + 3, release.end()) == piggyback_body);
+
+    // An INSERT of (id, CLOB, BLOB) binding the two locators.
+    const auto &binds_tail = python_lob_locator_binds;
+    const std::vector<uint8_t> clob_locator(binds_tail.end() - 83, binds_tail.end() - 43);
+    const std::vector<uint8_t> blob_locator(binds_tail.end() - 40, binds_tail.end());
+    OracleBind id_bind;
+    id_bind.oracle_type = 2;
+    id_bind.value = EncodeOracleNumber("77");
+    id_bind.maximum_bytes = 22;
+    OracleBind clob_bind;
+    clob_bind.oracle_type = 112;
+    clob_bind.value = clob_locator;
+    OracleBind blob_bind;
+    blob_bind.oracle_type = 113;
+    blob_bind.value = blob_locator;
+    TtcExecuteBindsRequest request;
+    request.sql = "insert into bl values (:1, :2, :3)";
+    request.binds = {id_bind, clob_bind, blob_bind};
+    request.ttc_field_version = 24;
+    const auto encoded = EncodeTtcExecuteBindsRequest(request);
+    CHECK(encoded.size() >= binds_tail.size());
+    CHECK(std::vector<uint8_t>(encoded.end() - static_cast<std::ptrdiff_t>(binds_tail.size()), encoded.end()) == binds_tail);
+
+    // A locator is exactly 40 bytes.
+    clob_bind.value = std::vector<uint8_t>(39, 0);
+    request.binds = {id_bind, clob_bind, blob_bind};
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)EncodeTtcExecuteBindsRequest(request); });
+    std::cout << "temporary LOB requests match python-oracledb's" << std::endl;
+}
+
+namespace {
+
+// Stands in for the server: hands out locators that change with every write,
+// as a real one does, and remembers what it was asked.
+class ScriptedLobWriter final : public TemporaryLobWriter {
+public:
+    std::vector<uint8_t> Create(TtcTempLobKind kind) override {
+        kinds.push_back(kind);
+        std::vector<uint8_t> locator(40, 0);
+        locator[0] = static_cast<uint8_t>(kinds.size());
+        return locator;
+    }
+    std::vector<uint8_t> Write(const std::vector<uint8_t> &locator, uint64_t offset,
+                               const std::vector<uint8_t> &data) override {
+        if (fail_write_after != 0 && writes.size() + 1 >= fail_write_after) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "scripted write failure");
+        }
+        writes.push_back({locator[0], offset, data.size()});
+        auto updated = locator;
+        updated[1]++;
+        return updated;
+    }
+    void Free(const std::vector<std::vector<uint8_t>> &locators) override {
+        if (fail_free) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "scripted free failure");
+        }
+        freed.insert(freed.end(), locators.begin(), locators.end());
+    }
+
+    struct WriteCall {
+        uint8_t owner;
+        uint64_t offset;
+        size_t size;
+    };
+    std::vector<TtcTempLobKind> kinds;
+    std::vector<WriteCall> writes;
+    std::vector<std::vector<uint8_t>> freed;
+    size_t fail_write_after = 0;
+    bool fail_free = false;
+};
+
+OracleBind LobContentBind(uint8_t kind, std::optional<std::vector<uint8_t>> value) {
+    OracleBind bind;
+    bind.name = "1";
+    bind.oracle_type = kind == 113 ? 23 : 1;
+    bind.value = std::move(value);
+    bind.lob_content = kind;
+    return bind;
+}
+
+} // namespace
+
+// What goes through a temporary LOB, in what pieces, and what is released.
+static void TestTemporaryLobScope() {
+    const size_t big = TEMP_LOB_THRESHOLD_BYTES + 1;
+    {
+        // Under the threshold nothing changes: the ordinary bind is the proven form.
+        std::vector<OracleBind> binds {LobContentBind(112, std::vector<uint8_t>(TEMP_LOB_THRESHOLD_BYTES, 'a'))};
+        CHECK(!TemporaryLobScope::Needed(binds));
+    }
+    {
+        // A CLOB is written as UTF-16: offsets count UTF-16 units, so a character
+        // outside the BMP moves the offset by two, and pieces never split a character.
+        std::string text;
+        while (text.size() <= big) {
+            text += "ð";
+        }
+        std::vector<OracleBind> binds {LobContentBind(112, std::vector<uint8_t>(text.begin(), text.end()))};
+        CHECK(TemporaryLobScope::Needed(binds));
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        scope.Convert(binds);
+        CHECK(binds[0].oracle_type == 112 && binds[0].lob_content == 0 && binds[0].value && binds[0].value->size() == 40);
+        CHECK(writer.kinds.size() == 1 && writer.kinds[0] == TtcTempLobKind::CLOB);
+        CHECK(writer.writes.size() >= 4);
+        uint64_t expected_offset = 1;
+        size_t total_bytes = 0;
+        for (const auto &call : writer.writes) {
+            CHECK(call.offset == expected_offset);
+            CHECK(call.size % 4 == 0 && call.size <= TEMP_LOB_WRITE_CHUNK_BYTES * 2);
+            expected_offset += call.size / 2;
+            total_bytes += call.size;
+        }
+        CHECK(total_bytes == text.size()); // 4 UTF-8 bytes become 4 UTF-16 bytes
+        // The locator the bind carries is the one the last write returned.
+        CHECK((*binds[0].value)[1] == writer.writes.size());
+        CHECK(writer.freed.empty());
+        scope.Release();
+        CHECK(writer.freed.size() == 1);
+        scope.Release();
+        CHECK(writer.freed.size() == 1);
+    }
+    {
+        // A BLOB's offsets are bytes.
+        std::vector<OracleBind> binds {LobContentBind(113, std::vector<uint8_t>(big, 0x5a))};
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        scope.Convert(binds);
+        CHECK(binds[0].oracle_type == 113 && writer.kinds[0] == TtcTempLobKind::BLOB);
+        uint64_t expected_offset = 1;
+        for (const auto &call : writer.writes) {
+            CHECK(call.offset == expected_offset);
+            expected_offset += call.size;
+        }
+        CHECK(expected_offset == big + 1);
+    }
+    {
+        // Array DML declares one set of bind metadata for every row of a group, so a
+        // column that needs a temporary LOB in one row is bound by locator in all of them.
+        std::vector<std::vector<OracleBind>> rows {
+            {LobContentBind(112, std::vector<uint8_t>(big, 'x'))},
+            {LobContentBind(112, std::vector<uint8_t>(3, 'y'))},
+            {LobContentBind(112, std::nullopt)},
+        };
+        CHECK(TemporaryLobScope::NeededRows(rows, 0, 3) && !TemporaryLobScope::NeededRows(rows, 1, 3));
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        scope.ConvertRows(rows);
+        CHECK(rows[0][0].oracle_type == 112 && rows[1][0].oracle_type == 112 && rows[2][0].oracle_type == 112);
+        CHECK(rows[0][0].value->size() == 40 && rows[1][0].value->size() == 40 && !rows[2][0].value);
+        CHECK(writer.kinds.size() == 2);
+        scope.Release();
+        CHECK(writer.freed.size() == 2);
+    }
+    {
+        // A write that fails still releases what exists, without throwing.
+        std::vector<OracleBind> binds {LobContentBind(112, std::vector<uint8_t>(big, 'x'))};
+        ScriptedLobWriter writer;
+        writer.fail_write_after = 2;
+        TemporaryLobScope scope(writer);
+        ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { scope.Convert(binds); });
+        scope.ReleaseQuietly();
+        CHECK(writer.freed.size() == 1);
+        // And a refused release is swallowed on that path, reported on the normal one.
+        ScriptedLobWriter refusing;
+        refusing.fail_free = true;
+        std::vector<OracleBind> more {LobContentBind(113, std::vector<uint8_t>(big, 1))};
+        TemporaryLobScope second(refusing);
+        second.Convert(more);
+        ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { second.Release(); });
+        TemporaryLobScope third(refusing);
+        std::vector<OracleBind> again {LobContentBind(113, std::vector<uint8_t>(big, 1))};
+        third.Convert(again);
+        third.ReleaseQuietly();
+    }
+    {
+        // Text that is not UTF-8 is refused rather than written.
+        std::vector<uint8_t> broken(big, 'a');
+        broken[10] = 0xFF;
+        std::vector<OracleBind> binds {LobContentBind(112, broken)};
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { scope.Convert(binds); });
+        scope.ReleaseQuietly();
+    }
+    std::cout << "temporary LOB scope converts, chunks and releases" << std::endl;
+}
+
 // A VECTOR is written as its image in a locator, as python-oracledb Thin does,
 // and keeps its place among the binds when the statement has short ones after it.
 static void TestVectorBindsMatchPython() {
@@ -8037,6 +8366,8 @@ int main() {
     TestBooleanLocalZoneAndWrites();
     TestJsonAndVectorImages();
     TestRequestHeadersCarryATokenFromFieldVersion18();
+    TestTemporaryLobsMatchPython();
+    TestTemporaryLobScope();
     TestVectorBindsMatchPython();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();

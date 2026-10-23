@@ -724,8 +724,10 @@ SELECT * FROM oracle_call_named('ora', 'APP.CALCULATE_TOTAL',
      {'name': 'p_total', 'direction': 'out', 'type': 'number',  'value': NULL}]);
 ```
 
-Types are `number`, `varchar`, `date`, `timestamp`, `raw` (uppercase hex),
-`float`, `double`, and `cursor`.
+Types are `number`, `varchar`, `nvarchar`, `boolean`, `date`, `timestamp`,
+`timestamp_ltz` (an offset in the text, bound as UTC), `interval_ym`,
+`interval_ds` (DuckDB interval text, such as `2 years 3 months` or
+`1 day 02:03:04`), `raw` (uppercase hex), `float`, `double`, and `cursor`.
 
 ### Getting a result set back
 
@@ -856,10 +858,11 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `BOOLEAN` (23ai) | `BOOLEAN` | |
 | `JSON` (23ai) | `JSON` | the stored OSON image, decoded to JSON text |
 | `VECTOR` (23ai) | `FLOAT[n]`, `DOUBLE[n]`, `TINYINT[n]`, `UTINYINT[n]`; `STRUCT` for `SPARSE` | by the column's declared format and dimensions |
+| `XMLTYPE` | `VARCHAR` | the document as text (`XMLSERIALIZE ... NO INDENT`); written back through `XMLPARSE(DOCUMENT ...)`. An attached table only |
 | `ROWID`, `UROWID` | `VARCHAR` | the 18 characters `ROWIDTOCHAR` gives; a logical UROWID is refused |
 | `LONG`, `LONG RAW` | `VARCHAR`, `BLOB` | up to 1 MiB a value |
 
-Anything else — `BFILE`, `XMLTYPE`, object and collection types — is **refused when the query is
+Anything else — `BFILE`, object and collection types — is **refused when the query is
 bound**, with a message naming the column and the reason. It is never decoded
 into something that looks right and is not.
 
@@ -897,7 +900,7 @@ directly, and every client that touches the table gets a real numeric type.
 row carries only a pointer, and fetching the content costs extra round trips per
 value. Measured: 2,000 rows with a 2,000-character CLOB took **1.22 s**, against
 **0.004 s** for the same rows without that column. Select a LOB column only when
-you need it. Writing is cheap by comparison: a LOB value goes out as an ordinary bind, up to 16 MiB each.
+you need it. Writing is cheap by comparison: a LOB value goes out as an ordinary bind up to 8 MiB, and past that through a temporary LOB, up to 1 GiB each.
 
 ---
 

@@ -284,8 +284,9 @@ homogeneous, so `[1, 'one', DATE '2026-01-02']` cannot even be constructed. A
 | `INTERVAL DAY TO SECOND` | `INTERVAL` | Days and microseconds. Oracle keeps nanoseconds; a fraction finer than a microsecond is refused, not rounded. Written from an interval without months, whose days and time have one sign |
 | `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | An instant. The session time zone is UTC (see below), so the value Oracle sends is the instant. Microseconds only: a finer fraction is refused. Written from a `TIMESTAMPTZ` |
 | `BOOLEAN` (23ai) | `BOOLEAN` | Needs a server that sends it as its own type, which 23ai does to a client advertising TTC field version 17, as this one does. Earlier servers have no such column |
-| `JSON` (21c and later; read from 23ai) | `JSON` | The OSON image the server stores, decoded to JSON text. Objects keep the order the image holds. Oracle's non-JSON scalars print as `JSON_SERIALIZE` prints them: timestamps as ISO 8601 strings, `RAW` as upper-case hex, intervals as ISO 8601 durations. Written as its text, up to 16 MiB |
+| `JSON` (21c and later; read from 23ai) | `JSON` | The OSON image the server stores, decoded to JSON text. Objects keep the order the image holds. Oracle's non-JSON scalars print as `JSON_SERIALIZE` prints them: timestamps as ISO 8601 strings, `RAW` as upper-case hex, intervals as ISO 8601 durations. Written as its text, up to 1 GiB (past 8 MiB through a temporary LOB) |
 | `VECTOR` (23ai) | `FLOAT[n]`, `DOUBLE[n]`, `TINYINT[n]`, `UTINYINT[n]`, or the same as a list | By the column's declared storage format and dimensions: `FLOAT32` is `FLOAT`, `FLOAT64` is `DOUBLE`, `INT8` is `TINYINT`, `BINARY` is the packed bytes as `UTINYINT` (dimensions ÷ 8). A fixed dimension count is an array, `*` a list. A column of any format (`VECTOR(*,*)`) is a list of `DOUBLE`, which holds every dense format but `BINARY`; a `BINARY` value in one is refused. A `SPARSE` column is `STRUCT(dimensions UINTEGER, indices UINTEGER[], "values" T[])`. Written as the image python-oracledb sends |
+| `XMLTYPE` | `VARCHAR` | Through an attached table: the document as text, selected as `XMLSERIALIZE(CONTENT col AS CLOB NO INDENT)`, so it comes back compact whatever the storage. Written through `XMLPARSE(DOCUMENT :n)`, which gives NULL for NULL and Oracle's own `ORA-31011` for a document that does not parse. A filter on one runs in DuckDB. `oracle_query` of a bare `XMLTYPE` column is still refused: select `XMLSERIALIZE(...)` yourself |
 | `ROWID`, `UROWID` | `VARCHAR` | The 18 characters Oracle itself prints (`ROWIDTOCHAR`). A logical UROWID, which an index-organized table has, is refused |
 | `LONG` | `VARCHAR` | At most 1 MiB per value |
 | `LONG RAW` | `BLOB` | At most 1 MiB per value |
@@ -338,7 +339,7 @@ The define is only written when every column is a type whose define is known;
 a table with a `ROWID` or `LONG` beside its JSON column is read value by value,
 as before.
 
-**A statement that writes a `JSON` column can carry text up to 16 MiB; one that
+**A statement that writes a `JSON` column can carry text up to 1 GiB; one that
 writes a `VECTOR` carries the image.** A vector as text would stop at the 32767
 bytes of a `VARCHAR2` bind, about 2,700 `FLOAT32` elements, and embeddings of
 3,072 and 4,096 dimensions are common. Neither can be returned by
@@ -349,7 +350,7 @@ bytes of a `VARCHAR2` bind, about 2,700 `FLOAT32` elements, and embeddings of
 | Type | Why |
 | --- | --- |
 | `BFILE` | No read path |
-| Object, `VARRAY`, nested table, `XMLTYPE`, `REF` | Outside this version |
+| Object, `VARRAY`, nested table, `REF` | Outside this version |
 
 A refusal happens at bind time, so a query either runs correctly or fails
 immediately — it never returns a column decoded into something wrong.
@@ -379,9 +380,16 @@ python-oracledb uses. Through an attached table that is `INSERT` and `UPDATE`
 with a `VARCHAR` or `BLOB` value; an empty value is NULL, like any empty string
 in Oracle.
 
-- **16 MiB per value.** One bind carries at most that. A larger value is refused
-  by name, because a bigger one needs a temporary LOB written block by block,
-  which is not implemented.
+- **Up to 8 MiB a value is an ordinary bind; past that, a temporary LOB.** The
+  session creates one (`LOB_OP` `CREATE_TEMP`, for the session's duration),
+  writes the content into it in pieces of at most 2 MiB (a `CLOB` as UTF-16, its
+  offsets counted in UTF-16 units), binds its locator, and releases it when the
+  statement is done, on failure too. In an array `INSERT` a column that needs one
+  in any row of a group is bound by locator in every row of that group, because
+  the bind metadata is declared once. The same shapes python-oracledb Thin sends
+  (see PROVENANCE.md). A value is limited to **1 GiB**; the server's temporary
+  tablespace is the real ceiling. Checked live to 100 MiB of `CLOB` and 200 MiB
+  of `BLOB` against 19c and 23ai, content compared by hash.
 - **Memory.** A statement is built whole, so a batch of N rows holds N times its
   LOB values at once; insert large LOBs a few rows at a time.
 - **`RETURNING` cannot cover a LOB, JSON or VECTOR column.** Oracle returns a locator
@@ -595,13 +603,14 @@ SELECT * FROM oracle_arguments('ora', 'PKG.PROC');   -- inspect the signature
 ```
 
 **Works:** `IN`, `OUT`, and `IN OUT` arguments of `NUMBER`, `VARCHAR2`, `CHAR`,
-`DATE`, and `TIMESTAMP`; functions with a return value; `SYS_REFCURSOR` returns,
+`NCHAR`, `NVARCHAR2`, `DATE`, `TIMESTAMP`, `TIMESTAMP WITH LOCAL TIME ZONE`
+(bound as the UTC wall time), `INTERVAL YEAR TO MONTH`, `INTERVAL DAY TO SECOND`
+and `BOOLEAN` (a PL/SQL `BOOLEAN`, on a 23ai server); functions with a return value; `SYS_REFCURSOR` returns,
 read through `oracle_cursor` and released with `oracle_close_call`; names
 reached through a synonym; packaged and standalone callables.
 
-**Refused:** arguments of LOB, `NCHAR`/`NVARCHAR2`, object, record, collection,
-`REF`, `XMLTYPE`, `PL/SQL BOOLEAN`, `INTERVAL`, or `TIMESTAMP WITH [LOCAL] TIME
-ZONE` type; a name that matches more than one object; and an overload set with
+**Refused:** arguments of LOB, object, record, collection, `REF`, `XMLTYPE`,
+`JSON`, `VECTOR` or `TIMESTAMP WITH TIME ZONE` type; a name that matches more than one object; and an overload set with
 two candidates of the same arity — only the caller can say which was meant.
 
 A LOB is therefore **readable as a column but not passable as an argument.**
@@ -655,8 +664,8 @@ the attached catalog's transactions reuse sessions as §6 describes.
 ## 11. Not supported, in one list
 
 Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
-LOB values past 16 MiB · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
-`LONG` and `ROWID` · object, collection, record and `XMLTYPE`
+LOB values past 1 GiB · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
+`LONG` and `ROWID` · object, collection and record
 types · several schemas in one attachment ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1
 verifier · SEPS · IAM · failover of an established session (TAF) ·

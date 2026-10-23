@@ -59,12 +59,23 @@ bool IsVectorBind(const OracleBind &bind) {
     return bind.oracle_type == ORACLE_WIRE_TYPE_VECTOR;
 }
 
+// A CLOB or BLOB bound by locator: the value is the 40-byte locator of a
+// temporary LOB that already holds the content.
+bool IsLocatorBind(const OracleBind &bind) {
+    return bind.oracle_type == 112 || bind.oracle_type == 113;
+}
+
+constexpr uint32_t LOCATOR_BIND_BYTES = 112;
+
 uint32_t BindBufferSize(const OracleBind &bind) {
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
         return 4;
     }
     if (IsVectorBind(bind)) {
         return VECTOR_BIND_BYTES;
+    }
+    if (IsLocatorBind(bind)) {
+        return LOCATOR_BIND_BYTES;
     }
     if (bind.maximum_bytes != 0) {
         return bind.maximum_bytes;
@@ -84,7 +95,8 @@ bool IsCharacterType(uint16_t type) {
 
 void ValidateBind(const OracleBind &bind) {
     if (bind.oracle_type == 0 || bind.oracle_type > 255 || (bind.value && bind.value->size() > MAX_BUFFER_BYTES) ||
-        (IsVectorBind(bind) && bind.value && bind.value->size() > VECTOR_BIND_BYTES)) {
+        (IsVectorBind(bind) && bind.value && bind.value->size() > VECTOR_BIND_BYTES) ||
+        (IsLocatorBind(bind) && bind.value && bind.value->size() != 40)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC bind has invalid type or value size");
     }
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR && bind.direction == BindDirection::BIND_IN) {
@@ -163,12 +175,12 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
                       const std::vector<uint32_t> &buffer_sizes, uint8_t field_version) {
     for (size_t index = 0; index < binds.size(); index++) {
         const auto &bind = binds[index];
-        const auto character_type = IsCharacterType(bind.oracle_type);
+        const auto character_type = IsCharacterType(bind.oracle_type) || bind.oracle_type == 112;
         writer.WriteByte(static_cast<uint8_t>(bind.oracle_type)).WriteByte(1).WriteByte(0).WriteByte(0);
         // UB8 is one universal-length field, not two UB4 placeholders. The
         // previous four-zero tail inserted two phantom fields before OID and
         // made a bound SELECT's metadata impossible for Oracle to parse.
-        writer.WriteUB4(buffer_sizes[index]).WriteUB4(0).WriteUB8(IsVectorBind(bind) ? LOB_PREFETCH_FLAG : 0);
+        writer.WriteUB4(buffer_sizes[index]).WriteUB4(0).WriteUB8(IsVectorBind(bind) || IsLocatorBind(bind) ? LOB_PREFETCH_FLAG : 0);
         // The empty object-id slot is a distinct UB4 (encoded as one zero
         // byte). Omitting it shifts version/charset/form by one field; Oracle
         // then reports a nonsensical collation id for character binds.
@@ -206,6 +218,9 @@ void WriteBindValue(ByteWriter &writer, const OracleBind &bind) {
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
         // OUT SYS_REFCURSOR has metadata but no client-side value.
         writer.WriteByte(0);
+    } else if (IsLocatorBind(bind) && bind.value) {
+        writer.WriteUB4(static_cast<uint32_t>(bind.value->size()));
+        writer.WriteLengthPrefixed(bind.value);
     } else if (IsVectorBind(bind) && bind.value) {
         const auto locator = ImageLocator(bind.value->size());
         writer.WriteUB4(static_cast<uint32_t>(locator.size()));
@@ -223,7 +238,7 @@ void WriteBindValue(ByteWriter &writer, const OracleBind &bind) {
 // that sets six vector columns with all six values first, ahead of the short
 // binds declared after them.
 bool IsDeferredBind(const OracleBind &bind, uint32_t buffer_size) {
-    return buffer_size > LONG_BIND_BUFFER_BYTES && !IsVectorBind(bind);
+    return buffer_size > LONG_BIND_BUFFER_BYTES && !IsVectorBind(bind) && !IsLocatorBind(bind);
 }
 
 void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds,

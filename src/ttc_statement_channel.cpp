@@ -70,8 +70,26 @@ TtcStatementChannel::TtcStatementChannel(TtcChannel &channel_p, OracleStatementR
 }
 
 TtcLobResponse TtcStatementChannel::LobOperation(const TtcLobRequest &request, uint8_t server_field_version) {
+    TtcLobResponse result;
+    LobExchange(EncodeTtcLobRequest(request), [&](const std::vector<uint8_t> &response) {
+        result = DecodeCompleteTtcLobCall(response, request.locator.size(), server_field_version);
+    });
+    return result;
+}
+
+std::vector<uint8_t> TtcStatementChannel::LocatorOperation(const std::vector<uint8_t> &request, size_t locator_count,
+                                                           bool created, uint8_t server_field_version) {
+    std::vector<uint8_t> locator;
+    LobExchange(request, [&](const std::vector<uint8_t> &response) {
+        locator = DecodeCompleteTtcLocatorCall(response, locator_count, created, server_field_version);
+    });
+    return locator;
+}
+
+void TtcStatementChannel::LobExchange(const std::vector<uint8_t> &request,
+                                      const std::function<void(const std::vector<uint8_t> &)> &decode) {
     const auto call = channel.LockCall();
-    channel.Send(EncodeTtcLobRequest(request));
+    channel.Send(request);
     // A LOB large enough to outgrow one packet arrives as several, and so can
     // the end-of-call behind it: a response is complete only when the data,
     // the return parameter AND the end-of-call all decode. Until then the
@@ -85,7 +103,8 @@ TtcLobResponse TtcStatementChannel::LobOperation(const TtcLobRequest &request, u
     auto response = channel.Receive();
     for (size_t pass = 0;; pass++) {
         try {
-            return DecodeCompleteTtcLobCall(response, request.locator.size(), server_field_version);
+            decode(response);
+            return;
         } catch (const ProtocolError &error) {
             if (error.Kind() != ProtocolErrorKind::TRUNCATED) {
                 throw;

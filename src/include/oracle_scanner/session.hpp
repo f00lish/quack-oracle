@@ -86,6 +86,12 @@ struct OracleBind {
     // character set for a character type), 2 the national one, in which case
     // the value must be UTF-16BE.
     uint8_t character_set_form = 0;
+    // Set on a bind that stands for the content of a LOB-like target: 112 for
+    // text (a CLOB, or JSON and XML written as text), 113 for bytes. `value` is
+    // then the content itself, `oracle_type` is how a small one is bound
+    // (VARCHAR2 or RAW), and a native session sends one too large for that
+    // through a temporary LOB, binding its locator instead.
+    uint8_t lob_content = 0;
 };
 
 class OracleCursor {

@@ -12,6 +12,7 @@
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include <cstdint>
 #include <mutex>
+#include <functional>
 #include <vector>
 
 namespace oracle_scanner {
@@ -26,6 +27,12 @@ public:
     //! follows the data is consumed here, so a caller sees a value or an
     //! error and never a half-read channel.
     TtcLobResponse LobOperation(const TtcLobRequest &request, uint8_t server_field_version);
+
+    //! Runs a LOB_OP that returns locators rather than data — creating,
+    //! writing or releasing a temporary LOB — from an already encoded request.
+    //! Returns the locator(s) the server sent back, concatenated.
+    std::vector<uint8_t> LocatorOperation(const std::vector<uint8_t> &request, size_t locator_count, bool created,
+                                          uint8_t server_field_version);
 
     //! Held across a request and the response that answers it. See
     //! TtcChannel::LockCall.
@@ -64,6 +71,8 @@ public:
     bool Close(OracleStatementHandle handle);
 
 private:
+    void LobExchange(const std::vector<uint8_t> &request, const std::function<void(const std::vector<uint8_t> &)> &decode);
+
     TtcChannel &channel;
     OracleStatementRegistry &statements;
 };

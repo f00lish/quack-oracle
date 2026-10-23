@@ -88,6 +88,7 @@ set(EXTENSION_SOURCES
     src/ttc_o5logon.cpp
     src/value_codec.cpp
     src/oson.cpp
+    src/temp_lob.cpp
     src/oracle_vector.cpp
     src/ttc_define.cpp
     src/auth_crypto.cpp
@@ -171,6 +172,7 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/ttc_o5logon.cpp
                  src/value_codec.cpp
                  src/oson.cpp
+                 src/temp_lob.cpp
                  src/oracle_vector.cpp
                  src/ttc_define.cpp
                  src/auth_crypto.cpp

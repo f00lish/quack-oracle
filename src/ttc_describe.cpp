@@ -127,10 +127,14 @@ TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message,
     }
     try {
         ReadDeclaredBytes(reader); // current date
-        reader.ReadUB4();
-        reader.ReadUB4();
-        reader.ReadUB4();
-        reader.ReadUB4();
+        // The four fields between the two blocks are read without a width
+        // limit: the first of them in an 11.2 response states a length of
+        // eighty-one bytes, and a four-byte limit would refuse the response
+        // that the server sent in good faith.
+        reader.ReadUB4Unbounded();
+        reader.ReadUB4Unbounded();
+        reader.ReadUB4Unbounded();
+        reader.ReadUB4Unbounded();
         ReadDeclaredBytes(reader); // descriptor tail
     } catch (const ProtocolError &error) {
         throw ProtocolError(error.Kind(), "TTC describe trailer at offset " + std::to_string(reader.Position()) + ": " +

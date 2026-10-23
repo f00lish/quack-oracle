@@ -38,6 +38,13 @@ public:
     uint16_t ReadUB2();
     uint32_t ReadUB4();
     uint64_t ReadUB8();
+    // Reads a value whose own length byte may be wider than the width its
+    // field is usually called. A compressed universal integer states its own
+    // length, and a few fields in a describe response carry one that is far
+    // past their usual width -- an 11.2 response has an eighty-one byte one.
+    // Those fields are read with this, so the width a field is normally called
+    // stays the limit everywhere else.
+    uint32_t ReadUB4Unbounded();
     std::optional<std::vector<uint8_t>> ReadLengthPrefixed(size_t maximum_size,
                                                             TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
     std::string ReadNullTerminated(size_t maximum_size);

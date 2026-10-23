@@ -24,7 +24,9 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <string>
@@ -32,6 +34,161 @@
 namespace duckdb {
 
 namespace {
+
+// JSON paths. A native JSON column filtered with json_extract_string(col, '$.a.b')
+// is not translated: DuckDB returns the text of whatever the path finds (a number
+// as written in the document, an object as JSON text), and Oracle's JSON_VALUE
+// returns its own rendering of a scalar and nothing for an object. What can be
+// sent is a *superset*: a predicate Oracle makes true for every row DuckDB's is
+// true for. The scan keeps DuckDB's filter and applies it to what comes back, so
+// Oracle only has to leave out rows that cannot match, which is where the saving
+// is, and the answer is DuckDB's.
+bool SimpleJsonPath(const std::string &path) {
+    if (path.size() < 2 || path[0] != '$') {
+        return false;
+    }
+    size_t position = 1;
+    while (position < path.size()) {
+        if (path[position] == '.') {
+            position++;
+            const auto start = position;
+            while (position < path.size() && (std::isalnum(static_cast<unsigned char>(path[position])) || path[position] == '_')) {
+                position++;
+            }
+            if (position == start || std::isdigit(static_cast<unsigned char>(path[start]))) {
+                return false;
+            }
+        } else if (path[position] == '[') {
+            position++;
+            const auto start = position;
+            while (position < path.size() && std::isdigit(static_cast<unsigned char>(path[position]))) {
+                position++;
+            }
+            if (position == start || position >= path.size() || path[position] != ']') {
+                return false;
+            }
+            position++;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A string constant whose text no JSON number, literal, object or array can be
+// written as, so that a value DuckDB renders as text equal to it is a JSON string
+// and Oracle renders it the same way.
+bool PlainJsonText(const std::string &text) {
+    if (text.empty() || text.size() > 2000 || text == "true" || text == "false" || text == "null" ||
+        text[0] == '{' || text[0] == '[') {
+        return false;
+    }
+    if (text.find('\0') != std::string::npos) {
+        return false;
+    }
+    char *end = nullptr;
+    std::strtod(text.c_str(), &end);
+    return end == text.c_str();
+}
+
+// The JSON path of a json_extract_string(column, 'path') call, or nothing.
+std::optional<std::string> ExtractedPath(const Expression &expression) {
+    if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+        return std::nullopt;
+    }
+    const auto &call = expression.Cast<BoundFunctionExpression>();
+    const auto &name = call.Function().GetName().GetIdentifierName();
+    if (name != "json_extract_string" && name != "->>") {
+        return std::nullopt;
+    }
+    const auto &arguments = call.GetChildren();
+    if (arguments.size() != 2 || arguments[0]->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+        arguments[0]->Cast<BoundReferenceExpression>().Index() != 0 ||
+        arguments[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+        return std::nullopt;
+    }
+    const auto &path = arguments[1]->Cast<BoundConstantExpression>().GetValue();
+    if (path.IsNull() || path.type().id() != LogicalTypeId::VARCHAR || !SimpleJsonPath(path.ToString())) {
+        return std::nullopt;
+    }
+    return path.ToString();
+}
+
+std::string JsonStringLiteral(const std::string &text) {
+    std::string literal = "'";
+    for (const auto character : text) {
+        literal += character == '\'' ? std::string("''") : std::string(1, character);
+    }
+    return literal + "'";
+}
+
+std::optional<std::string> JsonPrefilter(const Expression &piece, const OracleColumn &column,
+                                         const std::string &quoted_name) {
+    if (column.oracle_type != 119) {
+        return std::nullopt;
+    }
+    const auto value_of = [&](const std::string &path) {
+        return "JSON_VALUE(" + quoted_name + ", " + JsonStringLiteral(path) + " RETURNING VARCHAR2(4000) NULL ON ERROR)";
+    };
+    if (BoundComparisonExpression::IsComparison(piece) && piece.GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
+        const auto &comparison = piece.Cast<BoundFunctionExpression>();
+        const auto path = ExtractedPath(BoundComparisonExpression::Left(comparison));
+        const auto &right = BoundComparisonExpression::Right(comparison);
+        if (!path || right.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+            return std::nullopt;
+        }
+        const auto &constant = right.Cast<BoundConstantExpression>().GetValue();
+        if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR || !PlainJsonText(constant.ToString())) {
+            return std::nullopt;
+        }
+        return value_of(*path) + " = " + JsonStringLiteral(constant.ToString());
+    }
+    if (piece.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+        piece.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+        // An IN list arrives as a disjunction of equalities: narrowed only if every
+        // branch is, since one branch left out would drop rows it matches.
+        std::string joined;
+        for (const auto &child : piece.Cast<BoundConjunctionExpression>().GetChildren()) {
+            const auto branch = JsonPrefilter(*child, column, quoted_name);
+            if (!branch) {
+                return std::nullopt;
+            }
+            joined += (joined.empty() ? "" : " OR ") + *branch;
+        }
+        return "(" + joined + ")";
+    }
+    if (piece.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+        const auto &op = piece.Cast<BoundOperatorExpression>();
+        const auto &children = op.GetChildren();
+        if (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL && children.size() == 1) {
+            const auto path = ExtractedPath(*children[0]);
+            if (path) {
+                // True for a null, an object and an array too, which DuckDB's test also is for the last two.
+                return "JSON_EXISTS(" + quoted_name + ", " + JsonStringLiteral(*path) + ")";
+            }
+        }
+        if (op.GetExpressionType() == ExpressionType::COMPARE_IN && children.size() >= 2 && children.size() <= 1001) {
+            const auto path = ExtractedPath(*children[0]);
+            if (!path) {
+                return std::nullopt;
+            }
+            std::string list;
+            for (size_t index = 1; index < children.size(); index++) {
+                if (children[index]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+                    return std::nullopt;
+                }
+                const auto &constant = children[index]->Cast<BoundConstantExpression>().GetValue();
+                if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR ||
+                    !PlainJsonText(constant.ToString())) {
+                    return std::nullopt;
+                }
+                list += (list.empty() ? "" : ", ") + JsonStringLiteral(constant.ToString());
+            }
+            return value_of(*path) + " IN (" + list + ")";
+        }
+    }
+    return std::nullopt;
+}
 
 // Oracle refuses an expression list longer than 1,000 entries, so a longer one
 // could not be sent even if every value were provable.
@@ -602,6 +759,25 @@ unique_ptr<Expression> LocalExpression(const ExpressionFilter &filter, const Exp
 
 } // namespace
 
+// Whether DuckDB may hand the scan this expression as a filter on one column. Only
+// tests of a JSON path are asked for: the scan narrows them in Oracle where it can
+// (JsonPrefilter) and always applies the expression itself, so a shape it cannot
+// narrow costs nothing but the pushdown.
+bool OraclePushdownExpression(ClientContext &, const LogicalGet &, Expression &expression) {
+    bool json_path = false;
+    std::function<void(const Expression &)> visit = [&](const Expression &node) {
+        if (node.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+            const auto &name = node.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
+            if (name == "json_extract_string" || name == "->>") {
+                json_path = true;
+            }
+        }
+        ExpressionIterator::EnumerateChildren(node, [&](const Expression &child) { visit(child); });
+    };
+    visit(expression);
+    return json_path;
+}
+
 OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
                                      const std::vector<column_t> &scanned_columns) {
     OracleFilterSplit result;
@@ -657,6 +833,15 @@ OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::v
                     translated = TranslatePiece(*piece, column, quoted_name);
                 } catch (const NotImplementedException &) {
                     local = true;
+                }
+            }
+            if (local && column_index < columns.size()) {
+                // A JSON path test Oracle can narrow but not decide: the narrower
+                // predicate goes to Oracle and the real one stays here.
+                if (const auto narrowed =
+                        JsonPrefilter(*piece, columns[column_index],
+                                      KeywordHelper::WriteQuotedAndEscaped(columns[column_index].name, '"'))) {
+                    result.where += (result.where.empty() ? "" : " AND ") + *narrowed;
                 }
             }
             if (local) {

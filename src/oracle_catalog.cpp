@@ -989,6 +989,7 @@ public:
         function.filter_pushdown =
             context.TryGetCurrentSetting("oracle_filter_pushdown", pushdown) && BooleanValue::Get(pushdown);
         function.projection_pushdown = true;
+        function.pushdown_expression = OraclePushdownExpression;
         function.cardinality = OracleAttachedScanCardinality;
         // TABLESAMPLE SYSTEM becomes Oracle's SAMPLE BLOCK, so a sample of a big
         // table reads a fraction of its blocks instead of all of them.

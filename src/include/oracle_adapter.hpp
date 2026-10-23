@@ -370,6 +370,7 @@ struct OracleFilterSplit {
     std::string where;
     vector<unique_ptr<Expression>> local;
 };
+bool OraclePushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expression);
 OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
                                      const std::vector<column_t> &scanned_columns);
 //! The strict form of the same translation: a filter that cannot be translated

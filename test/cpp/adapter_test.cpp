@@ -2301,6 +2301,15 @@ void TestJsonAndVectorColumnsThroughSql() {
 
     auto wrong_shape = database.Query("INSERT INTO ora.main.DOCS (ID, EMB) VALUES (5, [1, 2]);");
     CHECK(wrong_shape->HasError());
+    // A test of a JSON path is narrowed in Oracle (JSON_VALUE / JSON_EXISTS) and still applied by DuckDB.
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE DOC->>'$.name' = 'abc';")->HasError());
+    CHECK(script->queries.back().find("JSON_VALUE(\"DOC\", '$.name' RETURNING VARCHAR2(4000) NULL ON ERROR) = 'abc'") !=
+          std::string::npos);
+    // A constant that could be a number is not narrowed: Oracle writes numbers its own way.
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE DOC->>'$.name' = '5';")->HasError());
+    CHECK(script->queries.back().find("JSON_VALUE") == std::string::npos);
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE DOC->>'$.a[0]' IS NOT NULL;")->HasError());
+    CHECK(script->queries.back().find("JSON_EXISTS(\"DOC\", '$.a[0]')") != std::string::npos);
     std::cout << "JSON and VECTOR columns read, write and attach against a fake session" << std::endl;
 }
 

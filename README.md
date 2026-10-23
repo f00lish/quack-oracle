@@ -480,6 +480,18 @@ lists joined by `OR`, up to 16384 values (more than that is read unfiltered, as 
 composite key is filtered column by column, never as a tuple, since DuckDB hands the scan one
 filter per column.
 
+**JSON paths.** A test of a path in a native `JSON` column
+(`WHERE doc->>'$.customer.id' = 'c42'`, also `json_extract_string`, an `IN` list as `OR`, `IS NOT NULL`) is
+narrowed in Oracle with `JSON_VALUE(doc, '$.customer.id' RETURNING VARCHAR2(4000) NULL ON ERROR) = 'c42'`
+or `JSON_EXISTS`, so only candidate documents are read and decoded, and DuckDB still applies its own test
+to them. The Oracle predicate is a superset on purpose: DuckDB renders a number as the document wrote it and an
+object as JSON text, Oracle does neither, so a constant that could be a JSON number, `true`, `false`,
+`null`, an object or an array is not narrowed, and neither is a path with a quoted key, a wildcard or a
+filter (`$.a`, `$.a.b` and `$.a[0]` are). The answer is always DuckDB's: on 20,000 documents, with numbers,
+booleans, nulls, objects, quotes and non-ASCII text as values, the same rows came back with the pushdown
+on and off. A comparison with an `OR` of paths narrows only if every branch can be. Needs Oracle 21c or later
+for the `JSON` type; `VARCHAR2`/`CLOB` columns with `IS JSON` are not narrowed.
+
 **One moment for a whole statement.** A statement that reads several attached tables (a join DuckDB
 does itself, a union, a subquery) normally reads each at the moment its scan starts. `SET
 oracle_consistent_read = true` takes one change number when the statement's first scan starts and reads

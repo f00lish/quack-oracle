@@ -11,6 +11,7 @@
 #include "oracle_scanner/lob_reader.hpp"
 #include "oracle_scanner/io_deadline_binding.hpp"
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
+#include "oracle_scanner/ttc_define.hpp"
 #include "oracle_scanner/value_codec.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
 
@@ -48,6 +49,7 @@ public:
                 prefetch_eligible=false;
             }
         }
+        inline_eligible = !prefetch_eligible && SupportsInlineLobDefine(columns, field_version);
         if (!pending.empty()) {
             previous_row = pending.back();
         }
@@ -70,17 +72,21 @@ public:
     void ResolveLobs(OracleBatch &batch,bool prefetched=false) {
         bool any = false;
         for (const auto &column : columns) {
-            any = any || IsOracleLobType(column.oracle_type);
+            any = any || IsOracleLocatorType(column.oracle_type);
         }
         if (!any) {
             return;
         }
         for (auto &row : batch.rows) {
             for (size_t index = 0; index < row.size() && index < columns.size(); index++) {
-                if (!IsOracleLobType(columns[index].oracle_type) || !row[index]) {
+                if (!IsOracleLocatorType(columns[index].oracle_type) || !row[index]) {
                     continue;
                 }
                 const bool character=columns[index].oracle_type==ORACLE_WIRE_TYPE_CLOB;
+                if (columns[index].inline_lob_cells && !prefetched) {
+                    row[index]=ResolveInlineLob(*row[index],character);
+                    continue;
+                }
                 if (!prefetched) { row[index]=ReadWholeLob(*row[index],character);continue; }
                 const auto call=channel.LockCall();
                 const auto cell=DecodeStoredLobPrefetch(*row[index],character,prefetch_limits);
@@ -94,6 +100,35 @@ public:
                 row[index]=character ? DecodeUtf16BeToUtf8(*content) : *content;
             }
         }
+    }
+
+    // A value that came with its row: whole, when what the server sent covers
+    // it, and otherwise the rest of it is read from the locator. A CLOB or BLOB
+    // came with only its size, so the size spares the length request.
+    std::vector<uint8_t> ResolveInlineLob(const std::vector<uint8_t> &cell, bool character) {
+        const auto lob = DecodeTtcInlineLob(cell);
+        if (!character && lob.prefix.size() == lob.total) {
+            return lob.prefix;
+        }
+        OracleLobPrefetch prefetch;
+        prefetch.character = character;
+        prefetch.total_units = lob.total;
+        prefetch.prefix_units = lob.prefix.size();
+        prefetch.prefix = lob.prefix;
+        prefetch.locator = lob.locator;
+        const auto call = channel.LockCall();
+        const auto content = MaterializePrefetchedOracleLob(
+            std::optional<OracleLobPrefetch>(std::move(prefetch)), 65536, prefetch_limits.maximum_content_bytes,
+            [&](const std::vector<uint8_t> &locator, uint64_t offset, uint64_t amount) {
+                TtcLobRequest request;
+                request.sequence = NextCursorSequence();
+                request.locator = locator;
+                request.operation = LOB_OP_READ;
+                request.offset = offset;
+                request.amount = amount;
+                return channel.LobOperation(request, server_field_version);
+            });
+        return character ? DecodeUtf16BeToUtf8(*content) : *content;
     }
 
     std::vector<uint8_t> ReadWholeLob(const std::vector<uint8_t> &locator, bool is_character) {
@@ -151,12 +186,18 @@ public:
             const auto call = channel.LockCall();
             const auto desired=requested_rows-result.rows.size();
             const auto count=prefetch_eligible ? BoundedLobPrefetchRows(columns,desired,prefetch_limits) :
+                inline_eligible ? InlineLobRows(columns,desired) :
                 static_cast<uint32_t>((std::min)(desired,size_t((std::numeric_limits<uint32_t>::max)())));
             const auto sequence=NextCursorSequence();
             if (prefetch_eligible && !prefetch_active) {
                 channel.DefineLobPrefetch(handle,sequence,columns,count,field_version,prefetch_limits);
                 // Never interpret an old locator as a prefetched descriptor.
                 previous_row.reset();prefetch_active=true;
+            } else if (inline_eligible && !inline_active) {
+                channel.DefineInlineLobs(handle,sequence,columns,count);
+                for (auto &column : columns) { column.inline_lob_cells = IsOracleLocatorType(column.oracle_type); }
+                // The rows before the define carry locators only.
+                previous_row.reset();inline_active=true;
             } else { channel.Fetch(handle,sequence,count); }
             auto response_limits=prefetch_limits;
             response_limits.maximum_rows=count;
@@ -219,6 +260,8 @@ private:
     uint8_t field_version=0;
     bool prefetch_eligible=false;
     bool prefetch_active=false;
+    bool inline_eligible=false;
+    bool inline_active=false;
     OracleLobPrefetchLimits prefetch_limits;
 };
 

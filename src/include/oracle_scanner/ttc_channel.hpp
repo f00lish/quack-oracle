@@ -29,6 +29,8 @@ public:
     // Sends the capture-verified TCP interrupt marker. The reader that owns
     // the in-flight response completes the subsequent RESET exchange.
     void Cancel();
+    // The negotiated TTC field version, which decides the shape of every request header.
+    void SetWireFieldVersion(uint8_t field_version) { wire_field_version = field_version; }
     void Send(const std::vector<uint8_t> &message);
     std::vector<uint8_t> Receive();
 
@@ -49,6 +51,7 @@ private:
     TnsDataAssembler assembler;
     std::vector<uint32_t> pending_close_cursors;
     uint8_t next_piggyback_sequence = 1;
+    uint8_t wire_field_version = 0;
     bool cancellation_supported;
     std::atomic<bool> cancellation_requested {false};
     std::mutex outbound_mutex;

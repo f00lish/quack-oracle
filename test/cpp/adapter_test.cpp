@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 
+#include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/io_deadline.hpp"
 #include "oracle_scanner/session.hpp"
@@ -1031,8 +1032,8 @@ void TestUnsupportedColumnTypesAreRefusedAtBind() {
 
     // Anything with no mapping at all still fails by name rather than falling
     // through to the textual default.
-    const auto unmapped = bind_error(119, 0);
-    CHECK(unmapped.find("Oracle type 119") != std::string::npos);
+    const auto unmapped = bind_error(108, 0);
+    CHECK(unmapped.find("Oracle type 108") != std::string::npos);
 
     // TIMESTAMP WITH TIME ZONE stays readable: the value carries its own
     // offset, so nothing has to be assumed about a session zone.
@@ -1985,7 +1986,7 @@ void TestAttachedCatalogNamesTheNewTypes() {
     }
     // RETURNING cannot carry a LOB, and says so.
     auto returning_lob = database.Query("INSERT INTO ora.main.T (DOC) VALUES ('x') RETURNING DOC;");
-    CHECK(returning_lob->HasError() && returning_lob->GetError().find("cannot return the LOB column") != std::string::npos);
+    CHECK(returning_lob->HasError() && returning_lob->GetError().find("cannot return the LOB, JSON or VECTOR column") != std::string::npos);
 
     // What cannot be written is refused by name, not as "type 0".
     auto refused = database.Query("INSERT INTO ora.main.T (OLD) VALUES ('x');");
@@ -1993,6 +1994,193 @@ void TestAttachedCatalogNamesTheNewTypes() {
     refused = database.Query("INSERT INTO ora.main.T (ADDR) VALUES ('AAAAAAAAAAAAAAAAAA');");
     CHECK(refused->HasError() && refused->GetError().find("Oracle type 11 cannot be written") != std::string::npos);
     std::cout << "the attached catalog names national, interval, boolean and local-zone columns" << std::endl;
+}
+
+// JSON and VECTOR through SQL, with no database: the DuckDB types a describe
+// maps to, the values, the catalog that reads a VECTOR's shape from the
+// dictionary, the text they are written as, and an INSERT whose columns the
+// optimizer turns into constants. The images are built here from the layout
+// oson.cpp and oracle_vector.cpp document and the live tests check against a
+// server; the captured ones are in protocol_test.cpp.
+std::vector<uint8_t> VectorImage(uint8_t format, uint32_t dimensions, const std::vector<uint8_t> &elements) {
+    std::vector<uint8_t> image {0xDB, 0x00, 0x00, 0x12, format};
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        image.push_back(static_cast<uint8_t>(dimensions >> shift));
+    }
+    image.insert(image.end(), 8, 0);
+    image.insert(image.end(), elements.begin(), elements.end());
+    return image;
+}
+
+std::vector<uint8_t> Float32Elements(const std::vector<float> &values) {
+    std::vector<uint8_t> result;
+    for (const auto value : values) {
+        const auto sortable = oracle_scanner::EncodeOracleBinaryFloat(value);
+        result.insert(result.end(), sortable.begin(), sortable.end());
+    }
+    return result;
+}
+
+std::vector<uint8_t> Utf8(const std::string &text) {
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+void TestJsonAndVectorColumnsThroughSql() {
+    // A scalar JSON document is the smallest image: header, tree size, then a
+    // string node (its length in the type byte).
+    std::vector<uint8_t> scalar_string {0xff, 0x4a, 0x5a, 0x01, 0x00, 0x16, 0x00, 0x07, 0x06};
+    for (const auto character : std::string("scalar")) {
+        scalar_string.push_back(static_cast<uint8_t>(character));
+    }
+    const std::vector<uint8_t> object_a_is_1 {0xff, 0x4a, 0x5a, 0x01, 0x21, 0x06, 0x01, 0x00, 0x02, 0x00, 0x08, 0x00, 0x00, 0x2c,
+                                              0x00, 0x00, 0x01, 0x61, 0x84, 0x01, 0x01, 0x00, 0x05, 0x21, 0xc1, 0x02};
+
+    // oracle_query: the describe carries the vector's shape.
+    {
+        auto script = std::make_shared<FakeScript>();
+        auto json = Column("J", 119);
+        auto fixed = Column("F", 127);
+        fixed.vector_dimensions = 3;
+        fixed.vector_format = oracle_scanner::ORACLE_VECTOR_FLOAT32;
+        auto open_ended = Column("O", 127);
+        open_ended.vector_flags = oracle_scanner::ORACLE_VECTOR_COLUMN_FLEXIBLE_DIMENSIONS;
+        auto small = Column("S", 127);
+        small.vector_dimensions = 4;
+        small.vector_format = oracle_scanner::ORACLE_VECTOR_INT8;
+        auto packed = Column("B", 127);
+        packed.vector_dimensions = 16;
+        packed.vector_format = oracle_scanner::ORACLE_VECTOR_BINARY;
+        script->columns = {json, fixed, open_ended, small, packed};
+        script->rows = {{object_a_is_1, VectorImage(oracle_scanner::ORACLE_VECTOR_FLOAT32, 3, Float32Elements({1.5F, 2.0F, 3.0F})),
+                         VectorImage(oracle_scanner::ORACLE_VECTOR_FLOAT32, 2, Float32Elements({0.5F, -1.0F})),
+                         VectorImage(oracle_scanner::ORACLE_VECTOR_INT8, 4, {1, 0xFE, 3, 127}),
+                         VectorImage(oracle_scanner::ORACLE_VECTOR_BINARY, 16, {0x05, 0xFF})},
+                        {scalar_string, std::nullopt, std::nullopt, std::nullopt, std::nullopt},
+                        {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT * FROM app.docs')");
+        CHECK(!result->HasError());
+        CHECK(result->GetTypes()[0].IsJSONType());
+        CHECK(result->GetTypes()[1].ToString() == "FLOAT[3]");
+        CHECK(result->GetTypes()[2].ToString() == "DOUBLE[]");
+        CHECK(result->GetTypes()[3].ToString() == "TINYINT[4]");
+        CHECK(result->GetTypes()[4].ToString() == "UTINYINT[2]");
+        CHECK(result->RowCount() == 3);
+        CHECK(result->GetValue(0, 0).ToString() == "{\"a\":1}");
+        CHECK(result->GetValue(1, 0).ToString() == "[1.5, 2.0, 3.0]");
+        CHECK(result->GetValue(2, 0).ToString() == "[0.5, -1.0]");
+        CHECK(result->GetValue(3, 0).ToString() == "[1, -2, 3, 127]");
+        CHECK(result->GetValue(4, 0).ToString() == "[5, 255]");
+        CHECK(result->GetValue(0, 1).ToString() == "\"scalar\"");
+        CHECK(result->GetValue(1, 1).IsNull() && result->GetValue(0, 2).IsNull());
+        // The JSON column is queryable as JSON.
+        auto extracted = database.Query("SELECT json_extract(J, '$.a') FROM oracle_query('ora', 'SELECT * FROM app.docs') WHERE J IS NOT NULL ORDER BY 1");
+        CHECK(!extracted->HasError());
+        // A vector of a different storage format than its column declared is refused, not reinterpreted.
+        script->rows = {{object_a_is_1, VectorImage(oracle_scanner::ORACLE_VECTOR_INT8, 3, {1, 2, 3}), std::nullopt, std::nullopt,
+                         std::nullopt}};
+        auto mismatched = database.Query("SELECT F FROM oracle_query('ora', 'SELECT * FROM app.docs')");
+        CHECK(mismatched->HasError() && mismatched->GetError().find("storage format") != std::string::npos);
+        // A BINARY vector in a column that may hold any format cannot be a list of DOUBLE.
+        script->rows = {{object_a_is_1, std::nullopt, VectorImage(oracle_scanner::ORACLE_VECTOR_BINARY, 8, {1}), std::nullopt,
+                         std::nullopt}};
+        auto binary_in_flexible = database.Query("SELECT O FROM oracle_query('ora', 'SELECT * FROM app.docs')");
+        CHECK(binary_in_flexible->HasError() && binary_in_flexible->GetError().find("BINARY vector") != std::string::npos);
+    }
+
+    // The attached catalog: the dictionary names the types and VECTOR_INFO the shapes.
+    auto script = std::make_shared<FakeScript>();
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("DOCS")}, {Text("PERF")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"vector_info FROM user_tab_columns",
+         {text_columns({"TABLE_NAME", "COLUMN_NAME", "VECTOR_INFO"}),
+          {{Text("DOCS"), Text("EMB"), Text("VECTOR(3,FLOAT32,DENSE)")},
+           {Text("DOCS"), Text("FLEX"), Text("VECTOR(*,*,DENSE)")},
+           {Text("DOCS"), Text("SPARSE"), Text("VECTOR(8,FLOAT64,SPARSE)")},
+           {Text("PERF"), Text("V"), Text("VECTOR(3,FLOAT32,DENSE)")}}}});
+    const auto row = [](const char *name, const char *type, const char *table = "DOCS") {
+        return std::vector<WireValue> {Text(table), Text(name), Text(type), Number("22"), WireValue(), WireValue(), Text("Y")};
+    };
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {row("ID", "NUMBER"), row("DOC", "JSON"), row("EMB", "VECTOR"), row("FLEX", "VECTOR"), row("SPARSE", "VECTOR"),
+           {Text("PERF"), Text("ID"), Text("NUMBER"), Number("22"), Number("9"), Number("0"), Text("N")},
+           row("V", "VECTOR", "PERF"), row("J", "JSON", "PERF")}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {{Text("PERF"), Text("ID")}}}});
+    auto id_column = Column("ID", 2);
+    auto embedding = Column("EMB", 127);
+    auto flex = Column("FLEX", 127);
+    auto sparse = Column("SPARSE", 127);
+    script->tables["DOCS"] = {{id_column, Column("DOC", 119), embedding, flex, sparse}, {}};
+    script->tables["PERF"] = {{Column("ID", 2, 9, 0), embedding, Column("J", 119)}, {}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    auto described = database.Query(
+        "SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'DOCS' ORDER BY column_index");
+    CHECK(!described->HasError() && described->RowCount() == 5);
+    CHECK(described->GetValue(1, 1).ToString() == "JSON");
+    CHECK(described->GetValue(1, 2).ToString() == "FLOAT[3]");
+    CHECK(described->GetValue(1, 3).ToString() == "DOUBLE[]");
+    CHECK(described->GetValue(1, 4).ToString() == "STRUCT(dimensions UINTEGER, indices UINTEGER[], \"values\" DOUBLE[])");
+
+    // JSON is written as its text, which the server converts; a VECTOR as its image.
+    database.Run("INSERT INTO ora.main.DOCS (ID, DOC, EMB, FLEX, SPARSE) VALUES (1, '{\"k\":[1,2]}', [0.1, 2, -3.5], "
+                 "[1.0, 2.0], {'dimensions': 8, 'indices': [1, 6], 'values': [0.5, 4.0]});");
+    CHECK(script->batch_rows.size() == 1 && script->batch_rows[0].size() == 5);
+    const auto &binds = script->batch_rows[0];
+    CHECK(binds[1].oracle_type == 1 && binds[1].value == Utf8("{\"k\":[1,2]}"));
+    // A vector is bound as its image, in the storage format its column has;
+    // a column of any format is written as FLOAT64 and the server converts.
+    const auto written = [&](size_t position) { return oracle_scanner::DecodeOracleVector(*binds[position].value); };
+    CHECK(binds[2].oracle_type == 127 && written(2).format == oracle_scanner::ORACLE_VECTOR_FLOAT32 &&
+          written(2).float32 == std::vector<float>({0.1F, 2.0F, -3.5F}));
+    CHECK(binds[3].oracle_type == 127 && written(3).format == oracle_scanner::ORACLE_VECTOR_FLOAT64 &&
+          written(3).float64 == std::vector<double>({1.0, 2.0}));
+    CHECK(binds[4].oracle_type == 127 && written(4).sparse && written(4).dimensions == 8 &&
+          written(4).indices == std::vector<uint32_t>({1, 6}) && written(4).float64 == std::vector<double>({0.5, 4.0}));
+    // NULL carries the same wire type as a value, as a batch needs.
+    database.Run("INSERT INTO ora.main.DOCS (ID, DOC, EMB) VALUES (2, NULL, NULL), (3, '{}', [1, 2, 3]);");
+    CHECK(script->batch_rows.size() == 2);
+    CHECK(script->batch_rows[0][1].oracle_type == 1 && !script->batch_rows[0][1].value.has_value());
+    CHECK(script->batch_rows[0][2].oracle_type == 127 && !script->batch_rows[0][2].value.has_value());
+
+    // A column the statement names is written whatever the optimizer makes of
+    // the expression that fills it: here two columns are constants the
+    // optimizer folds, and they used to be mistaken for columns left out, so
+    // Oracle received a row of NULLs, or no columns at all.
+    database.Run("INSERT INTO ora.main.PERF (ID, V, J) SELECT i, list_transform(range(3), lambda x: x / 2.0)::FLOAT[3], "
+                 "'{\"folded\":true}'::JSON FROM range(2) t(i);");
+    CHECK(script->batch_rows.size() == 2 && script->batch_rows[0].size() == 3);
+    CHECK(oracle_scanner::DecodeOracleVector(*script->batch_rows[0][1].value).float32 == std::vector<float>({0.0F, 0.5F, 1.0F}));
+    CHECK(script->batch_rows[0][2].value == Utf8("{\"folded\":true}"));
+    database.Run("INSERT INTO ora.main.PERF (ID, V, J) SELECT 10 + i, list_transform(range(3), lambda x: x / 2.0)::FLOAT[3], "
+                 "'{\"folded\":true}'::JSON FROM range(2) t(i);");
+    CHECK(script->batch_rows.size() == 2 && script->batch_rows[0].size() == 3);
+    CHECK(oracle_scanner::DecodeOracleVector(*script->batch_rows[0][1].value).float32 == std::vector<float>({0.0F, 0.5F, 1.0F}));
+    // A column the statement leaves out stays out.
+    database.Run("INSERT INTO ora.main.PERF (ID) SELECT i FROM range(2) t(i);");
+    CHECK(script->batch_rows.size() == 2 && script->batch_rows[0].size() == 1);
+
+    auto returning = database.Query("INSERT INTO ora.main.DOCS (ID) VALUES (4) RETURNING ID;");
+    CHECK(returning->HasError() && returning->GetError().find("cannot return the LOB, JSON or VECTOR column") != std::string::npos);
+
+    auto wrong_shape = database.Query("INSERT INTO ora.main.DOCS (ID, EMB) VALUES (5, [1, 2]);");
+    CHECK(wrong_shape->HasError());
+    std::cout << "JSON and VECTOR columns read, write and attach against a fake session" << std::endl;
 }
 
 void TestAttachedWritesAgainstAFakeSession() {
@@ -3525,6 +3713,7 @@ int main() {
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedWritesAgainstAFakeSession();
     TestAttachedCatalogNamesTheNewTypes();
+    TestJsonAndVectorColumnsThroughSql();
     TestParallelScanShardsOneSnapshot();
     TestWriteBindsFollowTheOracleColumnType();
     TestCallableSignatureResolution();

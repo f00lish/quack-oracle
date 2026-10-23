@@ -86,9 +86,9 @@ OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version) {
         }
     }
     if (field_version >= 24) {
-        reader.ReadUB4();
-        reader.ReadByte();
-        reader.ReadByte();
+        column.vector_dimensions = reader.ReadUB4();
+        column.vector_format = reader.ReadByte();
+        column.vector_flags = reader.ReadByte();
     }
     column.byte_width = column.oracle_type == 23 ? maximum_size : size;
     // The declared maximum, not the size field, is what says whether the column

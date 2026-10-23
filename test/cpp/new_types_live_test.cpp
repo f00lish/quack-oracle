@@ -154,6 +154,20 @@ int main() {
             auto created_boolean = admin.Query(Admin("CREATE TABLE " + user + ".T_BOOL (ID NUMBER(5) PRIMARY KEY, B BOOLEAN)"));
             has_boolean = !created_boolean->HasError();
         }
+        // JSON and VECTOR need 23ai. A server without them refuses the types and
+        // the stage is skipped.
+        bool has_json = true;
+        {
+            auto created_json = admin.Query(Admin("CREATE TABLE " + user + ".T_JV (ID NUMBER(5) PRIMARY KEY, J JSON, V3 VECTOR(3,FLOAT32), "
+                                                  "VD VECTOR(2,FLOAT64), VI VECTOR(4,INT8), VB VECTOR(16,BINARY), VX VECTOR(*,*), "
+                                                  "VS VECTOR(6,FLOAT32,SPARSE))"));
+            has_json = !created_json->HasError();
+            if (has_json) {
+                table("T_JV_MIX (ID NUMBER(5) PRIMARY KEY, V VARCHAR2(20), D DATE, T TIMESTAMP(6), N NUMBER(6,2), C CLOB, J JSON, "
+                      "E VECTOR(3,FLOAT32))",
+                      "create json mix");
+            }
+        }
         Run(admin, "CREATE SECRET rt (" + Secret(user, password) + ");", "runtime secret");
         Run(admin, "ATTACH 'rt' AS raw (TYPE oracle_scanner);", "attach");
         const auto dml = [&](const std::string &sql, const std::string &stage) {
@@ -468,7 +482,7 @@ int main() {
         auto oversize = admin.Query("INSERT INTO raw.T_LOBW (id, c) VALUES (9, repeat('x', 17000000));");
         Check(oversize->HasError() && oversize->GetError().find("16 MiB") != std::string::npos, "an oversize LOB is refused by name");
         auto lob_returning = admin.Query("INSERT INTO raw.T_LOBW (id) VALUES (10) RETURNING id;");
-        Check(lob_returning->HasError() && lob_returning->GetError().find("cannot return the LOB column") != std::string::npos,
+        Check(lob_returning->HasError() && lob_returning->GetError().find("cannot return the LOB, JSON or VECTOR column") != std::string::npos,
               "RETURNING over a LOB table says why it cannot");
         std::cout << "PASS CLOB, NCLOB and BLOB are written, whole and updated\n";
 
@@ -498,6 +512,101 @@ int main() {
             std::cout << "PASS BOOLEAN reads and writes\n";
         } else {
             std::cout << "SKIP BOOLEAN: this server has no such type\n";
+        }
+        if (has_json) {
+            // Written through this client as text and read back through the
+            // inline define, then checked by Oracle itself where it matters.
+            Run(admin,
+                "INSERT INTO raw.T_JV VALUES (1, '{\"a\":[1,2,{\"b\":null}],\"s\":\"h\xc3\xa9llo " + emoji + "\"}', [1.5, 2.0, 3.0], "
+                "[0.1, -2.5e300], [1, -2, 3, 127], [1, 255], [1.0, 2.0, 3.0, 4.0], "
+                "{'dimensions': 6, 'indices': [1, 4], 'values': [1.5, -2.5]}), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL), "
+                "(3, '[1,2,3]', [0.5, 0.25, -1.0], [1e-300, 3.0], [-128, 0, 0, 1], [0, 0], [7.0], "
+                "{'dimensions': 6, 'indices': [], 'values': []});",
+                "json vector write");
+            for (const auto &source : {std::string("raw.T_JV"), std::string("oracle_query('rt', 'SELECT * FROM T_JV')")}) {
+                auto result = Run(admin, "SELECT id, j, v3, vd, vi, vb, vx, vs FROM " + source + " ORDER BY id;", "json vector read");
+                Check(result->RowCount() == 3, "json vector rows");
+                Check(result->GetValue(1, 0).ToString().find("\"b\":null") != std::string::npos &&
+                          result->GetValue(1, 0).ToString().find("h\xc3\xa9llo " + emoji) != std::string::npos &&
+                          result->GetValue(1, 2).ToString() == "[1,2,3]",
+                      "JSON text");
+                Check(result->GetValue(2, 0).ToString() == "[1.5, 2.0, 3.0]" && result->GetValue(2, 2).ToString() == "[0.5, 0.25, -1.0]",
+                      "FLOAT32 vectors");
+                Check(result->GetValue(3, 0).ToString() == "[0.1, -2.5e+300]" && result->GetValue(3, 2).ToString() == "[1e-300, 3.0]",
+                      "FLOAT64 vectors");
+                Check(result->GetValue(4, 0).ToString() == "[1, -2, 3, 127]" && result->GetValue(4, 2).ToString() == "[-128, 0, 0, 1]",
+                      "INT8 vectors");
+                Check(result->GetValue(5, 0).ToString() == "[1, 255]", "BINARY vectors");
+                Check(result->GetValue(6, 0).ToString() == "[1.0, 2.0, 3.0, 4.0]", "vectors of any format");
+                Check(result->GetValue(7, 0).ToString() == "{'dimensions': 6, 'indices': [1, 4], 'values': [1.5, -2.5]}", "sparse vectors");
+                for (idx_t column = 1; column < 8; column++) {
+                    Check(result->GetValue(column, 1).IsNull(), "NULL JSON and vectors");
+                }
+            }
+            Check(Scalar(admin,
+                         "SELECT * FROM oracle_query('rt', 'SELECT JSON_VALUE(J, ''$.a[0]'') || ''/'' || VECTOR_DIMS(V3) || ''/'' || "
+                         "VECTOR_DIMENSION_COUNT(VS) AS S FROM T_JV WHERE ID = 1');",
+                         "json vector check") == "1/3/6",
+                  "Oracle reads what was written");
+            Run(admin, "UPDATE raw.T_JV SET j = '{\"updated\":true}', v3 = [9, 8, 7] WHERE id = 3;", "json vector update");
+            Check(Scalar(admin, "SELECT * FROM oracle_query('rt', 'SELECT JSON_VALUE(J, ''$.updated'') || ''/'' || VECTOR_SERIALIZE(V3) AS S FROM T_JV WHERE ID = 3');",
+                         "json vector update check").find("true/") == 0,
+                  "UPDATE replaces JSON and VECTOR");
+
+            // Many rows: the first fetch defines the columns, the later ones
+            // keep fetching with that define, and the rows come back in order.
+            Run(admin,
+                "INSERT INTO raw.T_JV (id, j, v3) SELECT 100 + i, ('{\"n\":' || i || ',\"s\":\"' || repeat('x', i % 50) || '\"}')::JSON, "
+                "[i, i + 0.5, -i]::FLOAT[3] FROM range(1000) t(i);",
+                "json vector bulk write");
+            auto bulk = Run(admin,
+                            "SELECT count(*), sum((json_extract(j, '$.n'))::BIGINT), sum(v3[1]), min(length(json_extract_string(j, '$.s'))) "
+                            "FROM raw.T_JV WHERE id >= 100;",
+                            "json vector bulk read");
+            Check(bulk->GetValue(0, 0).ToString() == "1000" && bulk->GetValue(1, 0).ToString() == "499500" &&
+                      bulk->GetValue(2, 0).ToString() == "499500.0" && bulk->GetValue(3, 0).ToString() == "0",
+                  "a thousand JSON and VECTOR rows");
+            // Past the 64 KiB asked for ahead of the locator: a 300 KiB document, a
+            // vector of 30000 FLOAT32 (120 KB) and a field name over 255 bytes.
+            Run(admin,
+                "INSERT INTO raw.T_JV (id, j, vx) SELECT 5000, ('{\"big\":\"' || repeat('y', 300000) || '\"}')::JSON, "
+                "list_transform(range(30000), lambda x: x / 8.0);",
+                "json vector large write");
+            Run(admin,
+                "INSERT INTO raw.T_JV (id, j) VALUES (5001, ('{\"' || repeat('k', 300) || '\":1,\"a\":2}')::JSON);",
+                "json long name write");
+            auto large = Run(admin,
+                             "SELECT length(json_extract_string(j, '$.big')), array_length(vx), vx[30000], length(j) FROM raw.T_JV WHERE id = 5000;",
+                             "json vector large read");
+            Check(large->GetValue(0, 0).ToString() == "300000" && large->GetValue(1, 0).ToString() == "30000" &&
+                      large->GetValue(2, 0).ToString() == "3749.875",
+                  "values longer than the prefix are completed from the locator");
+            Check(Scalar(admin,
+                         "SELECT max(length(k)) || '/' || count(*) FROM (SELECT unnest(json_keys(j)) AS k FROM raw.T_JV WHERE id = 5001);",
+                         "json long name read") == "300/2",
+                  "a field name over 255 bytes");
+            auto refused_returning = admin.Query("INSERT INTO raw.T_JV (id) VALUES (6000) RETURNING id;");
+            Check(refused_returning->HasError() &&
+                      refused_returning->GetError().find("cannot return the LOB, JSON or VECTOR column") != std::string::npos,
+                  "RETURNING over JSON and VECTOR says why it cannot");
+
+            // Beside other columns: the define is written for all of them.
+            Run(admin,
+                "INSERT INTO raw.T_JV_MIX VALUES (1, 'abc', DATE '2020-01-02', TIMESTAMP '2020-01-02 03:04:05.123456', 2.5, 'clob text', "
+                "'{\"m\":1}', [1.0, 2.0, 3.0]), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL), "
+                "(3, 'xyz', DATE '2021-12-31', TIMESTAMP '2021-12-31 23:59:59', -0.5, repeat('c', 20000), '{\"m\":3}', [3.0, 2.0, 1.0]);",
+                "json mix write");
+            for (const auto &source : {std::string("raw.T_JV_MIX"), std::string("oracle_query('rt', 'SELECT * FROM T_JV_MIX')")}) {
+                auto mix = Run(admin, "SELECT id, v, d, t, n, length(c), j, e FROM " + source + " ORDER BY id;", "json mix read");
+                Check(mix->RowCount() == 3 && mix->GetValue(1, 0).ToString() == "abc" && mix->GetValue(5, 0).ToString() == "9" &&
+                          mix->GetValue(5, 2).ToString() == "20000" && mix->GetValue(6, 0).ToString() == "{\"m\":1}" &&
+                          mix->GetValue(6, 2).ToString() == "{\"m\":3}" && mix->GetValue(7, 2).ToString() == "[3.0, 2.0, 1.0]" &&
+                          mix->GetValue(3, 0).ToString() == "2020-01-02 03:04:05.123456" && mix->GetValue(1, 1).IsNull(),
+                      "JSON and VECTOR beside CLOB and scalar columns");
+            }
+            std::cout << "PASS JSON and VECTOR read and write, inline and past the prefix\n";
+        } else {
+            std::cout << "SKIP JSON and VECTOR: this server has no such types\n";
         }
         Run(admin, "DETACH raw;", "detach");
     } catch (const std::exception &error) {

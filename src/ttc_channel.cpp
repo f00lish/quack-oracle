@@ -1,7 +1,9 @@
 #include "oracle_scanner/ttc_channel.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/ttc_piggyback.hpp"
+#include "oracle_scanner/ttc_auth.hpp"
 #include "oracle_scanner/ttc_error.hpp"
+#include "oracle_scanner/ttc_negotiation.hpp"
 
 #include <string>
 
@@ -70,17 +72,32 @@ void TtcChannel::Cancel() {
     }
 }
 
-void TtcChannel::Send(const std::vector<uint8_t> &message) {
-    if (message.empty()) {
+namespace {
+// From TTC field version 18 every function call and piggyback header carries a
+// token number after the sequence number. This client never uses one, so it is
+// always zero — python-oracledb sends the same single 0x00.
+std::vector<uint8_t> WithHeaderToken(std::vector<uint8_t> message, uint8_t field_version) {
+    if (field_version >= TTC_FIELD_VERSION_HEADER_TOKEN && message.size() >= 3 &&
+        (message[0] == TTC_MESSAGE_FUNCTION || message[0] == TTC_MESSAGE_PIGGYBACK)) {
+        message.insert(message.begin() + 3, 0);
+    }
+    return message;
+}
+} // namespace
+
+void TtcChannel::Send(const std::vector<uint8_t> &request) {
+    if (request.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "empty TTC messages are not valid");
     }
+    const auto message = WithHeaderToken(request, wire_field_version);
     std::lock_guard<std::mutex> lock(outbound_mutex);
     // END_OF_RESPONSE marks Oracle's response boundary; a client request
     // carries no response flag. Setting it here leaves 19c waiting for a
     // valid request terminator after TTIPRO.
     std::vector<uint8_t> outbound;
     if (!pending_close_cursors.empty()) {
-        outbound = EncodeTtcCloseCursorsPiggyback(next_piggyback_sequence, pending_close_cursors);
+        outbound = WithHeaderToken(EncodeTtcCloseCursorsPiggyback(next_piggyback_sequence, pending_close_cursors),
+                                   wire_field_version);
         outbound.insert(outbound.end(), message.begin(), message.end());
     } else {
         outbound = message;

@@ -87,6 +87,9 @@ set(EXTENSION_SOURCES
     src/ttc_negotiation.cpp
     src/ttc_o5logon.cpp
     src/value_codec.cpp
+    src/oson.cpp
+    src/oracle_vector.cpp
+    src/ttc_define.cpp
     src/auth_crypto.cpp
     src/bind_validation.cpp
     src/sql_binds.cpp
@@ -167,6 +170,9 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/ttc_negotiation.cpp
                  src/ttc_o5logon.cpp
                  src/value_codec.cpp
+                 src/oson.cpp
+                 src/oracle_vector.cpp
+                 src/ttc_define.cpp
                  src/auth_crypto.cpp
                  src/bind_validation.cpp
                  src/sql_binds.cpp

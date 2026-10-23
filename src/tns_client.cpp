@@ -748,6 +748,7 @@ TtcProtocolInfo TnsClientConnection::Negotiate(const TtcNegotiationOptions &opti
     auto result = RunTtcNegotiation(Ttc(), options);
     ttc_field_version = result.field_version;
     ttc_server_field_version = result.server_field_version;
+    Ttc().SetWireFieldVersion(result.field_version);
     state = OracleConnectionState::TTC_NEGOTIATED;
     return result;
 }

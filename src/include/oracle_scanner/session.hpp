@@ -41,6 +41,19 @@ struct OracleColumn {
     // decoders can know this; the default means "expect bytes", which is what
     // every column built anywhere else should be treated as.
     bool omitted_from_row_data = false;
+    // A VECTOR column's declared shape, which a server at TTC field version 24
+    // or later sends with the describe: the dimension count (0 for an unbounded
+    // `*`), the storage format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 for
+    // `*`), and flags. Zero in every column that is not a VECTOR.
+    uint32_t vector_dimensions = 0;
+    uint8_t vector_format = 0;
+    uint8_t vector_flags = 0;
+    // Set by a cursor once it has asked the server to send a LOB-like column
+    // (CLOB, BLOB, JSON, VECTOR) with its size, and for JSON and VECTOR the
+    // first bytes of its value, ahead of the locator. A row's cell for such a
+    // column is then framed differently, and this is what the row decoder
+    // reads to know which way. Never set on a describe.
+    bool inline_lob_cells = false;
 };
 
 struct OracleBatch {

@@ -284,6 +284,8 @@ homogeneous, so `[1, 'one', DATE '2026-01-02']` cannot even be constructed. A
 | `INTERVAL DAY TO SECOND` | `INTERVAL` | Days and microseconds. Oracle keeps nanoseconds; a fraction finer than a microsecond is refused, not rounded. Written from an interval without months, whose days and time have one sign |
 | `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | An instant. The session time zone is UTC (see below), so the value Oracle sends is the instant. Microseconds only: a finer fraction is refused. Written from a `TIMESTAMPTZ` |
 | `BOOLEAN` (23ai) | `BOOLEAN` | Needs a server that sends it as its own type, which 23ai does to a client advertising TTC field version 17, as this one does. Earlier servers have no such column |
+| `JSON` (21c and later; read from 23ai) | `JSON` | The OSON image the server stores, decoded to JSON text. Objects keep the order the image holds. Oracle's non-JSON scalars print as `JSON_SERIALIZE` prints them: timestamps as ISO 8601 strings, `RAW` as upper-case hex, intervals as ISO 8601 durations. Written as its text, up to 16 MiB |
+| `VECTOR` (23ai) | `FLOAT[n]`, `DOUBLE[n]`, `TINYINT[n]`, `UTINYINT[n]`, or the same as a list | By the column's declared storage format and dimensions: `FLOAT32` is `FLOAT`, `FLOAT64` is `DOUBLE`, `INT8` is `TINYINT`, `BINARY` is the packed bytes as `UTINYINT` (dimensions ÷ 8). A fixed dimension count is an array, `*` a list. A column of any format (`VECTOR(*,*)`) is a list of `DOUBLE`, which holds every dense format but `BINARY`; a `BINARY` value in one is refused. A `SPARSE` column is `STRUCT(dimensions UINTEGER, indices UINTEGER[], "values" T[])`. Written as the image python-oracledb sends |
 | `ROWID`, `UROWID` | `VARCHAR` | The 18 characters Oracle itself prints (`ROWIDTOCHAR`). A logical UROWID, which an index-organized table has, is refused |
 | `LONG` | `VARCHAR` | At most 1 MiB per value |
 | `LONG RAW` | `BLOB` | At most 1 MiB per value |
@@ -315,12 +317,32 @@ a local-zone column in your own SQL are UTC in a session opened here. (Before
 0.6.0 the zone was a fixed `+04:00`, copied from the capture the login was
 modelled on, and nothing relied on it.)
 
-**BOOLEAN needs field version 17.** This client advertises TTC field version 17
-(python-oracledb's `TNS_CCAP_FIELD_VERSION_23_1`), the lowest at which a 23ai
-server sends a SQL `BOOLEAN` as itself rather than as `NUMBER`. It was measured:
-13 to 16 still get `NUMBER`, 17 gets the type, and 18 and above change the shape
-of the execute request. A 19c server reports 12 and negotiates down, so nothing
-changes there.
+**BOOLEAN, JSON and VECTOR need a newer field version.** This client advertises
+TTC field version 24 (python-oracledb's `TNS_CCAP_FIELD_VERSION_23_4`) and uses
+whatever the server will go to, up to that. A 23ai server then sends a SQL
+`BOOLEAN` as itself (it needs 17; 13 to 16 still get `NUMBER`), tells the client
+a `VECTOR` column's dimensions and storage format in the describe (it needs 24),
+and sends JSON as an OSON image. From 18 every request header carries a token
+number after its sequence number, which this client always sets to zero. A 19c
+server reports 12 and negotiates down, so nothing changes there.
+
+**JSON and VECTOR arrive with their rows.** A query over either gets a locator
+for each value, and reading a value from its locator is a round trip of its own
+or two. After the describe the client therefore re-executes the cursor with a
+define for every column, the exchange python-oracledb makes, and asks for the
+first 64 KiB of every JSON and VECTOR value ahead of its locator. A value longer
+than that arrives cut short and the rest is read from the locator. On Free 23ai,
+reading 5,000 rows of a `VECTOR(768,FLOAT32)` and a small `JSON` column took 1.5
+and 1.4 seconds a column one value at a time and 0.3 and 0.04 with the define.
+The define is only written when every column is a type whose define is known;
+a table with a `ROWID` or `LONG` beside its JSON column is read value by value,
+as before.
+
+**A statement that writes a `JSON` column can carry text up to 16 MiB; one that
+writes a `VECTOR` carries the image.** A vector as text would stop at the 32767
+bytes of a `VARCHAR2` bind, about 2,700 `FLOAT32` elements, and embeddings of
+3,072 and 4,096 dimensions are common. Neither can be returned by
+`INSERT ... RETURNING`, which hands back a locator; that is refused by name.
 
 **Refused while binding**, before any fetch, each naming its reason:
 
@@ -362,13 +384,13 @@ in Oracle.
   which is not implemented.
 - **Memory.** A statement is built whole, so a batch of N rows holds N times its
   LOB values at once; insert large LOBs a few rows at a time.
-- **`INSERT … RETURNING` cannot cover a LOB column.** Oracle returns a locator
+- **`INSERT … RETURNING` cannot cover a LOB, JSON or VECTOR column.** Oracle returns a locator
   there, and DuckDB's `RETURNING` spans every column of the table, so a table
   with a LOB column refuses it with a message that names the column.
 - A LOB column is not filtered remotely; a filter on one runs in DuckDB.
 
 A LOB column carries a locator in the row. Against a server that negotiates
-the 12c field version (19c, 23ai and Autonomous do), the fetch asks Oracle to
+the 12c field version or later (19c, 23ai and Autonomous all do), the fetch asks Oracle to
 send the first 4 096 characters or bytes of each LOB along with the row, in
 batches of at most 128 rows and 4 MB; a value that fits costs no LOB call at
 all, and a longer one reads only its remainder, 32 767 characters or 65 536
@@ -459,7 +481,7 @@ reinterpret.
 Writable column types: `VARCHAR2`, `CHAR`, `NCHAR`, `NVARCHAR2`, `NUMBER`,
 `DATE`, `TIMESTAMP`, `TIMESTAMP WITH LOCAL TIME ZONE`, `INTERVAL YEAR TO MONTH`,
 `INTERVAL DAY TO SECOND`, `BOOLEAN`, `RAW`, `BINARY_FLOAT`, `BINARY_DOUBLE`.
-`CLOB`, `NCLOB`, `BLOB` (see §4). (`TIMESTAMP WITH TIME ZONE` is read but not
+`CLOB`, `NCLOB`, `BLOB` (see §4), `JSON`, `VECTOR`. (`TIMESTAMP WITH TIME ZONE` is read but not
 written.) Everything else — `LONG` and `ROWID` included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
 column is refused too: cast to `DECIMAL` or text first, because binary floats
 are not exact.

@@ -6,8 +6,12 @@
 #include "oracle_adapter.hpp"
 
 #include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/operator/decimal_cast_operators.hpp"
 #include "duckdb/common/types/time.hpp"
+#include "oracle_scanner/oracle_vector.hpp"
+#include "oracle_scanner/oson.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
 
 #include <cstdlib>
@@ -78,6 +82,9 @@ void RequireReadableColumn(const OracleColumn &column) {
     case 183: // INTERVAL DAY TO SECOND
     case 208: // UROWID
         return;
+    case 119: // JSON, an OSON image behind a locator; decoded to JSON text
+    case 127: // VECTOR, an image behind a locator; decoded to a list or array
+        return;
     default:
         break;
     }
@@ -88,8 +95,49 @@ void RequireReadableColumn(const OracleColumn &column) {
 // attached catalog uses this directly, so that a table carrying a column this
 // version cannot read is still listed; reading it goes through TypeFor and is
 // refused there.
+LogicalType VectorElementType(uint8_t format) {
+    switch (format) {
+    case oracle_scanner::ORACLE_VECTOR_FLOAT32:
+        return LogicalType::FLOAT;
+    case oracle_scanner::ORACLE_VECTOR_INT8:
+        return LogicalType::TINYINT;
+    case oracle_scanner::ORACLE_VECTOR_BINARY:
+        return LogicalType::UTINYINT;
+    default:
+        // FLOAT64 and a column whose elements may be any format: every format
+        // but BINARY widens into a DOUBLE without losing a digit.
+        return LogicalType::DOUBLE;
+    }
+}
+
+// A VECTOR column maps by the shape its describe or its dictionary entry
+// gives. Dense: an ARRAY of the declared dimension count when there is one, a
+// LIST when the column leaves it open. A BINARY vector's elements are its
+// packed bytes, so its dimensions are bits / 8. Sparse: the three parts a
+// SparseVector has.
+LogicalType VectorType(const OracleColumn &column) {
+    const auto element = VectorElementType(column.vector_format);
+    if ((column.vector_flags & oracle_scanner::ORACLE_VECTOR_COLUMN_SPARSE) != 0) {
+        return LogicalType::STRUCT({{"dimensions", LogicalType::UINTEGER},
+                                    {"indices", LogicalType::LIST(LogicalType::UINTEGER)},
+                                    {"values", LogicalType::LIST(element)}});
+    }
+    auto dimensions = column.vector_dimensions;
+    if (column.vector_format == oracle_scanner::ORACLE_VECTOR_BINARY) {
+        dimensions /= 8;
+    }
+    if (dimensions == 0) {
+        return LogicalType::LIST(element);
+    }
+    return LogicalType::ARRAY(element, dimensions);
+}
+
 LogicalType MappedType(const OracleColumn &column) {
     switch (column.oracle_type) {
+    case 119: // JSON
+        return LogicalType::JSON();
+    case 127: // VECTOR
+        return VectorType(column);
     case 2: // NUMBER
         // Only integral NUMBER values with a representable declared precision
         // are widened. Unconstrained and fractional NUMBER stay textual so no
@@ -197,6 +245,101 @@ Value TimestampValueFor(const OracleColumn &column, const oracle_scanner::Oracle
     return Value::TIMESTAMPNS(timestamp_ns_t(nanoseconds + static_cast<int64_t>(value.nanosecond)));
 }
 
+
+// The JSON text of one OSON image, with the column named when it cannot be read.
+std::string OsonToJson(const OracleColumn &column, const std::vector<uint8_t> &image) {
+    try {
+        return oracle_scanner::DecodeOsonToJson(image);
+    } catch (const oracle_scanner::ProtocolError &error) {
+        throw ConversionException("Oracle JSON column \"%s\" cannot be read: %s", column.name, error.what());
+    }
+}
+
+template <class T>
+vector<Value> VectorElements(const std::vector<T> &elements) {
+    vector<Value> values;
+    values.reserve(elements.size());
+    for (const auto element : elements) {
+        values.push_back(Value::CreateValue<T>(element));
+    }
+    return values;
+}
+
+// One VECTOR as the DuckDB value its column maps to. A column whose elements
+// may be in any format maps to DOUBLE, which every format but BINARY fits
+// exactly; a BINARY value there is reported rather than turned into numbers
+// that are not its elements.
+Value VectorValueFor(const OracleColumn &column, const std::vector<uint8_t> &image) {
+    oracle_scanner::OracleVector decoded;
+    try {
+        decoded = oracle_scanner::DecodeOracleVector(image);
+    } catch (const oracle_scanner::ProtocolError &error) {
+        throw ConversionException("Oracle VECTOR column \"%s\" cannot be read: %s", column.name, error.what());
+    }
+    const auto type = VectorType(column);
+    const bool sparse = (column.vector_flags & oracle_scanner::ORACLE_VECTOR_COLUMN_SPARSE) != 0;
+    if (decoded.sparse != sparse) {
+        throw ConversionException("Oracle VECTOR column \"%s\" holds a %s vector in a column declared %s", column.name,
+                                  decoded.sparse ? "sparse" : "dense", sparse ? "sparse" : "dense");
+    }
+    const auto element_type = sparse ? ListType::GetChildType(StructType::GetChildType(type, 2))
+                                     : (type.id() == LogicalTypeId::ARRAY ? ArrayType::GetChildType(type)
+                                                                          : ListType::GetChildType(type));
+    if (column.vector_format != 0 && decoded.format != column.vector_format) {
+        throw ConversionException("Oracle VECTOR column \"%s\" holds a vector of storage format %d where %d was declared",
+                                  column.name, static_cast<int>(decoded.format), static_cast<int>(column.vector_format));
+    }
+    vector<Value> elements;
+    switch (decoded.format) {
+    case oracle_scanner::ORACLE_VECTOR_FLOAT32:
+        if (element_type.id() == LogicalTypeId::DOUBLE) {
+            for (const auto element : decoded.float32) {
+                elements.push_back(Value::DOUBLE(static_cast<double>(element)));
+            }
+        } else {
+            elements = VectorElements(decoded.float32);
+        }
+        break;
+    case oracle_scanner::ORACLE_VECTOR_FLOAT64:
+        elements = VectorElements(decoded.float64);
+        break;
+    case oracle_scanner::ORACLE_VECTOR_INT8:
+        if (element_type.id() == LogicalTypeId::DOUBLE) {
+            for (const auto element : decoded.int8) {
+                elements.push_back(Value::DOUBLE(static_cast<double>(element)));
+            }
+        } else {
+            elements = VectorElements(decoded.int8);
+        }
+        break;
+    default:
+        if (element_type.id() != LogicalTypeId::UTINYINT) {
+            throw ConversionException(
+                "Oracle VECTOR column \"%s\" holds a BINARY vector in a column of mixed storage formats; "
+                "read it with VECTOR_SERIALIZE or declare the column's format",
+                column.name);
+        }
+        elements = VectorElements(decoded.binary);
+        break;
+    }
+    if (sparse) {
+        vector<Value> indices;
+        indices.reserve(decoded.indices.size());
+        for (const auto index : decoded.indices) {
+            indices.push_back(Value::UINTEGER(index));
+        }
+        return Value::STRUCT(type, {Value::UINTEGER(decoded.dimensions), Value::LIST(LogicalType::UINTEGER, std::move(indices)),
+                                    Value::LIST(element_type, std::move(elements))});
+    }
+    const auto expected = type.id() == LogicalTypeId::ARRAY ? ArrayType::GetSize(type) : elements.size();
+    if (elements.size() != expected) {
+        throw ConversionException("Oracle VECTOR column \"%s\" holds %llu elements where %llu were declared", column.name,
+                                  static_cast<uint64_t>(elements.size()), static_cast<uint64_t>(expected));
+    }
+    return type.id() == LogicalTypeId::ARRAY ? Value::ARRAY(element_type, std::move(elements))
+                                             : Value::LIST(element_type, std::move(elements));
+}
+
 Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8_t>> &wire) {
     if (!wire) {
         return Value();
@@ -234,6 +377,10 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
             throw InvalidInputException("Oracle BOOLEAN value is empty");
         }
         return Value::BOOLEAN(wire->back() == 1);
+    case 119:
+        return Value(OsonToJson(column, *wire)).WithType(LogicalType::JSON());
+    case 127:
+        return VectorValueFor(column, *wire);
     case 23:
     case 24:
     case 113:
@@ -280,6 +427,105 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
         }
         return Value(std::string(wire->begin(), wire->end()));
     }
+}
+
+// Copies a dense vector's elements into the child of a LIST or ARRAY vector
+// without a Value per element. Returns false for anything this does not cover,
+// and the caller then takes the Value path, which also raises every refusal.
+template <class FROM, class TO>
+void CopyElements(const std::vector<FROM> &source, TO *target) {
+    for (size_t index = 0; index < source.size(); index++) {
+        target[index] = static_cast<TO>(source[index]);
+    }
+}
+
+bool TryWriteDenseVector(Vector &vector, idx_t row, const OracleColumn &column, const oracle_scanner::OracleVector &decoded) {
+    const auto &type = vector.GetType();
+    if (decoded.sparse || (column.vector_flags & oracle_scanner::ORACLE_VECTOR_COLUMN_SPARSE) != 0 ||
+        (column.vector_format != 0 && decoded.format != column.vector_format)) {
+        return false;
+    }
+    const bool is_array = type.id() == LogicalTypeId::ARRAY;
+    if (!is_array && type.id() != LogicalTypeId::LIST) {
+        return false;
+    }
+    const auto &child_type = is_array ? ArrayType::GetChildType(type) : ListType::GetChildType(type);
+    const idx_t count = decoded.format == oracle_scanner::ORACLE_VECTOR_BINARY ? decoded.binary.size()
+                        : decoded.format == oracle_scanner::ORACLE_VECTOR_FLOAT32 ? decoded.float32.size()
+                        : decoded.format == oracle_scanner::ORACLE_VECTOR_FLOAT64 ? decoded.float64.size()
+                                                                                  : decoded.int8.size();
+    if (is_array && count != ArrayType::GetSize(type)) {
+        return false;
+    }
+    // The element type the column maps to must be what this format fills; a
+    // format that does not fit it (BINARY into DOUBLE) takes the Value path to be refused.
+    const auto id = child_type.id();
+    const auto fill = [&](data_ptr_t target) {
+        switch (decoded.format) {
+        case oracle_scanner::ORACLE_VECTOR_FLOAT32:
+            if (id == LogicalTypeId::FLOAT) {
+                CopyElements(decoded.float32, reinterpret_cast<float *>(target));
+            } else if (id == LogicalTypeId::DOUBLE) {
+                CopyElements(decoded.float32, reinterpret_cast<double *>(target));
+            } else {
+                return false;
+            }
+            return true;
+        case oracle_scanner::ORACLE_VECTOR_FLOAT64:
+            if (id != LogicalTypeId::DOUBLE) {
+                return false;
+            }
+            CopyElements(decoded.float64, reinterpret_cast<double *>(target));
+            return true;
+        case oracle_scanner::ORACLE_VECTOR_INT8:
+            if (id == LogicalTypeId::TINYINT) {
+                CopyElements(decoded.int8, reinterpret_cast<int8_t *>(target));
+            } else if (id == LogicalTypeId::DOUBLE) {
+                CopyElements(decoded.int8, reinterpret_cast<double *>(target));
+            } else {
+                return false;
+            }
+            return true;
+        default:
+            if (id != LogicalTypeId::UTINYINT) {
+                return false;
+            }
+            CopyElements(decoded.binary, reinterpret_cast<uint8_t *>(target));
+            return true;
+        }
+    };
+    if (is_array) {
+        auto &child = ArrayVector::GetChildMutable(vector);
+        if (child.GetVectorType() != VectorType::FLAT_VECTOR) {
+            return false;
+        }
+        const auto width = GetTypeIdSize(child_type.InternalType());
+        if (!fill(FlatVector::GetDataMutable(child) + static_cast<idx_t>(row) * count * width)) {
+            return false;
+        }
+        for (idx_t element = 0; element < count; element++) {
+            FlatVector::SetNull(child, row * count + element, false);
+        }
+        FlatVector::SetNull(vector, row, false);
+        return true;
+    }
+    const idx_t offset = ListVector::GetListSize(vector);
+    ListVector::Reserve(vector, offset + count);
+    auto &child = ListVector::GetChildMutable(vector);
+    if (child.GetVectorType() != VectorType::FLAT_VECTOR) {
+        return false;
+    }
+    const auto width = GetTypeIdSize(child_type.InternalType());
+    if (!fill(FlatVector::GetDataMutable(child) + offset * width)) {
+        return false;
+    }
+    for (idx_t element = 0; element < count; element++) {
+        FlatVector::SetNull(child, offset + element, false);
+    }
+    ListVector::SetListSize(vector, offset + count);
+    FlatVector::GetDataMutable<list_entry_t>(vector)[row] = list_entry_t(offset, count);
+    FlatVector::SetNull(vector, row, false);
+    return true;
 }
 
 // A scan used to store each fetched value as SetValue(ValueFor(...)): a Value
@@ -412,6 +658,29 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
             return;
         }
         break;
+    case 119:
+        if (type.IsJSONType()) {
+            // The decoder writes valid UTF-8 by construction.
+            const auto json = OsonToJson(column, *wire);
+            store_string(json.data(), json.size());
+            return;
+        }
+        break;
+    case 127: {
+        // Decoded once here; a vector this cannot place goes through ValueFor,
+        // which decodes it again and says why if it must be refused.
+        oracle_scanner::OracleVector decoded;
+        try {
+            decoded = oracle_scanner::DecodeOracleVector(*wire);
+        } catch (const oracle_scanner::ProtocolError &) {
+            through_value();
+            return;
+        }
+        if (TryWriteDenseVector(vector, row, column, decoded)) {
+            return;
+        }
+        break;
+    }
     case 181:
     case 231:
     case 182:

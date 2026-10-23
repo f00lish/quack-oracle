@@ -1,4 +1,5 @@
 #include "oracle_scanner/ttc_statement_channel.hpp"
+#include "oracle_scanner/ttc_define.hpp"
 
 #include <optional>
 #include "oracle_scanner/ttc_error.hpp"
@@ -250,6 +251,19 @@ void TtcStatementChannel::Fetch(OracleStatementHandle handle, uint8_t sequence, 
     statements.BeginFetch(handle);
     try {
         channel.Send(EncodeTtcFetchRequest({sequence, remote_cursor_id, requested_rows}));
+    } catch (...) {
+        statements.Poison(handle);
+        throw;
+    }
+}
+
+void TtcStatementChannel::DefineInlineLobs(OracleStatementHandle handle, uint8_t sequence,
+                                           const std::vector<OracleColumn> &columns, uint32_t rows) {
+    const auto cursor = statements.RemoteCursorId(handle);
+    const auto request = EncodeInlineLobDefine(sequence, cursor, columns, rows);
+    statements.BeginFetch(handle);
+    try {
+        channel.Send(request);
     } catch (...) {
         statements.Poison(handle);
         throw;

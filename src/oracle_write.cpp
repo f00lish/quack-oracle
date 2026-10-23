@@ -33,10 +33,12 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
+#include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/session_factory.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -385,6 +387,103 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
 // One bind carries at most this much (the TTC bind limit). Writing a LOB through
 // an ordinary bind therefore stops here.
 constexpr size_t MAX_LOB_WRITE_BYTES = 16U << 20U;
+constexpr size_t MAX_JSON_WRITE_BYTES = MAX_LOB_WRITE_BYTES;
+
+namespace {
+const vector<Value> &VectorChildren(const Value &list) {
+    return list.type().id() == LogicalTypeId::ARRAY ? ArrayValue::GetChildren(list) : ListValue::GetChildren(list);
+}
+
+// The elements of a VECTOR value, in the storage format the column has. A
+// column of any format is mapped to a list of DOUBLE, so that is written as
+// FLOAT64 and the server converts it to whatever each row's format is.
+void FillVectorElements(oracle_scanner::OracleVector &target, const vector<Value> &children, const OracleColumn &column) {
+    for (const auto &child : children) {
+        if (child.IsNull()) {
+            RefuseValue(column, "a VECTOR has no NULL element");
+        }
+        try {
+            switch (target.format) {
+            case oracle_scanner::ORACLE_VECTOR_FLOAT32: {
+                const float number = child.GetValue<float>();
+                if (!std::isfinite(number)) {
+                    RefuseValue(column, "a VECTOR has no infinity or NaN element");
+                }
+                target.float32.push_back(number);
+                break;
+            }
+            case oracle_scanner::ORACLE_VECTOR_FLOAT64: {
+                const double number = child.GetValue<double>();
+                if (!std::isfinite(number)) {
+                    RefuseValue(column, "a VECTOR has no infinity or NaN element");
+                }
+                target.float64.push_back(number);
+                break;
+            }
+            case oracle_scanner::ORACLE_VECTOR_INT8: {
+                const auto number = child.GetValue<int64_t>();
+                if (number < -128 || number > 127) {
+                    RefuseValue(column, "an INT8 VECTOR element must be between -128 and 127");
+                }
+                target.int8.push_back(static_cast<int8_t>(number));
+                break;
+            }
+            default: {
+                const auto number = child.GetValue<int64_t>();
+                if (number < 0 || number > 255) {
+                    RefuseValue(column, "a BINARY VECTOR holds bytes, 0 to 255");
+                }
+                target.binary.push_back(static_cast<uint8_t>(number));
+                break;
+            }
+            }
+        } catch (const ConversionException &) {
+            RefuseValue(column, "a VECTOR element does not fit the column's storage format");
+        }
+    }
+}
+
+// A VECTOR value as the image a bind carries. A dense one is its list or array
+// of numbers; a sparse one is STRUCT(dimensions, indices, values).
+std::vector<uint8_t> VectorImage(const Value &value, const OracleColumn &column) {
+    const auto type = value.type().id();
+    const bool sparse = (column.vector_flags & oracle_scanner::ORACLE_VECTOR_COLUMN_SPARSE) != 0;
+    oracle_scanner::OracleVector target;
+    target.format = column.vector_format != 0 ? column.vector_format : oracle_scanner::ORACLE_VECTOR_FLOAT64;
+    target.sparse = sparse;
+    if (sparse) {
+        if (type != LogicalTypeId::STRUCT) {
+            RefuseBind(column, value, "a sparse VECTOR column takes STRUCT(dimensions, indices, values)");
+        }
+        const auto &children = StructValue::GetChildren(value);
+        if (children.size() != 3 || children[0].IsNull() || children[1].IsNull() || children[2].IsNull()) {
+            RefuseBind(column, value, "a sparse VECTOR needs its dimensions, indices and values");
+        }
+        target.dimensions = children[0].GetValue<uint32_t>();
+        for (const auto &index : VectorChildren(children[1])) {
+            if (index.IsNull()) {
+                RefuseValue(column, "a sparse VECTOR has no NULL index");
+            }
+            target.indices.push_back(index.GetValue<uint32_t>());
+        }
+        FillVectorElements(target, VectorChildren(children[2]), column);
+    } else {
+        if (type != LogicalTypeId::LIST && type != LogicalTypeId::ARRAY) {
+            RefuseBind(column, value, "a VECTOR column takes a list or array of numbers");
+        }
+        FillVectorElements(target, VectorChildren(value), column);
+        target.dimensions = static_cast<uint32_t>(VectorChildren(value).size());
+        if (target.format == oracle_scanner::ORACLE_VECTOR_BINARY) {
+            target.dimensions *= 8;
+        }
+    }
+    try {
+        return oracle_scanner::EncodeOracleVector(target);
+    } catch (const oracle_scanner::ProtocolError &error) {
+        RefuseValue(column, error.what());
+    }
+}
+} // namespace
 
 OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, const std::string &name) {
     // A column this client cannot read is one it cannot reason about writing
@@ -411,6 +510,11 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
         bind.oracle_type = 1;
     } else if (column.oracle_type == 113) {
         bind.oracle_type = 23;
+    } else if (column.oracle_type == 119) {
+        // JSON is written as its text, which the server converts: the form
+        // python-oracledb falls back to for a string bound to one. A VECTOR is
+        // bound as its image (see VectorImage).
+        bind.oracle_type = 1;
     }
     if ((column.oracle_type == 1 || column.oracle_type == 96) && column.character_set_form == 2) {
         bind.character_set_form = 2;
@@ -554,6 +658,24 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
         bind.value = std::vector<uint8_t>(bytes.begin(), bytes.end());
         return bind;
     }
+    case 119: { // JSON
+        if (type != LogicalTypeId::VARCHAR) {
+            RefuseBind(column, value, "a JSON column takes VARCHAR or JSON text");
+        }
+        const auto text = value.GetValue<std::string>();
+        if (text.empty()) {
+            return bind;
+        }
+        if (text.size() >= MAX_JSON_WRITE_BYTES) {
+            RefuseValue(column, "a JSON value is limited to " + std::to_string(MAX_JSON_WRITE_BYTES >> 20U) +
+                                    " MiB of text in this version");
+        }
+        bind.value = std::vector<uint8_t>(text.begin(), text.end());
+        return bind;
+    }
+    case 127: // VECTOR, bound as its image
+        bind.value = VectorImage(value, column);
+        return bind;
     case 181:
         // Readable because the value carries its own offset, but nothing on the
         // DuckDB side of this mapping carries one to write back.
@@ -1005,17 +1127,19 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
     // puts a projection over the source whose select list has, per physical
     // column, a reference into the source for a named column and the column's
     // bound default — a constant NULL for an Oracle table, which has no DuckDB
-    // default — for an unnamed one. So the projection's select list is read:
-    // a column whose expression is not a reference (possibly under a cast,
-    // which GetDefaultExpressionForColumn adds) was not named. The old map is
-    // still honoured when present, for a plan that reaches here some other way.
+    // default — for an unnamed one. The default is moved out of
+    // op.bound_defaults to do it, which is what says a column was left out:
+    // the projection's expressions cannot, because the optimizer folds
+    // constants into them and merges projections, so a named column can end up
+    // as a constant or a computation. The old map is still honoured when
+    // present, for a plan that reaches here some other way.
     std::vector<idx_t> source_indexes;
     std::vector<OracleColumn> bound_columns;
     std::string column_list;
     std::string value_list;
     const auto *projection =
         plan->type == PhysicalOperatorType::PROJECTION ? &plan->Cast<PhysicalProjection>() : nullptr;
-    const auto names_column = [&](idx_t physical) -> std::optional<idx_t> {
+    const auto names_column = [&](idx_t physical, idx_t storage) -> std::optional<idx_t> {
         if (!op.column_index_map.empty()) {
             const auto mapped = op.column_index_map[PhysicalIndex(physical)];
             if (mapped == DConstants::INVALID_INDEX) {
@@ -1027,6 +1151,15 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
             // No projection means the source already matches the table
             // column for column, so every column is named and in order.
             return physical;
+        }
+        if (storage < op.bound_defaults.size()) {
+            // The binder moves a column's bound default into the projection when
+            // the statement does not name it and only reads it for one it does,
+            // so a default that has gone is exactly an unnamed column. The
+            // expression itself cannot say: the optimizer folds constants and
+            // merges projections, and a column the user wrote as a constant or
+            // a computation then looks no different from one left out.
+            return op.bound_defaults[storage] ? std::optional<idx_t>(physical) : std::nullopt;
         }
         const Expression *expression = projection->select_list[physical].get();
         // A cast is a function expression of type OPERATOR_CAST in 2.0;
@@ -1046,7 +1179,7 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
         if (position >= columns.size()) {
             throw InternalException("Oracle INSERT column %llu is outside the table's Oracle metadata", position);
         }
-        const auto named = names_column(position);
+        const auto named = names_column(position, column.StorageOid());
         if (!named) {
             continue;
         }
@@ -1079,12 +1212,13 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
                                         static_cast<uint64_t>(position));
             }
             RequireReadableColumn(columns[position]);
-            if (columns[position].oracle_type == 112 || columns[position].oracle_type == 113) {
+            if (columns[position].oracle_type == 112 || columns[position].oracle_type == 113 ||
+                columns[position].oracle_type == 119 || columns[position].oracle_type == 127) {
                 // Oracle hands a LOB in RETURNING back as a locator, not as
                 // content, and this client has no capture of that exchange.
                 // DuckDB evaluates RETURNING over every column of the table,
                 // so one LOB column rules the clause out.
-                throw NotImplementedException("Oracle INSERT ... RETURNING cannot return the LOB column \"%s\"; "
+                throw NotImplementedException("Oracle INSERT ... RETURNING cannot return the LOB, JSON or VECTOR column \"%s\"; "
                                               "insert without RETURNING and read the row back",
                                               columns[position].name);
             }

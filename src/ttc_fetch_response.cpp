@@ -191,7 +191,14 @@ std::vector<TtcColumnFraming> ColumnFraming(const std::vector<OracleColumn> &col
     std::vector<TtcColumnFraming> framing;
     framing.reserve(wire_columns.size());
     for (const auto index : wire_columns) {
-        framing.push_back(TtcFramingForType(columns[index].oracle_type));
+        const auto &column = columns[index];
+        if (column.inline_lob_cells && IsOracleLocatorType(column.oracle_type)) {
+            framing.push_back(column.oracle_type == ORACLE_WIRE_TYPE_JSON || column.oracle_type == ORACLE_WIRE_TYPE_VECTOR
+                                  ? TtcColumnFraming::LOB_WITH_PREFIX
+                                  : TtcColumnFraming::LOB_WITHOUT_PREFIX);
+        } else {
+            framing.push_back(TtcFramingForType(column.oracle_type));
+        }
     }
     return framing;
 }

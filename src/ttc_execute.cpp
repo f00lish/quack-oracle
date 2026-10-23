@@ -47,9 +47,24 @@ void WriteThinOall8Extension(ByteWriter &writer, uint8_t field_version) {
     }
 }
 
+// A VECTOR is bound as its image, wrapped in a locator that states the image's
+// length, and declared with the largest buffer a vector can need — what
+// python-oracledb Thin sends (see PROVENANCE.md). Text would do for a short
+// vector, but a VARCHAR2 bind stops at 32767 bytes and a vector of a few
+// thousand floats is longer than that as text.
+constexpr uint32_t VECTOR_BIND_BYTES = 1U << 20U;
+constexpr uint64_t LOB_PREFETCH_FLAG = 0x02000000;
+
+bool IsVectorBind(const OracleBind &bind) {
+    return bind.oracle_type == ORACLE_WIRE_TYPE_VECTOR;
+}
+
 uint32_t BindBufferSize(const OracleBind &bind) {
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
         return 4;
+    }
+    if (IsVectorBind(bind)) {
+        return VECTOR_BIND_BYTES;
     }
     if (bind.maximum_bytes != 0) {
         return bind.maximum_bytes;
@@ -68,7 +83,8 @@ bool IsCharacterType(uint16_t type) {
 }
 
 void ValidateBind(const OracleBind &bind) {
-    if (bind.oracle_type == 0 || bind.oracle_type > 255 || (bind.value && bind.value->size() > MAX_BUFFER_BYTES)) {
+    if (bind.oracle_type == 0 || bind.oracle_type > 255 || (bind.value && bind.value->size() > MAX_BUFFER_BYTES) ||
+        (IsVectorBind(bind) && bind.value && bind.value->size() > VECTOR_BIND_BYTES)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC bind has invalid type or value size");
     }
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR && bind.direction == BindDirection::BIND_IN) {
@@ -152,12 +168,13 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
         // UB8 is one universal-length field, not two UB4 placeholders. The
         // previous four-zero tail inserted two phantom fields before OID and
         // made a bound SELECT's metadata impossible for Oracle to parse.
-        writer.WriteUB4(buffer_sizes[index]).WriteUB4(0).WriteUB8(0);
+        writer.WriteUB4(buffer_sizes[index]).WriteUB4(0).WriteUB8(IsVectorBind(bind) ? LOB_PREFETCH_FLAG : 0);
         // The empty object-id slot is a distinct UB4 (encoded as one zero
         // byte). Omitting it shifts version/charset/form by one field; Oracle
         // then reports a nonsensical collation id for character binds.
         const uint8_t character_form = bind.character_set_form != 0 ? bind.character_set_form : (character_type ? 1 : 0);
-        writer.WriteUB4(0).WriteUB2(0).WriteUB2(character_type ? 873 : 0).WriteByte(character_form).WriteUB4(0);
+        writer.WriteUB4(0).WriteUB2(0).WriteUB2(character_type ? 873 : 0).WriteByte(character_form);
+        writer.WriteUB4(IsVectorBind(bind) ? VECTOR_BIND_BYTES : 0);
         // 12.2+ uses a separate OACCOLID after max-character-size even for
         // bind metadata. Its one-byte zero encoding keeps the following
         // ROW_DATA marker aligned with Oracle's bound OALL8 parser.
@@ -173,10 +190,27 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
 // at 40000 characters: the row carried id, then the NCLOB, then the CLOB.
 constexpr uint32_t LONG_BIND_BUFFER_BYTES = 32767;
 
+// The 40-byte locator that goes in front of a bound image. Only the eight bytes
+// at offset 10 vary: the image's length, big-endian.
+std::vector<uint8_t> ImageLocator(uint64_t length) {
+    std::vector<uint8_t> locator(40, 0);
+    const uint8_t prefix[10] = {0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00, 0x00, 0x00, 0x01};
+    std::copy(prefix, prefix + sizeof(prefix), locator.begin());
+    for (size_t index = 0; index < 8; index++) {
+        locator[10 + index] = static_cast<uint8_t>(length >> (8U * (7U - index)));
+    }
+    return locator;
+}
+
 void WriteBindValue(ByteWriter &writer, const OracleBind &bind) {
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
         // OUT SYS_REFCURSOR has metadata but no client-side value.
         writer.WriteByte(0);
+    } else if (IsVectorBind(bind) && bind.value) {
+        const auto locator = ImageLocator(bind.value->size());
+        writer.WriteUB4(static_cast<uint32_t>(locator.size()));
+        writer.WriteLengthPrefixed(locator);
+        writer.WriteLengthPrefixed(bind.value);
     } else if (bind.value) {
         writer.WriteLengthPrefixed(bind.value);
     } else {
@@ -184,16 +218,24 @@ void WriteBindValue(ByteWriter &writer, const OracleBind &bind) {
     }
 }
 
+// A VECTOR bind is declared with a large buffer too, but it is a locator and
+// its value stays where it is declared: python-oracledb Thin sends an UPDATE
+// that sets six vector columns with all six values first, ahead of the short
+// binds declared after them.
+bool IsDeferredBind(const OracleBind &bind, uint32_t buffer_size) {
+    return buffer_size > LONG_BIND_BUFFER_BYTES && !IsVectorBind(bind);
+}
+
 void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds,
                      const std::vector<uint32_t> &buffer_sizes) {
     writer.WriteByte(TTC_MESSAGE_ROW_DATA);
     for (size_t index = 0; index < binds.size(); index++) {
-        if (buffer_sizes[index] <= LONG_BIND_BUFFER_BYTES) {
+        if (!IsDeferredBind(binds[index], buffer_sizes[index])) {
             WriteBindValue(writer, binds[index]);
         }
     }
     for (size_t index = 0; index < binds.size(); index++) {
-        if (buffer_sizes[index] > LONG_BIND_BUFFER_BYTES) {
+        if (IsDeferredBind(binds[index], buffer_sizes[index])) {
             WriteBindValue(writer, binds[index]);
         }
     }

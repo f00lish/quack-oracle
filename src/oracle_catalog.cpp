@@ -29,6 +29,7 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 
 #include "oracle_scanner/io_deadline_binding.hpp"
+#include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/session_factory.hpp"
 
 #include <mutex>
@@ -249,6 +250,12 @@ struct OracleAttachedState {
             oracle_type = 113;
         } else if (type == "BOOLEAN") {
             oracle_type = 252;
+        } else if (type == "JSON") {
+            oracle_type = 119;
+        } else if (type == "VECTOR") {
+            // Its dimensions and format are in a column only a 23ai dictionary
+            // has; ApplyVectorShapesLocked reads them once a VECTOR is seen.
+            oracle_type = 127;
         } else if (type == "ROWID") {
             oracle_type = 11;
         } else if (type == "UROWID") {
@@ -282,6 +289,110 @@ struct OracleAttachedState {
                 number(row[offset + 4], 0),
                 std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
                 character_set_form};
+    }
+
+    // VECTOR_INFO reads `VECTOR(3,FLOAT32,DENSE)`, `VECTOR(*,*,DENSE)`,
+    // `VECTOR(*,INT8,SPARSE)`: the dimension count or `*`, the storage format
+    // or `*`, and whether the column stores its vectors dense or sparse.
+    static bool ParseVectorInfo(const std::string &info, OracleColumn &column) {
+        const auto open = info.find('(');
+        const auto close = info.rfind(')');
+        if (open == std::string::npos || close == std::string::npos || close < open) {
+            return false;
+        }
+        auto parts = StringUtil::Split(info.substr(open + 1, close - open - 1), ',');
+        if (parts.size() != 3) {
+            return false;
+        }
+        for (auto &part : parts) {
+            StringUtil::Trim(part);
+        }
+        uint32_t dimensions = 0;
+        if (parts[0] != "*") {
+            try {
+                dimensions = static_cast<uint32_t>(std::stoul(parts[0]));
+            } catch (const std::exception &) {
+                return false;
+            }
+        }
+        uint8_t format = 0;
+        if (parts[1] == "FLOAT32") {
+            format = oracle_scanner::ORACLE_VECTOR_FLOAT32;
+        } else if (parts[1] == "FLOAT64") {
+            format = oracle_scanner::ORACLE_VECTOR_FLOAT64;
+        } else if (parts[1] == "INT8") {
+            format = oracle_scanner::ORACLE_VECTOR_INT8;
+        } else if (parts[1] == "BINARY") {
+            format = oracle_scanner::ORACLE_VECTOR_BINARY;
+        } else if (parts[1] != "*") {
+            return false;
+        }
+        if (parts[2] != "DENSE" && parts[2] != "SPARSE") {
+            return false;
+        }
+        column.vector_dimensions = dimensions;
+        column.vector_format = format;
+        column.vector_flags = static_cast<uint8_t>((dimensions == 0 ? oracle_scanner::ORACLE_VECTOR_COLUMN_FLEXIBLE_DIMENSIONS : 0) |
+                                                   (parts[2] == "SPARSE" ? oracle_scanner::ORACLE_VECTOR_COLUMN_SPARSE : 0));
+        return true;
+    }
+
+    // Gives every VECTOR column in `columns` the shape the dictionary states,
+    // so the type it is declared with here is the one a scan then produces.
+    // VECTOR_INFO does not exist before 23ai, and a server that has VECTOR
+    // columns has it; if the query is refused the shape stays unknown and the
+    // column is a list of DOUBLE, which holds any dense vector but BINARY.
+    void ApplyVectorShapesLocked(std::unordered_map<std::string, std::vector<OracleColumn>> &columns_by_object,
+                                 const std::string &only_object) const {
+        bool any = false;
+        for (const auto &entry : columns_by_object) {
+            for (const auto &column : entry.second) {
+                any = any || column.oracle_type == 127;
+            }
+        }
+        if (!any) {
+            return;
+        }
+        std::string sql = "SELECT table_name, column_name, vector_info FROM user_tab_columns WHERE data_type = 'VECTOR'";
+        if (!only_object.empty()) {
+            std::string literal;
+            for (const auto character : only_object) {
+                literal.push_back(character);
+                if (character == '\'') {
+                    literal.push_back('\'');
+                }
+            }
+            sql += " AND table_name = '" + literal + "'";
+        }
+        try {
+            OracleMetadataLease session(transaction_pool, config, password);
+            auto cursor = session->Query(sql, {});
+            for (;;) {
+                const auto batch = cursor->Fetch(STANDARD_VECTOR_SIZE);
+                for (const auto &row : batch.rows) {
+                    if (row.size() < 3 || !row[0] || !row[1] || !row[2]) {
+                        continue;
+                    }
+                    const auto entry = columns_by_object.find(std::string(row[0]->begin(), row[0]->end()));
+                    if (entry == columns_by_object.end()) {
+                        continue;
+                    }
+                    const std::string column_name(row[1]->begin(), row[1]->end());
+                    for (auto &column : entry->second) {
+                        if (column.oracle_type == 127 && column.name == column_name) {
+                            ParseVectorInfo(std::string(row[2]->begin(), row[2]->end()), column);
+                        }
+                    }
+                }
+                if (batch.exhausted) {
+                    break;
+                }
+            }
+            cursor->Close();
+            session.Finish();
+        } catch (const std::exception &) {
+            // Shapes left unknown; the columns still read, as DOUBLE lists.
+        }
     }
 
     // Reads the columns of every object in the schema in one dictionary query
@@ -348,6 +459,7 @@ struct OracleAttachedState {
         }
         cursor->Close();
         session.Finish();
+        ApplyVectorShapesLocked(column_cache, std::string());
         metadata_complete = !truncated;
     }
 
@@ -381,7 +493,10 @@ struct OracleAttachedState {
         }
         cursor->Close();
         session.Finish();
-        return columns;
+        std::unordered_map<std::string, std::vector<OracleColumn>> by_object;
+        by_object.emplace(object_name, std::move(columns));
+        ApplyVectorShapesLocked(by_object, object_name);
+        return std::move(by_object.begin()->second);
     }
 
     // Oracle enforces a primary key only while the constraint is enabled and
@@ -914,6 +1029,13 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         columns[index].precision = dictionary_column.precision;
         columns[index].scale = dictionary_column.scale;
         columns[index].nullable = dictionary_column.nullable;
+        if (dictionary_column.oracle_type == 127) {
+            // The table was declared with the dictionary's shape, so that is
+            // the shape this scan fills.
+            columns[index].vector_dimensions = dictionary_column.vector_dimensions;
+            columns[index].vector_format = dictionary_column.vector_format;
+            columns[index].vector_flags = dictionary_column.vector_flags;
+        }
         (void)TypeFor(columns[index]);
     }
 }

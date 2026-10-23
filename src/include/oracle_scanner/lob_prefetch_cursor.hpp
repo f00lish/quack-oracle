@@ -18,7 +18,7 @@ struct OracleLobPrefetchLimits {
 };
 
 inline bool SupportsLobPrefetchColumns(const std::vector<OracleColumn> &columns, uint8_t field_version) {
-    if (field_version != 12 || columns.empty() || columns.size() > 4096) { return false; }
+    if (field_version < 12 || columns.empty() || columns.size() > 4096) { return false; }
     bool lob = false;
     for (const auto &column : columns) {
         if (column.character_set_form > 1) { return false; }

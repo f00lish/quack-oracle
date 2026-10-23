@@ -832,11 +832,12 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `INTERVAL DAY TO SECOND` | `INTERVAL` | days and microseconds; a finer fraction is refused |
 | `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | an instant; sessions opened here use UTC |
 | `BOOLEAN` (23ai) | `BOOLEAN` | |
+| `JSON` (23ai) | `JSON` | the stored OSON image, decoded to JSON text |
+| `VECTOR` (23ai) | `FLOAT[n]`, `DOUBLE[n]`, `TINYINT[n]`, `UTINYINT[n]`; `STRUCT` for `SPARSE` | by the column's declared format and dimensions |
 | `ROWID`, `UROWID` | `VARCHAR` | the 18 characters `ROWIDTOCHAR` gives; a logical UROWID is refused |
 | `LONG`, `LONG RAW` | `VARCHAR`, `BLOB` | up to 1 MiB a value |
 
-Anything else — `BFILE`, `XMLTYPE`, `JSON`,
-`VECTOR`, object and collection types — is **refused when the query is
+Anything else — `BFILE`, `XMLTYPE`, object and collection types — is **refused when the query is
 bound**, with a message naming the column and the reason. It is never decoded
 into something that looks right and is not.
 

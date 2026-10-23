@@ -17,17 +17,21 @@ constexpr uint16_t ORACLE_CHARSET_AL32UTF8 = 873;
 // carries 12 at that index, and every decoder gate has to agree with what was
 // actually offered rather than with a literal written at the call site.
 //
-// 17 is python-oracledb's TNS_CCAP_FIELD_VERSION_23_1, the lowest value at
-// which a 23ai server sends a SQL BOOLEAN as its own type (252) rather than as
-// NUMBER. Measured on Free 23ai with this client: 13 to 16 still get NUMBER, 17
-// gets 252, and 18 and above change the shape of the execute request, which
-// this client does not build (ORA-03120). A 19c server reports 12 and so still
-// negotiates down to 12.
+// 24 is python-oracledb's TNS_CCAP_FIELD_VERSION_23_4, the highest it knows and
+// the one at which a 23ai server describes a VECTOR column's dimensions and
+// storage format. 17 (23_1) is the lowest at which the server sends a SQL
+// BOOLEAN as its own type (252) rather than as NUMBER; 13 to 16 still get
+// NUMBER. From 18 every function-call and piggyback header carries a token after
+// its sequence number (TTC_FIELD_VERSION_HEADER_TOKEN) — measured on Free 23ai,
+// where a client that advertised 18 without writing it got ORA-03120 — and the
+// describe grows by a domain name pair (17), an annotation count (20) and the
+// vector fields (24). A 19c server reports 12 and so still negotiates down to 12.
 constexpr size_t TTC_CAPABILITY_FIELD_VERSION_INDEX = 7;
 // Where the capability vector starts in the TTIDTY request: message type, two
 // character sets, the encoding byte and the vector's length byte.
 constexpr size_t TTC_DATA_TYPES_CAPABILITIES_OFFSET = 7;
-constexpr uint8_t ORACLE_CLIENT_TTC_FIELD_VERSION = 17;
+constexpr uint8_t ORACLE_CLIENT_TTC_FIELD_VERSION = 24;
+constexpr uint8_t TTC_FIELD_VERSION_HEADER_TOKEN = 18;
 
 struct TtcProtocolInfo {
     uint8_t server_version = 0;

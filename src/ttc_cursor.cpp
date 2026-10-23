@@ -64,15 +64,20 @@ OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version) {
     reader.ReadUB4();   // UDS flags
     // The same trailing fields the top-level describe reads, by the same
     // gates: a domain schema and name from field version 17, an annotation
-    // count from 20, three more small fields from 24. Only 17 is ever
-    // negotiated by this client; the rest stay refused rather than guessed.
+    // count from 20, a vector's shape from 24.
     if (field_version >= 17) {
         SkipString(reader); // domain schema
         SkipString(reader); // domain name
     }
     if (field_version >= 20) {
-        throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
-                            "cursor-descriptor annotations require a versioned decoder");
+        if (reader.ReadUB4() != 0) {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "TTC cursor descriptor annotations are not yet supported");
+        }
+    }
+    if (field_version >= 24) {
+        column.vector_dimensions = reader.ReadUB4();
+        column.vector_format = reader.ReadByte();
+        column.vector_flags = reader.ReadByte();
     }
     column.byte_width = column.oracle_type == 23 ? maximum_size : size;
     // Same rule as the top-level describe: a zero declared maximum means the

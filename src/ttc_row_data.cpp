@@ -75,6 +75,41 @@ void SkipLongTrailer(ByteReader &reader) {
 
 } // namespace
 
+std::vector<uint8_t> EncodeTtcInlineLob(const TtcInlineLob &lob) {
+    std::vector<uint8_t> cell;
+    cell.reserve(12 + lob.prefix.size() + lob.locator.size());
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        cell.push_back(static_cast<uint8_t>(lob.total >> static_cast<unsigned>(shift)));
+    }
+    const auto prefix_size = static_cast<uint32_t>(lob.prefix.size());
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        cell.push_back(static_cast<uint8_t>(prefix_size >> static_cast<unsigned>(shift)));
+    }
+    cell.insert(cell.end(), lob.prefix.begin(), lob.prefix.end());
+    cell.insert(cell.end(), lob.locator.begin(), lob.locator.end());
+    return cell;
+}
+
+TtcInlineLob DecodeTtcInlineLob(const std::vector<uint8_t> &cell) {
+    if (cell.size() < 12) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "a stored LOB cell is too short");
+    }
+    TtcInlineLob lob;
+    for (size_t index = 0; index < 8; index++) {
+        lob.total = (lob.total << 8U) | cell[index];
+    }
+    uint32_t prefix_size = 0;
+    for (size_t index = 8; index < 12; index++) {
+        prefix_size = (prefix_size << 8U) | cell[index];
+    }
+    if (prefix_size > cell.size() - 12) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "a stored LOB cell's prefix runs past its end");
+    }
+    lob.prefix.assign(cell.begin() + 12, cell.begin() + 12 + prefix_size);
+    lob.locator.assign(cell.begin() + 12 + prefix_size, cell.end());
+    return lob;
+}
+
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, const std::vector<TtcColumnFraming> &framing,
                                         size_t maximum_value_bytes) {
     return DecodeTtcRowDataPrefix(message.data(), message.size(), framing, maximum_value_bytes);
@@ -117,6 +152,27 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const 
         }
         if (locator_size > MAX_LOB_LOCATOR_BYTES) {
             throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC LOB locator length is implausible");
+        }
+        if (framing[column] == TtcColumnFraming::LOB_WITH_PREFIX || framing[column] == TtcColumnFraming::LOB_WITHOUT_PREFIX) {
+            TtcInlineLob lob;
+            lob.total = reader.ReadUB8();
+            (void)reader.ReadUB4(); // the server's chunk size, not an allocation request
+            if (framing[column] == TtcColumnFraming::LOB_WITH_PREFIX) {
+                auto prefix = reader.ReadLengthPrefixed(maximum_value_bytes);
+                if (prefix) {
+                    lob.prefix = std::move(*prefix);
+                }
+                if (lob.prefix.size() > lob.total) {
+                    throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC LOB prefix is longer than the LOB");
+                }
+            }
+            auto locator = reader.ReadLengthPrefixed(MAX_LOB_LOCATOR_BYTES);
+            if (!locator || locator->size() != locator_size) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC LOB locator length disagrees with its prefix");
+            }
+            lob.locator = std::move(*locator);
+            result.push_back(EncodeTtcInlineLob(lob));
+            continue;
         }
         // The ub4 above is the locator's size, and the locator then follows in
         // the ordinary length-prefixed form — so its length is stated twice.

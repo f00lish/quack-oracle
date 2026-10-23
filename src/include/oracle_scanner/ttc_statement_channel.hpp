@@ -44,6 +44,10 @@ public:
                                         uint8_t ttc_field_version = 12, uint8_t server_field_version = 12);
     void CompleteExecute(OracleStatementHandle handle, bool is_query, uint32_t remote_cursor_id);
     void Fetch(OracleStatementHandle handle, uint8_t sequence, uint32_t requested_rows);
+    // Re-executes the described cursor with a define for each column, so JSON
+    // and VECTOR values arrive with their rows (see ttc_define.hpp).
+    void DefineInlineLobs(OracleStatementHandle handle, uint8_t sequence, const std::vector<OracleColumn> &columns,
+                          uint32_t rows);
     void DefineLobPrefetch(OracleStatementHandle handle,uint8_t sequence,
         const std::vector<OracleColumn> &columns,uint32_t rows,uint8_t field_version,const OracleLobPrefetchLimits &limits);
     TtcFetchResponse ReceiveDecodedLobPrefetchFetchResponse(OracleStatementHandle handle,

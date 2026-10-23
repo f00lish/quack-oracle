@@ -32,6 +32,16 @@ inline bool IsOracleLobType(uint16_t oracle_type) {
     return oracle_type == ORACLE_WIRE_TYPE_CLOB || oracle_type == ORACLE_WIRE_TYPE_BLOB;
 }
 
+// JSON (an OSON image) and VECTOR arrive exactly as a BLOB does: a locator in
+// ROW_DATA, the image behind it. They are binary, never character, LOBs.
+constexpr uint16_t ORACLE_WIRE_TYPE_JSON = 119;
+constexpr uint16_t ORACLE_WIRE_TYPE_VECTOR = 127;
+
+inline bool IsOracleLocatorType(uint16_t oracle_type) {
+    return IsOracleLobType(oracle_type) || oracle_type == ORACLE_WIRE_TYPE_JSON ||
+           oracle_type == ORACLE_WIRE_TYPE_VECTOR;
+}
+
 // LONG and LONG RAW declare no maximum: the describe reports zero, which for
 // every other type means a column that can only ever be NULL and is left out of
 // ROW_DATA. These two are sent, as a chunked value, so a zero maximum must not
@@ -57,10 +67,26 @@ constexpr uint16_t ORACLE_WIRE_TYPE_UROWID = 208;
 // -1 for NULL) and a return code (0, or 1405 for NULL), both universal
 // integers that carry nothing the value does not already say. Captured from
 // 19c: `fe 01 02 78 79 00 00 00` for 'xy', and `00 81 01 02 05 7d` for NULL.
-enum class TtcColumnFraming : uint8_t { SCALAR, LOB, ROWID, UROWID, LONG };
+//
+// A cursor that has asked for LOB values ahead of their locators gets cells
+// framed differently: the locator's size, the value's total size, a chunk size,
+// then either the first bytes of the value (JSON and VECTOR, whose define says
+// how many to send) or nothing (CLOB and BLOB, which it asks for none), and
+// the locator. Captured from a 23ai server answering python-oracledb Thin.
+enum class TtcColumnFraming : uint8_t { SCALAR, LOB, ROWID, UROWID, LONG, LOB_WITH_PREFIX, LOB_WITHOUT_PREFIX };
+
+// What a cell framed that way is kept as until the session resolves it: the
+// value's total size, the leading bytes the server sent, and the locator.
+struct TtcInlineLob {
+    uint64_t total = 0;
+    std::vector<uint8_t> prefix;
+    std::vector<uint8_t> locator;
+};
+std::vector<uint8_t> EncodeTtcInlineLob(const TtcInlineLob &lob);
+TtcInlineLob DecodeTtcInlineLob(const std::vector<uint8_t> &cell);
 
 inline TtcColumnFraming TtcFramingForType(uint16_t oracle_type) {
-    if (IsOracleLobType(oracle_type)) {
+    if (IsOracleLocatorType(oracle_type)) {
         return TtcColumnFraming::LOB;
     }
     if (oracle_type == ORACLE_WIRE_TYPE_ROWID) {

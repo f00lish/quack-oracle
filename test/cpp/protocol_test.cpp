@@ -1390,13 +1390,23 @@ static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
     request.sql = "select 1 from dual";
     request.is_query = true;
     const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
+    // The options word is the fourth field: three bytes of function header
+    // (message type, function code, sequence) and then the options themselves.
+    {
+        std::cout << "[exec-head]";
+        for (size_t index = 0; index < encoded.size() && index < 16; index++) {
+            std::cout << " " << std::hex << static_cast<int>(encoded[index]) << std::dec;
+        }
+        std::cout << std::endl;
+    }
     ByteReader reader(encoded);
-    CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION && reader.ReadByte() == TTC_FUNCTION_EXECUTE);
+    CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION);
+    CHECK(reader.ReadByte() == TTC_FUNCTION_EXECUTE);
     (void)reader.ReadByte(); // sequence
     const auto options = reader.ReadUB4();
     CHECK((options & 0x40) == 0);
-    CHECK((options & 0x01) != 0);  // parse
-    CHECK((options & 0x20) != 0);  // execute
+    CHECK((options & 0x01) != 0);   // parse
+    CHECK((options & 0x20) != 0);   // execute
     CHECK((options & 0x8000) != 0); // not PL/SQL
 
     // A DML request carries the same core bits and also leaves the bit
@@ -1404,11 +1414,13 @@ static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
     TtcExecuteNoBindsRequest dml;
     dml.sql = "update t set a = 1";
     dml.is_query = false;
-    ByteReader dml_reader(EncodeTtcExecuteNoBindsRequest(dml));
+    const auto dml_encoded = EncodeTtcExecuteNoBindsRequest(dml);
+    ByteReader dml_reader(dml_encoded);
     (void)dml_reader.ReadByte();
     (void)dml_reader.ReadByte();
     (void)dml_reader.ReadByte();
-    CHECK((dml_reader.ReadUB4() & 0x40) == 0);
+    const auto dml_options = dml_reader.ReadUB4();
+    CHECK((dml_options & 0x40) == 0);
 }
 
 static void TestTtcRowDataCodec() {

@@ -128,18 +128,12 @@
 using namespace oracle_scanner;
 using namespace duckdb_miniz;
 
-static int g_expect_error_counter = 0;
-
 template <class FUNCTION>
 static void ExpectError(ProtocolErrorKind kind, FUNCTION function) {
-    const int call_id = ++g_expect_error_counter;
-    std::cerr << "[expect-error] #" << call_id << " kind=" << static_cast<int>(kind) << std::endl;
     try {
         function();
-        std::cerr << "[expect-error] #" << call_id << " DID NOT RAISE" << std::endl;
         CHECK(false && "expected ProtocolError");
     } catch (const ProtocolError &error) {
-        std::cerr << "[expect-error] #" << call_id << " raised kind=" << static_cast<int>(error.Kind()) << std::endl;
         CHECK(error.Kind() == kind);
     }
 }
@@ -879,6 +873,15 @@ static void TestTtcParameters() {
         return std::vector<TtcParameter> {{"AUTH_VFR_DATA", "00112233445566778899AABBCCDDEEFF", type},
                                           {"AUTH_SESSKEY", std::string(96, 'A'), 0}};
     };
+    // An 11G challenge is refused by the 12C reader too, and the message says
+    // so: the two algorithms derive their keys differently, so answering an
+    // 11G challenge with the 12C one would build a well-formed response with
+    // the wrong keys in it.
+    const auto eleven_g = message_for(verifier_only(O5LOGON_VERIFIER_11G_2));
+    CHECK(eleven_g.find("11G challenge") != std::string::npos);
+    CHECK(eleven_g.find("0x1B25") != std::string::npos);
+    const auto eleven_g_b = message_for(verifier_only(O5LOGON_VERIFIER_11G_1));
+    CHECK(eleven_g_b.find("11G challenge") != std::string::npos);
     const auto ten_g = message_for(verifier_only(O5LOGON_VERIFIER_10G));
     CHECK(ten_g.find("10G password verifier (type 0x0939)") != std::string::npos);
     CHECK(ten_g.find("SEC_CASE_SENSITIVE_LOGON") != std::string::npos);

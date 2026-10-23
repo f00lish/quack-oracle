@@ -38,6 +38,15 @@ constexpr uint32_t O5LOGON_VERIFIER_10G = 0x0939;
 // Throws UNSUPPORTED, naming the verifier by type, unless it is 12C or 11G.
 void RequireSupportedO5LogonVerifier(uint32_t verifier_type);
 
+// Throws UNSUPPORTED unless the verifier is 12C.
+//
+// The stricter question, asked by the 12C paths: RequireSupportedO5LogonVerifier
+// answers "does this client implement the verifier the server offered", and
+// it allows 11G now. The 12C algorithm and the 11G algorithm derive their
+// keys completely differently, so a 12C path that accepts an 11G challenge
+// would build a well-formed response with the wrong keys in it.
+void Require12CVerifier(uint32_t verifier_type);
+
 struct O5LogonChallenge {
     std::string verifier_data_hex;
     std::string server_session_key_hex;

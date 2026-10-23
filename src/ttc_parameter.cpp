@@ -1,4 +1,5 @@
 #include "oracle_scanner/ttc_parameter.hpp"
+#include "oracle_scanner/auth_crypto.hpp"
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
@@ -179,7 +180,11 @@ O5LogonChallenge O5LogonChallengeFromParameters(const std::vector<TtcParameter> 
     // have to carry the 12C PBKDF2 fields, and should be reported as the
     // unsupported verifier it is rather than as a missing field.
     (void)required("AUTH_VFR_DATA");
-    RequireSupportedO5LogonVerifier(verifier_type);
+    // This reader answers 12C challenges. The shared check would let an 11G
+    // one through (11G is implemented), and the 12C algorithm would then
+    // derive the wrong keys from a challenge that carries none of the PBKDF2
+    // fields it needs.
+    Require12CVerifier(verifier_type);
     O5LogonChallenge result;
     result.verifier_data_hex = required("AUTH_VFR_DATA");
     result.server_session_key_hex = required("AUTH_SESSKEY");

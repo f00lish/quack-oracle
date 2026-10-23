@@ -247,6 +247,35 @@ void RequireSupportedO5LogonVerifier(uint32_t verifier_type) {
                             remedy);
 }
 
+// The 12C response builder answers 12C challenges and nothing else.
+//
+// RequireSupportedO5LogonVerifier answers a different question: "does this
+// client implement the verifier the server offered". It allows 11G now,
+// because an 11.2 listener offers 11G and the 11G path answers it. That is
+// not sufficient here: the 12C and 11G algorithms derive their keys
+// completely differently, so an 11G challenge answered with the 12C
+// algorithm produces a well-formed response with the wrong keys in it.
+//
+// So the question this function asks is "is this verifier the one I answer",
+// and an 11G challenge is reported as unsupported — with a message that says
+// where to send it, rather than as malformed.
+void Require12CVerifier(uint32_t verifier_type) {
+    if (verifier_type == O5LOGON_VERIFIER_12C) {
+        return;
+    }
+    if (verifier_type == O5LOGON_VERIFIER_11G_1 || verifier_type == O5LOGON_VERIFIER_11G_2) {
+        // The type is spelled the same way as everywhere else ("0x1B25"),
+        // so one reader recognises it however it was reported.
+        char type[16];
+        std::snprintf(type, sizeof(type), "0x%04X", static_cast<unsigned>(verifier_type));
+        throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                            std::string("the 12C O5LOGON path was given an 11G challenge (type ") + type +
+                                "); the 11G verifiers need the 11G algorithm, which answers them elsewhere");
+    }
+    // 10G and anything unknown: the shared check explains what to do about it.
+    RequireSupportedO5LogonVerifier(verifier_type);
+}
+
 O5LogonResponse BuildO5LogonResponse(const std::string &password, const O5LogonChallenge &challenge,
                                      const std::vector<uint8_t> &client_session_key,
                                      const std::vector<uint8_t> &password_salt,
@@ -258,7 +287,13 @@ O5LogonResponse BuildO5LogonResponse(const std::string &password, const O5LogonC
     // The verifier first: an account whose verifier this client does not
     // implement is unsupported, not malformed, and has to be reported so.
     // There is no default — a challenge that does not say 12C is not 12C.
-    RequireSupportedO5LogonVerifier(challenge.verifier_type);
+    //
+    // The check is stricter than "does this client implement that verifier":
+    // this function answers 12C challenges and nothing else. The 11G
+    // verifiers are implemented (an 11.2 listener offers 11G), and answering
+    // an 11G challenge with the 12C algorithm would derive the wrong keys
+    // entirely — the response would be well-formed and wrong.
+    Require12CVerifier(challenge.verifier_type);
     auto verifier = DecodeHex(challenge.verifier_data_hex, 64);
     auto encrypted_server_key = DecodeHex(challenge.server_session_key_hex, 64);
     auto combo_salt = DecodeHex(challenge.combo_key_salt_hex, 64);

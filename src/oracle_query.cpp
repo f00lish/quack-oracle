@@ -2680,8 +2680,63 @@ std::string OracleSampleClause(optional_ptr<SampleOptions> options, const std::o
 	return clause;
 }
 
+// Runs the statement an AGGREGATE was replaced with. The result columns are
+// the plan's contract (declared when the optimizer rewrote it); Oracle's describe
+// supplies the wire representation and has to map to the same types.
+unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
+                                                         TableFunctionInitInput &input) {
+    OracleSessionHandle session;
+    std::unique_ptr<OracleCursor> cursor;
+    OracleScanOpening opened;
+    try {
+        session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
+        const auto before = session->IoStats();
+        cursor = session->Query(bind.aggregate_sql, {});
+        opened.sql = bind.aggregate_sql;
+        opened.io = session->IoStats() - before;
+    } catch (const std::exception &error) {
+        session.Poison();
+        throw IOException("Oracle could not aggregate table '%s': %s", bind.object_name, error.what());
+    }
+    auto columns = cursor->Columns();
+    if (columns.size() != bind.columns.size()) {
+        throw IOException("Oracle described %llu columns for an aggregate of %llu", static_cast<uint64_t>(columns.size()),
+                          static_cast<uint64_t>(bind.columns.size()));
+    }
+    for (idx_t index = 0; index < columns.size(); index++) {
+        const auto &declared = bind.columns[index];
+        if (declared.oracle_type != 0) {
+            columns[index].oracle_type = declared.oracle_type;
+        }
+        columns[index].byte_width = declared.byte_width;
+        columns[index].precision = declared.precision;
+        columns[index].scale = declared.scale;
+        columns[index].nullable = declared.nullable;
+        columns[index].unconstrained_number = declared.unconstrained_number;
+        columns[index].unconstrained_precision = declared.unconstrained_precision;
+        columns[index].unconstrained_scale = declared.unconstrained_scale;
+        if (TypeFor(columns[index]) != bind.types[index]) {
+            throw IOException("Oracle aggregate column %llu maps to %s where the plan expects %s",
+                              static_cast<uint64_t>(index + 1), TypeFor(columns[index]).ToString(),
+                              bind.types[index].ToString());
+        }
+    }
+    const auto chunk_columns = columns.size();
+    auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
+                                                   bind.types, std::move(input.column_ids), chunk_columns);
+    state->catalog_name = bind.catalog_name;
+    state->sent_sql = opened.sql;
+    state->metrics.Add(opened.io);
+    state->metrics.sessions = 1;
+    state->last_io = state->session ? state->session->IoStats() : OracleIoStats();
+    return std::move(state);
+}
+
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleQueryBindData>();
+    if (bind.aggregate_scan) {
+        return OracleAggregateInit(context, bind, input);
+    }
     if (bind.transactional_query) {
         auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
         TransactionSession(context, target);

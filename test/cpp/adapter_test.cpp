@@ -622,6 +622,8 @@ struct TestDatabase {
         // any transport work, so these are placeholders, not credentials.
         Run("CREATE SECRET ora (TYPE oracle, HOST '127.0.0.1', PORT 1521, "
             "SERVICE_NAME 'service', USER 'app_user', PASSWORD 'placeholder');");
+        // The fake answers plain scans; the one test of aggregate pushdown turns it on.
+        Run("SET oracle_aggregate_pushdown = false;");
     }
 
     std::unique_ptr<MaterializedQueryResult> Query(const std::string &sql) {
@@ -2538,8 +2540,27 @@ void TestJoinKeysReachOracle() {
     CHECK(!database.Query("SELECT ID FROM o.main.FACTS ORDER BY ID DESC LIMIT 5;")->HasError());
     CHECK(script->queries.back().find("ORDER BY") == std::string::npos);
     database.Run("SET oracle_top_n_pushdown = true;");
+    // A grouped COUNT/SUM/MIN/MAX is computed by Oracle: the scan runs one GROUP BY statement and its columns
+    // reach the plan in the types the AGGREGATE had (a sum of integers arrives as text and is a HUGEINT).
+    database.Run("SET oracle_aggregate_pushdown = true;");
+    script->routes.insert(script->routes.begin(),
+                          {"GROUP BY", {{Column("C0", 2, 10, 0), Column("C1", 2, 18, 0), Column("C2", 1), Column("C3", 2, 10, 0)},
+                                        {{Number("1000"), Number("2"), Text("2100"), Number("1000")},
+                                         {Number("1100"), Number("1"), Text("1100"), Number("1100")}}}});
+    auto grouped = database.Query("SELECT ID, count(*), sum(ID), min(ID) FROM o.main.FACTS WHERE ID > 5 GROUP BY ID ORDER BY ID;");
+    CHECK(!grouped->HasError() && grouped->RowCount() == 2);
+    CHECK(grouped->GetValue(2, 0).ToString() == "2100" && grouped->GetValue(2, 0).type() == duckdb::LogicalType::HUGEINT &&
+          grouped->GetValue(1, 0).ToString() == "2");
+    CHECK(script->queries.back().find("GROUP BY \"ID\"") != std::string::npos &&
+          script->queries.back().find("SUM(\"ID\")") != std::string::npos &&
+          script->queries.back().find("WHERE \"ID\" > 5") != std::string::npos);
+    // An aggregate with a FILTER is left to DuckDB.
+    CHECK(!database.Query("SELECT count(*) FILTER (WHERE ID > 1050) FROM o.main.FACTS;")->HasError());
+    CHECK(script->queries.back().find("GROUP BY") == std::string::npos);
+    // The rest of this test counts rows the fake serves for plain scans.
+    database.Run("SET oracle_aggregate_pushdown = false;");
     // EXPLAIN ANALYZE says what was sent to Oracle and what came back.
-    auto analyzed = database.Query("EXPLAIN ANALYZE SELECT count(*) FROM o.main.FACTS WHERE ID > 1000;");
+    auto analyzed = database.Query("EXPLAIN ANALYZE SELECT ID FROM o.main.FACTS WHERE ID > 1000;");
     CHECK(!analyzed->HasError());
     std::string analysis;
     for (duckdb::idx_t row = 0; row < analyzed->RowCount(); row++) {

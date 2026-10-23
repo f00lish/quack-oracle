@@ -236,6 +236,11 @@ struct OracleQueryBindData final : TableFunctionData {
     idx_t top_n_rows = 0;
     //! ` ORDER BY ... FETCH FIRST n ROWS ONLY` when the scan applies it, built at init.
     std::string order_clause;
+    //! A scan that Oracle aggregates: the optimizer replaced an AGGREGATE over an
+    //! attached table with this statement. `columns` and `types` are its result
+    //! columns as the plan expects them, declared rather than described.
+    bool aggregate_scan = false;
+    std::string aggregate_sql;
     ConnectionConfig config;
     std::string password;
     std::string object_name;
@@ -495,6 +500,8 @@ struct OracleScanOpening {
 //! Installs the plan rewrites for attached tables (src/oracle_optimizer.cpp).
 void RegisterOracleOptimizer(DatabaseInstance &db);
 std::string OracleTopNClause(const OracleQueryBindData &bind);
+unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
+                                                         TableFunctionInitInput &input);
 
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,

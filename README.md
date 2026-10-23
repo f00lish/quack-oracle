@@ -482,6 +482,20 @@ rows would be cut before the filter) leaves the scan reading everything, as befo
 queries over a table with NULLs and ties, with and without pushed filters, returned the same
 rows with and without it on 19c and 23ai.
 
+**Aggregates.** `SELECT region, count(*), sum(amount), max(day) FROM o.SALES WHERE … GROUP BY region`
+is computed by Oracle (`SELECT "REGION", CAST(COUNT(*) …), …, MAX("DAY") FROM "SALES" WHERE … GROUP BY "REGION"`),
+so the groups travel, not the rows. Covered: `count(*)`, `count(col)`, `sum`, `min`, `max`, with
+or without `GROUP BY`, without `DISTINCT`, `FILTER`, `ORDER BY` or `GROUPING SETS`. `sum` is
+pushed for exact numbers only (integers arrive as text and are read as `HUGEINT`, fixed-scale
+decimals as `DECIMAL(38,s)`, the types DuckDB itself returns); `min`, `max` and group keys for
+numbers, dates and timestamps. Text keys and floating point are left to DuckDB (Oracle may
+group and order text by a collation or blank-padding where DuckDB compares bytes, and the order of
+addition changes a floating-point sum). Every filter must have gone to Oracle too, and the scan
+must have no sample and no join filter coming later; otherwise the plan is unchanged.
+`SET oracle_aggregate_pushdown = false` turns it off. 60 random aggregate queries (up to two
+group keys, NULLs, ties, decimals, dates, timestamps, pushed filters) returned the same rows with
+and without it on 19c and 23ai.
+
 **Samples.** `SELECT … FROM o.BIG TABLESAMPLE SYSTEM (1%)` and
 `USING SAMPLE 1000 ROWS (system)` are taken by Oracle (`SAMPLE (p)`, or `SAMPLE BLOCK (p)`
 for tables of tens of millions of rows, with `SEED` for `REPEATABLE`), so 1% of a
@@ -992,6 +1006,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
+| `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`/`sum`/`min`/`max` with `GROUP BY` over number, date and timestamp keys |
 | `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key; see [section 4](#pushing-filters-down-to-oracle) |
 | `oracle_parallel_scan` | `0` | How many sessions one scan of an attached table may read through at once; see [section 7](#7-read-a-big-table-faster) |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use |

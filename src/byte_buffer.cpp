@@ -134,19 +134,19 @@ std::optional<std::vector<uint8_t>> ByteReader::ReadLengthPrefixed(size_t maximu
 // The length of one piece of a long value. A modern session states it as a
 // universal integer, whose first byte is the width of the number that follows.
 // The 11.2 dialect states it as a single raw byte instead, which is what the
-// "fe 40 <64 bytes> 20 <32 bytes>" form of a legacy challenge is. A byte that
-// cannot be a universal integer width is therefore read as a raw length: that
-// turns a frame this client would refuse into one it understands, and it
-// changes nothing that already parses, because a modern frame never carries
-// such a byte here.
+// "fe 40 <64 bytes> 20 <32 bytes>" form of a legacy challenge is.
+//
+// The two encodings are read strictly. A byte that cannot be a universal
+// integer width is NOT treated as a raw length here: that guess used to make
+// a legacy frame readable through the modern path, but it read it *wrongly*
+// whenever a legacy chunk was four bytes or shorter (a width byte of 2 is a
+// valid universal integer width, so the reader would swallow the next four
+// bytes as the length). Reading the frame the wrong way round has to fail
+// loudly instead: the caller picks the encoding from the session's own
+// legacy marker, and a wrong pick is a bug worth seeing.
 size_t ByteReader::ReadChunkLength(TtcChunkEncoding chunk_encoding) {
     if (chunk_encoding == TtcChunkEncoding::RawByte) {
         return ReadByte();
-    }
-    const auto width = PeekByte();
-    if (width > 4) {
-        ReadByte();
-        return width;
     }
     return static_cast<size_t>(ReadUB4());
 }

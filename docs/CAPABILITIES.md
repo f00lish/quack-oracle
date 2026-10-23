@@ -640,6 +640,19 @@ runs in its own call scope for that reason.
 
 ---
 
+## 8a. Vector search
+
+`oracle_vector_search(secret, table, column, query_vector, k := 10, metric := 'COSINE',
+approximate := true)` returns the table's columns and `distance` for the `k` rows nearest
+to the query vector, ranked by Oracle's `VECTOR_DISTANCE` (23ai). It orders by the
+distance alias, which Oracle plans exactly as the expression: with a vector index the
+plan is an index probe, not a scan. `k` is 1 to 100,000, `metric` one of six words
+(never text from the caller), the identifiers are quoted. The query vector is sent in
+the column's storage format, read from `VECTOR_INFO`, because Oracle refuses
+`ORA-51812` on a mismatch; a `VECTOR(*,*)` column gets `FLOAT32` or `FLOAT64` by the
+element type given. A server without `VECTOR` answers with its own error. It runs on a
+pooled session of its own, not inside an attached transaction.
+
 ## 8. Parallel scan
 
 ```sql

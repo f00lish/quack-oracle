@@ -859,6 +859,36 @@ yet been run against a live Oracle.
 
 ---
 
+## 7a. Nearest-neighbour search on Oracle 23ai vectors
+
+A `VECTOR` column is read and written as a DuckDB array (see the type table above). To find the rows
+nearest to a query vector without pulling the table over, let Oracle rank them:
+
+```sql
+SELECT id, title, distance
+FROM oracle_vector_search('ora', 'DOCS', 'EMBEDDING', (SELECT embedding FROM my_questions WHERE id = 1)::FLOAT[768],
+                          k := 10, metric := 'COSINE');
+```
+
+It returns every column of the table plus `distance`, for the `k` nearest rows
+(1 to 100,000; default 10). The statement is
+`SELECT t.*, VECTOR_DISTANCE(t.col, :1, metric) AS DISTANCE FROM tbl t ORDER BY DISTANCE
+FETCH APPROX FIRST k ROWS ONLY`, so Oracle uses a vector index (HNSW or IVF) when the
+table has one — checked against an IVF index on 23ai, where the plan goes through the
+index's centroid tables — and only `k` rows travel. `metric` is `COSINE` (default),
+`EUCLIDEAN`, `EUCLIDEAN_SQUARED`, `DOT`, `MANHATTAN` or `HAMMING`; `approximate := false`
+asks for the exact top `k`. The table is `'T'` or `'OWNER.T'`; a name without quotes is
+read in upper case as Oracle reads it, and one in double quotes is kept as written.
+
+The query vector is a list or array of numbers. Oracle will not compare vectors of two
+storage formats, so it is sent in the column's own (`FLOAT32`, `FLOAT64`, `INT8` or
+`BINARY`, read from the dictionary); for a column declared `VECTOR(*, *)` it goes as
+`FLOAT32` when your numbers are `FLOAT` and `FLOAT64` otherwise. Filter after the
+function, not before: `WHERE` on its result narrows the `k` rows, it does not pick
+the `k` from a subset.
+
+---
+
 ## 7. Read a big table faster
 
 A normal scan is one Oracle session on one thread. For a large table, split it

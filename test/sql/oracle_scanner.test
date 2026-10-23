@@ -332,7 +332,7 @@ ATTACH 'missing_oracle_secret' AS missing_oracle (TYPE oracle_scanner);
 Binder Error: Oracle secret 'missing_oracle_secret' was not found
 
 # Every SQL function carries documentation in duckdb_functions(): the exact
-# list of thirty-one, their kinds, argument names in place of col0..colN, and the
+# list of thirty-two, their kinds, argument names in place of col0..colN, and the
 # argument types, varargs and named parameters exactly as they were before the
 # documentation was added.
 query TTTTT
@@ -372,8 +372,9 @@ oracle_scan_parallel	table	[secret_name, table_name, key_column, shards]	[VARCHA
 oracle_scanner_io_deadline_version	scalar	[]	[]	NULL
 oracle_scanner_version	scalar	[]	[]	NULL
 oracle_transaction_status	table	[catalog_name]	[VARCHAR]	NULL
+oracle_vector_search	table	[secret_name, table_name, column_name, query_vector, k, metric, approximate]	[VARCHAR, VARCHAR, VARCHAR, ANY, BIGINT, VARCHAR, BOOLEAN]	NULL
 
-# Two scalar and twenty-nine table functions, and no function whose documentation
+# Two scalar and thirty table functions, and no function whose documentation
 # is missing: a non-empty one-sentence description, exactly one non-empty
 # example, one or two categories starting with 'oracle', and no placeholder
 # argument names.
@@ -382,7 +383,7 @@ SELECT count(*) FILTER (WHERE function_type = 'scalar'), count(*) FILTER (WHERE 
 FROM duckdb_functions()
 WHERE starts_with(function_name, 'oracle_');
 ----
-2	29
+2	30
 
 query I
 SELECT count(*)

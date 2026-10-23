@@ -10,6 +10,7 @@
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/call_builder.hpp"
 #include "oracle_scanner/descriptor_parser.hpp"
+#include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/sql_statement.hpp"
@@ -602,6 +603,15 @@ std::vector<oracle_scanner::OracleBind> CallArguments(const Value &value) {
     return result;
 }
 
+// Runs the statement to describe it, as oracle_query does, and returns the bind
+// data a scan then reads from. Shared by every function that is a SELECT with
+// a generated or supplied text.
+unique_ptr<FunctionData> BindOracleSelect(ClientContext &context, const std::string &secret_name,
+                                          const std::string &sql,
+                                          const std::function<std::vector<oracle_scanner::OracleBind>()> &make_binds,
+                                          vector<LogicalType> &return_types, vector<Identifier> &names,
+                                          bool transactional);
+
 unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<Identifier> &names,
                                                bool transactional) {
@@ -610,6 +620,16 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     }
     const auto secret_name = input.inputs[0].GetValue<std::string>();
     const auto sql = input.inputs[1].GetValue<std::string>();
+    return BindOracleSelect(
+        context, secret_name, sql, [&] { return ParameterBinds(input, "oracle_query"); }, return_types, names,
+        transactional);
+}
+
+unique_ptr<FunctionData> BindOracleSelect(ClientContext &context, const std::string &secret_name,
+                                          const std::string &sql,
+                                          const std::function<std::vector<oracle_scanner::OracleBind>()> &make_binds,
+                                          vector<LogicalType> &return_types, vector<Identifier> &names,
+                                          bool transactional) {
     std::string password;
     // The secret is validated before the SQL, as it was before the transactional
     // form shared this bind: a misconfigured secret is reported for what it is.
@@ -617,7 +637,7 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     if (!transactional) {
         config = ConnectionFromSecret(context, secret_name, password);
     }
-    const auto binds = ParameterBinds(input, "oracle_query");
+    const auto binds = make_binds();
     oracle_scanner::ValidateOracleQuery(sql, binds);
     auto result = make_uniq<OracleQueryBindData>();
     result->secret_name = secret_name;
@@ -680,6 +700,169 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
 unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
     return OracleQueryBindCommon(context, input, return_types, names, false);
+}
+
+// oracle_vector_search: the rows of a table nearest to a query vector, found by
+// Oracle with VECTOR_DISTANCE so a vector index is used when the table has one,
+// and only the k rows come back.
+//
+// A name written without quotes is an Oracle name, so it is read in upper case,
+// as Oracle would read it; a name in double quotes is kept as written.
+std::string VectorSearchIdentifier(const Value &value, const char *what) {
+    if (value.IsNull()) {
+        throw BinderException("oracle_vector_search %s cannot be NULL", what);
+    }
+    auto text = value.GetValue<std::string>();
+    if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+        return text.substr(1, text.size() - 2);
+    }
+    return StringUtil::Upper(text);
+}
+
+struct VectorSearchTarget {
+    std::string owner; // empty: the connected user's
+    std::string name;
+};
+
+VectorSearchTarget VectorSearchTable(const Value &value) {
+    // OWNER.TABLE, each part by the same rule.
+    auto text = value.IsNull() ? std::string() : value.GetValue<std::string>();
+    if (text.empty()) {
+        throw BinderException("oracle_vector_search table cannot be empty");
+    }
+    const auto dot = text.find('.');
+    if (dot != std::string::npos && text.front() != '"') {
+        return {StringUtil::Upper(text.substr(0, dot)),
+                VectorSearchIdentifier(Value(text.substr(dot + 1)), "table")};
+    }
+    return {std::string(), VectorSearchIdentifier(value, "table")};
+}
+
+std::string SqlLiteral(const std::string &text) {
+    std::string result = "'";
+    for (const auto character : text) {
+        result += character == '\'' ? std::string("''") : std::string(1, character);
+    }
+    return result + "'";
+}
+
+// The storage format the column declares (FLOAT32, FLOAT64, INT8 or BINARY), from
+// the dictionary's VECTOR_INFO, or 0 when it cannot be read or says `*`. Oracle
+// will not compare vectors of different formats, so the query vector has to be
+// sent in the column's own.
+uint8_t VectorColumnFormat(const ConnectionConfig &config, const std::string &password, const VectorSearchTarget &table,
+                           const std::string &column) {
+    try {
+        auto session = OpenOracleSession(config, password);
+        const auto view = table.owner.empty() ? "user_tab_cols" : "all_tab_cols";
+        const auto sql = std::string("SELECT vector_info FROM ") + view + " WHERE table_name = " + SqlLiteral(table.name) +
+                         " AND column_name = " + SqlLiteral(column) +
+                         (table.owner.empty() ? std::string() : " AND owner = " + SqlLiteral(table.owner));
+        auto cursor = session->Query(sql, {});
+        std::string info;
+        for (;;) {
+            const auto batch = cursor->Fetch(8);
+            for (const auto &row : batch.rows) {
+                if (!row.empty() && row[0]) {
+                    info.assign(row[0]->begin(), row[0]->end());
+                }
+            }
+            if (batch.exhausted) {
+                break;
+            }
+        }
+        cursor->Close();
+        session->Close();
+        info = StringUtil::Upper(info);
+        if (info.find("FLOAT32") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_FLOAT32;
+        }
+        if (info.find("FLOAT64") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_FLOAT64;
+        }
+        if (info.find("INT8") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_INT8;
+        }
+        if (info.find("BINARY") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_BINARY;
+        }
+    } catch (const std::exception &) {
+        // A server without VECTOR_INFO has no vector column to search either, and
+        // the search itself then says so in Oracle's words.
+    }
+    return 0;
+}
+
+unique_ptr<FunctionData> OracleVectorSearchBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
+    if (input.inputs[0].IsNull()) {
+        throw BinderException("oracle_vector_search secret cannot be NULL");
+    }
+    const auto secret_name = input.inputs[0].GetValue<std::string>();
+    const auto target = VectorSearchTable(input.inputs[1]);
+    const auto table = (target.owner.empty() ? std::string()
+                                             : KeywordHelper::WriteQuotedAndEscaped(target.owner, '"') + ".") +
+                       KeywordHelper::WriteQuotedAndEscaped(target.name, '"');
+    const auto column_name = VectorSearchIdentifier(input.inputs[2], "column");
+    const auto column = KeywordHelper::WriteQuotedAndEscaped(column_name, '"');
+    const auto &query = input.inputs[3];
+    if (query.IsNull() || (query.type().id() != LogicalTypeId::LIST && query.type().id() != LogicalTypeId::ARRAY)) {
+        throw BinderException("oracle_vector_search query vector must be a list or array of numbers");
+    }
+    int64_t k = 10;
+    std::string metric = "COSINE";
+    bool approximate = true;
+    for (const auto &parameter : input.named_parameters) {
+        const auto &key = static_cast<const std::string &>(parameter.first);
+        if (parameter.second.IsNull()) {
+            throw BinderException("oracle_vector_search %s cannot be NULL", key);
+        }
+        if (key == "k") {
+            k = parameter.second.GetValue<int64_t>();
+        } else if (key == "metric") {
+            metric = StringUtil::Upper(parameter.second.GetValue<std::string>());
+        } else if (key == "approximate") {
+            approximate = parameter.second.GetValue<bool>();
+        }
+    }
+    if (k < 1 || k > 100000) {
+        throw BinderException("oracle_vector_search k must be between 1 and 100000");
+    }
+    // Words, not text from the caller: the metric goes into the statement.
+    static const char *const METRICS[] = {"COSINE", "EUCLIDEAN", "EUCLIDEAN_SQUARED", "DOT", "MANHATTAN", "HAMMING"};
+    bool known = false;
+    for (const auto *candidate : METRICS) {
+        known = known || metric == candidate;
+    }
+    if (!known) {
+        throw BinderException("oracle_vector_search metric must be COSINE, EUCLIDEAN, EUCLIDEAN_SQUARED, DOT, "
+                              "MANHATTAN or HAMMING, not '%s'",
+                              metric);
+    }
+    // The query vector is bound as the image Oracle stores, in the column's own
+    // format: Oracle will not compare vectors of two. When the column does not
+    // say (a `*` format), FLOAT32 if the caller's numbers are FLOAT, else FLOAT64.
+    OracleColumn vector_column;
+    vector_column.name = "query vector";
+    vector_column.oracle_type = 127;
+    const auto element_type = query.type().id() == LogicalTypeId::LIST ? ListType::GetChildType(query.type())
+                                                                       : ArrayType::GetChildType(query.type());
+    std::string password;
+    const auto config = ConnectionFromSecret(context, secret_name, password);
+    vector_column.vector_format = VectorColumnFormat(config, password, target, column_name);
+    if (vector_column.vector_format == 0) {
+        vector_column.vector_format = element_type.id() == LogicalTypeId::FLOAT
+                                          ? oracle_scanner::ORACLE_VECTOR_FLOAT32
+                                          : oracle_scanner::ORACLE_VECTOR_FLOAT64;
+    }
+    std::vector<oracle_scanner::OracleBind> binds {OracleBindForColumn(query, vector_column, "1")};
+    const auto distance = "VECTOR_DISTANCE(t." + column + ", :1, " + metric + ")";
+    // ORDER BY the alias: the expression is the same one, and naming it twice
+    // would make the statement carry the vector twice.
+    const auto sql = "SELECT t.*, " + distance + " AS \"DISTANCE\" FROM " + table + " t ORDER BY \"DISTANCE\" FETCH " +
+                     (approximate ? "APPROX " : "") + "FIRST " + std::to_string(k) + " ROWS ONLY";
+    return BindOracleSelect(
+        context, secret_name, sql, [&] { return binds; }, return_types, names, false);
 }
 
 unique_ptr<FunctionData> OracleTransactionQueryBind(ClientContext &context, TableFunctionBindInput &input,
@@ -2697,6 +2880,24 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
          "SELECT * FROM oracle_query('demo', 'SELECT :1 AS value FROM dual', [42]);",
          {"oracle", "query"}}));
 
+    {
+        TableFunction vector_search("oracle_vector_search",
+                                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                                    OracleQueryFunction, OracleVectorSearchBind, OracleQueryInit);
+        vector_search.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+            options.Add("k", LogicalType::BIGINT);
+            options.Add("metric", LogicalType::VARCHAR);
+            options.Add("approximate", LogicalType::BOOLEAN);
+        });
+        infos.push_back(DocumentedTableFunctionInfo(
+            std::move(vector_search),
+            {{"secret_name", "table_name", "column_name", "query_vector", "k", "metric", "approximate"},
+             "Returns the k rows of an Oracle 23ai table whose VECTOR column is nearest to the query vector, with their "
+             "distance, ranked by Oracle's VECTOR_DISTANCE so a vector index is used when there is one.",
+             "SELECT * FROM oracle_vector_search('demo', 'DOCS', 'EMBEDDING', [0.1, 0.2, 0.3]::FLOAT[3], k := 5, "
+             "metric := 'COSINE');",
+             {"oracle", "vector"}}));
+    }
     TableFunction transaction_query("oracle_query_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                     OracleQueryFunction, OracleTransactionQueryBind, OracleQueryInit);
     transaction_query.GetSignature().AddArgs("params", LogicalType::ANY);

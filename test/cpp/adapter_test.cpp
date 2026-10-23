@@ -2514,6 +2514,31 @@ void TestJoinKeysReachOracle() {
     std::cout << "a join's keys reach Oracle as a WHERE clause" << std::endl;
 }
 
+// oracle_vector_search puts nothing from the caller into its statement but
+// identifiers, a number and a word from a fixed list, and refuses the rest.
+void TestVectorSearchArguments() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("ID", 2, 6, 0)};
+    script->rows = {{Number("1")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const auto error_of = [&](const std::string &arguments) {
+        auto result = database.Query("SELECT * FROM oracle_vector_search('ora', " + arguments + ")");
+        CHECK(result->HasError());
+        return result->GetError();
+    };
+    CHECK(error_of("'T', 'E', [1.0], metric := 'x; DROP TABLE t'").find("metric must be COSINE") != std::string::npos);
+    CHECK(error_of("'T', 'E', [1.0], k := 0").find("k must be between 1 and 100000") != std::string::npos);
+    CHECK(error_of("'T', 'E', 5").find("list or array of numbers") != std::string::npos);
+    CHECK(error_of("'', 'E', [1.0]").find("table cannot be empty") != std::string::npos);
+    // Unquoted names are read as Oracle reads them; a quoted one is kept, and quotes inside are doubled.
+    auto quoted = database.Query("SELECT * FROM oracle_vector_search('ora', 'sales.\"MixedCase\"', 'e\"mb', [1.0]::FLOAT[1])");
+    CHECK(!quoted->HasError());
+    CHECK(script->queries.back().find("FROM \"SALES\".\"MixedCase\" t") != std::string::npos);
+    CHECK(script->queries.back().find("t.\"E\"\"MB\"") != std::string::npos);
+    std::cout << "oracle_vector_search refuses what it cannot put in a statement safely" << std::endl;
+}
+
 void TestCallableArgumentsOfTheNewTypes() {
     using oracle_scanner::BindDirection;
     const auto encode = [](const char *type, const char *text) {
@@ -3251,6 +3276,20 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
             CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "n" &&
                   result.GetValue(1, 0).ToString() == "2");
         }};
+    cases["oracle_vector_search"] = {
+        [](FakeScript &script) {
+            script.columns = {Column("ID", 2, 6, 0), Column("DISTANCE", 101)};
+            script.rows = {{Number("7"), std::nullopt}};
+        },
+        {},
+        [](FakeScript &script, MaterializedQueryResult &) {
+            CHECK(!script.queries.empty());
+            const auto &sql = script.queries.back();
+            CHECK(sql == "SELECT t.*, VECTOR_DISTANCE(t.\"EMBEDDING\", :1, COSINE) AS \"DISTANCE\" FROM \"DOCS\" t "
+                         "ORDER BY \"DISTANCE\" FETCH APPROX FIRST 5 ROWS ONLY");
+            const auto &binds = script.query_binds.back();
+            CHECK(binds.size() == 1 && binds[0].oracle_type == 127 && binds[0].value && !binds[0].value->empty());
+        }};
     cases["oracle_execute"] = {[](FakeScript &script) { script.affected_rows = 1; },
                                {},
                                [](FakeScript &script, MaterializedQueryResult &result) {
@@ -3501,7 +3540,7 @@ void TestFunctionExamplesRun() {
     auto cases = FunctionExampleCases();
     // The same set on both sides: a function added without an executable
     // example, or a case left for a function that is gone, fails here.
-    CHECK(examples.size() == cases.size() && examples.size() == 31);
+    CHECK(examples.size() == cases.size() && examples.size() == 32);
     for (const auto &example : examples) {
         const auto found = cases.find(example.first);
         if (found == cases.end()) {
@@ -3569,7 +3608,7 @@ void TestFunctionExamplesRun() {
 // bare RegisterFunction overloads set. Loading the extension twice would not
 // show it — DuckDB may skip the second load — and registering the same
 // signature again fails under either mode, so the infos the extension
-// registers are inspected directly, all thirty-one of them.
+// registers are inspected directly, all thirty-two of them.
 void TestDocumentedRegistrationsAlterOnConflict() {
     std::vector<std::string> names;
     const auto check = [&](const duckdb::CreateFunctionInfo &info, const duckdb::Identifier &name) {
@@ -3587,7 +3626,7 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     }
     const auto parallel = duckdb::OracleParallelScanFunctionInfo();
     check(parallel, parallel.functions.name);
-    CHECK(names.size() == 31);
+    CHECK(names.size() == 32);
 
     // And what that mode means on a database that already has the functions:
     // an extra overload under an existing name is added to it, where
@@ -4230,6 +4269,7 @@ int main() {
     TestXmlTypeColumnsAreText();
     TestJoinKeysReachOracle();
     TestCallableArgumentsOfTheNewTypes();
+    TestVectorSearchArguments();
     TestParallelScanShardsOneSnapshot();
     TestParallelScanRangesDoNotOverflow();
     TestWriteBindsFollowTheOracleColumnType();

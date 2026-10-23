@@ -662,6 +662,21 @@ int main() {
                           mix->GetValue(3, 0).ToString() == "2020-01-02 03:04:05.123456" && mix->GetValue(1, 1).IsNull(),
                       "JSON and VECTOR beside CLOB and scalar columns");
             }
+            {
+                // The nearest rows by Oracle's own VECTOR_DISTANCE; DOUBLE numbers against a FLOAT32 column.
+                auto nearest = Run(admin,
+                                   "SELECT id, distance FROM oracle_vector_search('rt', 'T_JV_MIX', 'E', "
+                                   "[3.0, 2.0, 1.0]::DOUBLE[3], k := 2, metric := 'EUCLIDEAN', approximate := false) "
+                                   "ORDER BY distance;",
+                                   "vector search");
+                Check(nearest->RowCount() == 2 && nearest->GetValue(0, 0).ToString() == "3" &&
+                          nearest->GetValue(1, 0).GetValue<double>() == 0.0 && nearest->GetValue(0, 1).ToString() == "1",
+                      "oracle_vector_search ranks by Oracle's distance");
+                auto cosine = Run(admin,
+                                  "SELECT id FROM oracle_vector_search('rt', 'T_JV_MIX', 'E', [1.0, 2.0, 3.0]::FLOAT[3], k := 1);",
+                                  "vector search cosine");
+                Check(cosine->RowCount() == 1 && cosine->GetValue(0, 0).ToString() == "1", "the default metric finds the same row");
+            }
             std::cout << "PASS JSON and VECTOR read and write, inline and past the prefix\n";
         } else {
             std::cout << "SKIP JSON and VECTOR: this server has no such types\n";

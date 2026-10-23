@@ -69,14 +69,24 @@ uint32_t ByteReader::ReadUInt32BE() {
            (static_cast<uint32_t>(bytes[2]) << 8U) | bytes[3];
 }
 
+// The width a caller names is the width the value is *declared* to have, not
+// a limit on how many bytes the encoding may use. A compressed universal
+// integer states its own length in its first byte, and go-ora accepts any
+// length up to eight for a field it calls four bytes wide. An 11.2 describe
+// response carries a field of that kind -- eighty-one bytes -- and reading it
+// as a four-byte field is what turned a good response into "universal integer
+// exceeds its declared width".
+constexpr size_t MAX_UNIVERSAL_BYTES = 8;
+
 uint64_t ByteReader::ReadUniversal(size_t maximum_bytes) {
     auto length = ReadByte();
     if ((length & 0x80U) != 0) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "negative universal integer is not valid here");
     }
-    if (length > maximum_bytes) {
+    if (length > MAX_UNIVERSAL_BYTES) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "universal integer exceeds its declared width");
     }
+    (void)maximum_bytes;
     uint64_t result = 0;
     for (size_t index = 0; index < length; index++) {
         result = (result << 8U) | ReadByte();

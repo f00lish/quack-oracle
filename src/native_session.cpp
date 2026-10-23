@@ -765,6 +765,18 @@ void NativeOracleSession::Rollback() {
     }
 }
 
+OracleIoStats NativeOracleSession::IoStats() const {
+    if (!connection) {
+        return {};
+    }
+    try {
+        const auto statistics = connection->Packets().GetStatistics();
+        return {statistics.bytes_sent, statistics.bytes_received, statistics.round_trips};
+    } catch (const std::exception &) {
+        return {};
+    }
+}
+
 bool NativeOracleSession::ReadyForReuse() const {
     return connection && connection->State() == OracleConnectionState::AUTHENTICATED && lifetime->open &&
            !lifetime->exchange_failed && lifetime->fetch_cancellation.CanUseConnection() &&

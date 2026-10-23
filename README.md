@@ -869,6 +869,26 @@ Every example is run by the adapter test suite against a scripted session,
 which checks the request each one sends. The six PL/SQL objects above have not
 yet been run against a live Oracle.
 
+### What a scan sent and moved: `EXPLAIN ANALYZE`
+
+`EXPLAIN ANALYZE` on a query over an attached table shows, on the scan:
+
+```
+Oracle SQL: SELECT "GRP", "PAD", "ID" FROM "MT" WHERE "GRP" < 10
+Oracle sessions: 1
+Oracle rows returned: 100000
+Oracle network: 1.2 MiB received, 1.0 KiB sent, 50 round trips
+Oracle fetch time: 0.056 s
+Value conversion time: 0.004 s
+Filters applied after fetching: ((#1 >= 'x') AND (#1 < 'y'))
+```
+
+The statement is the one Oracle ran (the first of the ROWID ranges, with a count of the
+rest, for a parallel scan); the rows are what Oracle returned before DuckDB filtered them;
+the network line is the bytes and request/response round trips on the connections the
+scan used; fetch time is the wait for Oracle plus decoding its answer, conversion time is
+turning that into DuckDB values; and the last line is every filter Oracle was *not* sent.
+
 ---
 
 ## 7a. Nearest-neighbour search on Oracle 23ai vectors

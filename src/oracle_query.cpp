@@ -1,4 +1,5 @@
 #include "oracle_io_deadline.hpp"
+#include <chrono>
 #include <condition_variable>
 #include <thread>
 #include "oracle_adapter.hpp"
@@ -23,6 +24,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -2787,7 +2789,8 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     auto chunks = PlanParallelAttachedScan(context, bind, selected, sessions);
     if (!chunks.empty()) {
         // Described once, with no row read: the chunks all have this shape.
-        OpenProjectedScan(context, bind, selected, session, cursor, columns, true);
+        OracleScanOpening described;
+        OpenProjectedScan(context, bind, selected, session, cursor, columns, true, &described);
         cursor->Close();
         cursor.reset();
         std::vector<LogicalType> chunk_types;
@@ -2797,15 +2800,23 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, std::move(columns),
                                                        std::move(chunk_types), std::move(input.column_ids), chunk_columns);
         state->local_filter = std::move(local_filter);
+        state->metrics.Add(described.io);
         state->parallel = true;
         state->thread_count = MinValue<idx_t>(sessions, chunks.size());
         state->chunk_sql = std::move(chunks);
         state->secret_name = bind.secret_name;
         state->config = bind.config;
         state->password = bind.password;
+        state->sent_sql = state->chunk_sql.front() + (state->chunk_sql.size() > 1
+                                                          ? " (and " + std::to_string(state->chunk_sql.size() - 1) +
+                                                                " more ROWID ranges)"
+                                                          : std::string());
+        state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
         return std::move(state);
     }
-    OpenProjectedScan(context, bind, selected, session, cursor, columns);
+    OracleScanOpening opened;
+    OpenProjectedScan(context, bind, selected, session, cursor, columns, false, &opened);
+    const auto io_after_open = session ? session->IoStats() : OracleIoStats();
     std::vector<LogicalType> types;
     types.reserve(columns.size());
     for (const auto &column : columns) {
@@ -2814,7 +2825,52 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
                                                    std::move(types), std::move(input.column_ids), chunk_columns);
     state->local_filter = std::move(local_filter);
+    state->sent_sql = opened.sql;
+    state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
+    state->metrics.Add(opened.io);
+    state->metrics.sessions = 1;
+    state->last_io = io_after_open;
     return std::move(state);
+}
+
+// What an attached scan reports in EXPLAIN ANALYZE: the statement Oracle was
+// sent, what came back and how much of the time went where. The counts are
+// the scan's own — the rows Oracle returned before any filter DuckDB applies
+// to them, and the bytes and round trips on the connections it used.
+void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
+	if (!input.global_state) {
+		return;
+	}
+	const auto *state = dynamic_cast<const OracleQueryGlobalState *>(input.global_state.get());
+	if (!state) {
+		return;
+	}
+	auto &metrics = input.operator_metrics;
+	const auto &counters = state->metrics;
+	const auto seconds = [](uint64_t nanoseconds) {
+		char text[32];
+		std::snprintf(text, sizeof(text), "%.3f s", static_cast<double>(nanoseconds) / 1e9);
+		return std::string(text);
+	};
+	if (!state->sent_sql.empty()) {
+		metrics.AddExtraInfo("Oracle SQL", state->sent_sql);
+	}
+	metrics.AddExtraInfo("Oracle sessions", std::to_string(counters.sessions.load()));
+	if (state->parallel) {
+		metrics.AddExtraInfo("Oracle ROWID ranges", std::to_string(counters.chunks_read.load()) + " read of " +
+		                                                std::to_string(state->chunk_sql.size()));
+	}
+	metrics.AddExtraInfo("Oracle rows returned", std::to_string(counters.rows_fetched.load()));
+	metrics.AddExtraInfo("Oracle network", StringUtil::BytesToHumanReadableString(counters.bytes_received.load()) +
+	                                           " received, " +
+	                                           StringUtil::BytesToHumanReadableString(counters.bytes_sent.load()) +
+	                                           " sent, " + std::to_string(counters.round_trips.load()) + " round trips");
+	metrics.AddExtraInfo("Oracle fetch time", seconds(counters.fetch_nanoseconds.load()));
+	metrics.AddExtraInfo("Value conversion time", seconds(counters.convert_nanoseconds.load()));
+	if (!state->local_filter_text.empty()) {
+		metrics.AddExtraInfo("Filters applied after fetching", state->local_filter_text);
+	}
+	metrics.rows_scanned = counters.rows_fetched.load();
 }
 
 unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &, TableFunctionInitInput &,
@@ -2832,6 +2888,11 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
     if (!state.catalog_name.empty()) {
         interrupt = std::make_unique<OracleCallerInterruptScope>(context);
     }
+    const auto clock_now = [] { return std::chrono::steady_clock::now(); };
+    const auto elapsed = [](std::chrono::steady_clock::time_point since) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+    };
     for (;;) {
         if (local && !local->cursor) {
             const auto chunk = state.next_chunk.fetch_add(1);
@@ -2843,13 +2904,22 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 if (!local->session) {
                     local->session = AcquireOracleReadSession(context, state.secret_name, std::string(), state.config,
                                                               state.password);
+                    state.metrics.sessions++;
+                    local->last_io = local->session->IoStats();
                 }
+                const auto opened_at = clock_now();
                 local->cursor = local->session->Query(state.chunk_sql[chunk], {});
+                state.metrics.fetch_nanoseconds += elapsed(opened_at);
+                state.metrics.chunks_read++;
+                const auto io_now = local->session->IoStats();
+                state.metrics.Add(io_now - local->last_io);
+                local->last_io = io_now;
             } catch (const std::exception &error) {
                 local->session.Poison();
                 throw IOException("Oracle ATTACH could not open a chunk of the table: %s", error.what());
             }
         }
+        const auto fetch_started = clock_now();
         const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
             if (local) {
                 try {
@@ -2875,6 +2945,18 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 throw;
             }
         });
+        state.metrics.fetch_nanoseconds += elapsed(fetch_started);
+        state.metrics.rows_fetched += batch.rows.size();
+        if (local) {
+            const auto io_now = local->session->IoStats();
+            state.metrics.Add(io_now - local->last_io);
+            local->last_io = io_now;
+        } else if (state.session) {
+            const auto io_now = state.session->IoStats();
+            state.metrics.Add(io_now - state.last_io);
+            state.last_io = io_now;
+        }
+        const auto convert_started = clock_now();
         // Every vector of the chunk has to be written: one left unset is
         // uninitialized memory that DuckDB reads back in DataChunk::Verify. The
         // fetched row and the chunk are in the same order, so vector i is column i;
@@ -2903,6 +2985,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         // all: `col IS NULL` matched every row, and count(col) counted them. The
         // compiler cannot see that; the adapter suite now does.
         output.SetChildCardinality(batch.rows.size());
+        state.metrics.convert_nanoseconds += elapsed(convert_started);
         if (local && batch.exhausted) {
             local->cursor->Close();
             local->cursor.reset();

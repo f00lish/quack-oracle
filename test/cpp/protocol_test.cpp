@@ -499,6 +499,10 @@ static void TestPacketStream() {
     stream.output.clear();
     packets.Send(std::vector<TnsPacket> {{TnsPacketType::DATA, 0, {0, 0, 1}}, {TnsPacketType::DATA, 0, {0, 0, 2}}});
     CHECK(stream.output.size() == 22);
+    // What crossed the connection is counted; a round trip needs a response read after a request, which
+    // this stream, read before it is written, does not have.
+    const auto traffic = packets.GetStatistics();
+    CHECK(traffic.bytes_received == wire.size() && traffic.bytes_sent == 11 + 22 && traffic.round_trips == 0);
 
     wire.pop_back();
     FragmentedStream truncated(wire);

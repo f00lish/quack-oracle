@@ -142,9 +142,31 @@ struct OracleCallRequest {
     std::string block;
 };
 
+// What has crossed one session's connection so far. Cumulative, so what an
+// operation moved is the difference between two readings.
+struct OracleIoStats {
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
+    uint64_t round_trips = 0;
+
+    OracleIoStats operator-(const OracleIoStats &earlier) const {
+        return {bytes_sent - earlier.bytes_sent, bytes_received - earlier.bytes_received,
+                round_trips - earlier.round_trips};
+    }
+    OracleIoStats &operator+=(const OracleIoStats &other) {
+        bytes_sent += other.bytes_sent;
+        bytes_received += other.bytes_received;
+        round_trips += other.round_trips;
+        return *this;
+    }
+};
+
 class OracleSession {
 public:
     virtual ~OracleSession() = default;
+    virtual OracleIoStats IoStats() const {
+        return {};
+    }
     virtual std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
     virtual uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
     // One administrative DDL command on a dedicated autocommit session. This

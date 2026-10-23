@@ -22,6 +22,7 @@
 #include "duckdb/planner/table_filter.hpp"
 
 #include <memory>
+#include <atomic>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -38,6 +39,7 @@ class PhysicalPlanGenerator;
 using oracle_scanner::ConnectionConfig;
 using oracle_scanner::OracleColumn;
 using oracle_scanner::OracleCursor;
+using oracle_scanner::OracleIoStats;
 using oracle_scanner::OracleSession;
 
 // ProtocolError is a std::runtime_error from the protocol layer, not a DuckDB
@@ -239,6 +241,24 @@ struct OracleQueryBindData final : TableFunctionData {
     optional_ptr<TableCatalogEntry> table_entry;
 };
 
+//! Counters a scan keeps for EXPLAIN ANALYZE. Atomic, because the threads of a
+//! parallel scan add to them together.
+struct OracleScanMetrics {
+    std::atomic<uint64_t> rows_fetched {0};
+    std::atomic<uint64_t> bytes_received {0};
+    std::atomic<uint64_t> bytes_sent {0};
+    std::atomic<uint64_t> round_trips {0};
+    std::atomic<uint64_t> fetch_nanoseconds {0};
+    std::atomic<uint64_t> convert_nanoseconds {0};
+    std::atomic<uint64_t> sessions {0};
+    std::atomic<uint64_t> chunks_read {0};
+    void Add(const OracleIoStats &io) {
+        bytes_sent += io.bytes_sent;
+        bytes_received += io.bytes_received;
+        round_trips += io.round_trips;
+    }
+};
+
 struct OracleQueryGlobalState final : GlobalTableFunctionState {
     OracleQueryGlobalState(OracleSessionHandle session_p, std::unique_ptr<OracleCursor> cursor_p,
                            std::vector<OracleColumn> columns_p, std::vector<LogicalType> types_p,
@@ -264,6 +284,14 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     //! Filters Oracle was not sent, applied to each fetched chunk (see SplitOracleFilters).
     unique_ptr<Expression> local_filter;
 
+    //! What the scan did, for EXPLAIN ANALYZE (see OracleScanMetrics).
+    OracleScanMetrics metrics;
+    //! The statement(s) the scan sent, and the filters it applied itself.
+    std::string sent_sql;
+    std::string local_filter_text;
+    //! The connection's counters when this scan last looked, for the serial scan.
+    OracleIoStats last_io;
+
     //! A table read in chunks through several sessions: each thread takes the next
     //! statement and reads it on a session of its own. The session and cursor above
     //! are then unused.
@@ -284,9 +312,11 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
 struct OracleQueryLocalState final : LocalTableFunctionState {
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
+    OracleIoStats last_io;
 };
 unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state);
+void OracleQueryMetrics(TableFunctionGetMetricsInput &input);
 
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input);
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output);
@@ -443,9 +473,15 @@ PhysicalOperator &PlanOracleDelete(ClientContext &context, PhysicalPlanGenerator
 
 //! Opens an attached table's scan over exactly the requested columns, pushing
 //! the projection into Oracle's select list.
+//! What opening a scan sent and moved, for the scan's metrics.
+struct OracleScanOpening {
+    std::string sql;
+    OracleIoStats io;
+};
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
-                       std::vector<OracleColumn> &columns, bool schema_only = false);
+                       std::vector<OracleColumn> &columns, bool schema_only = false,
+                       OracleScanOpening *opening = nullptr);
 
 //! The statements, one per chunk of the table, that read an attached table through
 //! several sessions at one SCN, cut into ROWID ranges at extent boundaries; empty

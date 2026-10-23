@@ -36,6 +36,7 @@ public:
     void Cancel() override;
     void Close() override;
     bool ReadyForReuse() const override;
+    OracleIoStats IoStats() const override;
     bool BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) override;
 
 private:

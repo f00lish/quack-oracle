@@ -2529,6 +2529,16 @@ void TestJoinKeysReachOracle() {
     CHECK(script->queries.back().find("WHERE") != std::string::npos &&
           (script->queries.back().find("BETWEEN") != std::string::npos ||
            script->queries.back().find("IN (") != std::string::npos));
+    // EXPLAIN ANALYZE says what was sent to Oracle and what came back.
+    auto analyzed = database.Query("EXPLAIN ANALYZE SELECT count(*) FROM o.main.FACTS WHERE ID > 1000;");
+    CHECK(!analyzed->HasError());
+    std::string analysis;
+    for (duckdb::idx_t row = 0; row < analyzed->RowCount(); row++) {
+        analysis += analyzed->GetValue(1, row).ToString();
+    }
+    CHECK(analysis.find("Oracle SQL") != std::string::npos && analysis.find("WHERE \"ID\" > 1000") != std::string::npos &&
+          analysis.find("Oracle rows returned") != std::string::npos &&
+          analysis.find("Oracle network") != std::string::npos && analysis.find("Oracle sessions") != std::string::npos);
     // A system sample of a table is taken by Oracle, not by reading every row. A filter
     // above the sample stays above it, in DuckDB; a filter below it is part of the scan,
     // and the sample then stays in DuckDB, after the filter.

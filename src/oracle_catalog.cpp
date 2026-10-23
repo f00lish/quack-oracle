@@ -991,6 +991,7 @@ public:
         // table reads a fraction of its blocks instead of all of them.
         function.sampling_pushdown = state->IsTable(object_name);
         function.init_local = OracleQueryInitLocal;
+        function.get_metrics = OracleQueryMetrics;
         function.statistics = OracleAttachedScanStatistics;
         return function;
     }
@@ -1472,7 +1473,7 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
 
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
-                       std::vector<OracleColumn> &columns, bool schema_only) {
+                       std::vector<OracleColumn> &columns, bool schema_only, OracleScanOpening *opening) {
     const auto select_list = ProjectedSelectList(bind, selected);
     auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
     if (schema_only) {
@@ -1488,7 +1489,12 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
     }
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
+        const auto before = session->IoStats();
         cursor = session->Query(sql, {});
+        if (opening) {
+            opening->sql = sql;
+            opening->io = session->IoStats() - before;
+        }
     } catch (const std::exception &error) {
         session.Poison();
         throw IOException("Oracle ATTACH could not open table '%s': %s", bind.object_name, error.what());

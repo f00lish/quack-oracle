@@ -336,22 +336,22 @@ private:
     static std::string NumberText(const std::string &plain) {
         size_t start = !plain.empty() && plain[0] == '-' ? 1 : 0;
         std::string digits;
-        long long point = -1;
+        int64_t point = -1;
         for (size_t index = start; index < plain.size(); index++) {
             if (plain[index] == '.') {
-                point = static_cast<long long>(digits.size());
+                point = static_cast<int64_t>(digits.size());
             } else {
                 digits.push_back(plain[index]);
             }
         }
         if (point < 0) {
-            point = static_cast<long long>(digits.size());
+            point = static_cast<int64_t>(digits.size());
         }
         const auto first = digits.find_first_not_of('0');
         if (first == std::string::npos) {
             return "0";
         }
-        const long long exponent = point - static_cast<long long>(first) - 1;
+        const int64_t exponent = point - static_cast<int64_t>(first) - 1;
         if (exponent >= -20 && exponent <= 40) {
             return plain;
         }
@@ -429,7 +429,7 @@ private:
         return "[" + std::to_string(vector.dimensions) + "," + indices + "]," + elements(",") + "]";
     }
 
-    static std::string Pad(long long value, int width) {
+    static std::string Pad(int64_t value, int width) {
         char text[32];
         std::snprintf(text, sizeof(text), "%0*lld", width, value);
         return text;
@@ -447,24 +447,24 @@ private:
                ":" + Pad(value.minute, 2) + ":" + Pad(value.second, 2) + (fraction ? FractionText(value.nanosecond) : "");
     }
 
-    static long long DaysFromCivil(long long year, long long month, long long day) {
+    static int64_t DaysFromCivil(int64_t year, int64_t month, int64_t day) {
         year -= month <= 2 ? 1 : 0;
-        const long long era = (year >= 0 ? year : year - 399) / 400;
-        const long long year_of_era = year - era * 400;
-        const long long day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-        const long long day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        const int64_t era = (year >= 0 ? year : year - 399) / 400;
+        const int64_t year_of_era = year - era * 400;
+        const int64_t day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+        const int64_t day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
         return era * 146097 + day_of_era - 719468;
     }
 
-    static void CivilFromDays(long long days, OracleDateTime &value) {
+    static void CivilFromDays(int64_t days, OracleDateTime &value) {
         days += 719468;
-        const long long era = (days >= 0 ? days : days - 146096) / 146097;
-        const long long day_of_era = days - era * 146097;
-        const long long year_of_era =
+        const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+        const int64_t day_of_era = days - era * 146097;
+        const int64_t year_of_era =
             (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
-        const long long day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        const long long month_index = (5 * day_of_year + 2) / 153;
-        const long long month = month_index < 10 ? month_index + 3 : month_index - 9;
+        const int64_t day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        const int64_t month_index = (5 * day_of_year + 2) / 153;
+        const int64_t month = month_index < 10 ? month_index + 3 : month_index - 9;
         value.day = static_cast<uint8_t>(day_of_year - (153 * month_index + 2) / 5 + 1);
         value.month = static_cast<uint8_t>(month);
         value.year = static_cast<int32_t>(year_of_era + era * 400 + (month <= 2 ? 1 : 0));
@@ -473,8 +473,8 @@ private:
     // A TIMESTAMP WITH TIME ZONE is stored as UTC plus the zone's offset, and
     // printed in the zone it was written in.
     static std::string ZonedText(OracleDateTime value) {
-        long long minutes = static_cast<long long>(value.hour) * 60 + value.minute + value.offset_minutes;
-        long long days = DaysFromCivil(value.year, value.month, value.day);
+        int64_t minutes = static_cast<int64_t>(value.hour) * 60 + value.minute + value.offset_minutes;
+        int64_t days = DaysFromCivil(value.year, value.month, value.day);
         while (minutes < 0) {
             minutes += 1440;
             days--;
@@ -612,13 +612,13 @@ private:
         case NODE_INTERVAL_DS: {
             const auto value = DecodeOracleIntervalDaySecond(fixed(11, "an INTERVAL DAY TO SECOND"));
             const bool negative = value.days < 0 || value.nanoseconds < 0;
-            const long long days = value.days < 0 ? -static_cast<long long>(value.days) : value.days;
-            long long nanoseconds = value.nanoseconds < 0 ? -value.nanoseconds : value.nanoseconds;
-            const long long hours = nanoseconds / 3600000000000LL;
+            const int64_t days = value.days < 0 ? -static_cast<int64_t>(value.days) : value.days;
+            int64_t nanoseconds = value.nanoseconds < 0 ? -value.nanoseconds : value.nanoseconds;
+            const int64_t hours = nanoseconds / 3600000000000LL;
             nanoseconds %= 3600000000000LL;
-            const long long minutes = nanoseconds / 60000000000LL;
+            const int64_t minutes = nanoseconds / 60000000000LL;
             nanoseconds %= 60000000000LL;
-            const long long seconds = nanoseconds / 1000000000LL;
+            const int64_t seconds = nanoseconds / 1000000000LL;
             const auto fraction = static_cast<uint32_t>(nanoseconds % 1000000000LL);
             Append(std::string("\"") + (negative ? "-" : "") + "P" + std::to_string(days) + "DT" + std::to_string(hours) +
                    "H" + std::to_string(minutes) + "M" + std::to_string(seconds) +

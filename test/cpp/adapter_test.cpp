@@ -37,8 +37,7 @@
 
 #include <chrono>
 #include <fstream>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <filesystem>
 #include <thread>
 #include <cassert>
 #include <csignal>
@@ -3197,6 +3196,23 @@ void TestConnectDescriptorSecretReachesTheSession() {
     std::cout << "connect descriptor secrets reach the session" << std::endl;
 }
 
+// The environment, portably: setenv and unsetenv are POSIX, and MSVC spells them _putenv_s.
+void SetEnvironment(const char *name, const std::string &value) {
+#if defined(_WIN32)
+    CHECK(_putenv_s(name, value.c_str()) == 0);
+#else
+    CHECK(setenv(name, value.c_str(), 1) == 0);
+#endif
+}
+
+void UnsetEnvironment(const char *name) {
+#if defined(_WIN32)
+    CHECK(_putenv_s(name, "") == 0);
+#else
+    CHECK(unsetenv(name) == 0);
+#endif
+}
+
 // DSN and CONFIG_DIR: the python-oracledb spellings of the same three sources.
 void TestDsnSecretReachesTheSession() {
     auto script = std::make_shared<FakeScript>();
@@ -3269,10 +3285,11 @@ void TestDsnSecretReachesTheSession() {
     CHECK(configs->back().service_name == "svc");
 
     // A bare name is an alias, looked up in CONFIG_DIR: a folder or the file.
-    const auto folder = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
-                        "/oracle_scanner_config_dir_" +
-                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-    CHECK(mkdir(folder.c_str(), 0700) == 0);
+    const auto folder =
+        (std::filesystem::temp_directory_path() /
+         ("oracle_scanner_config_dir_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+            .string();
+    CHECK(std::filesystem::create_directory(folder));
     const auto tnsnames_path = folder + "/tnsnames.ora";
     {
         std::ofstream output(tnsnames_path, std::ios::binary);
@@ -3301,22 +3318,22 @@ void TestDsnSecretReachesTheSession() {
     refused("DSN 'a.example/svc', CONFIG_DIR '" + folder + "'", "CONFIG_DIR is only used to look up");
     // TNS_ADMIN is where an alias is looked up when nothing else says, and
     // CONFIG_DIR still wins over it.
-    CHECK(setenv("TNS_ADMIN", folder.c_str(), 1) == 0);
+    SetEnvironment("TNS_ADMIN", folder);
     CHECK(!query("DSN 'folder_db'")->HasError());
     CHECK(configs->back().service_name == "folder.example");
     CHECK(!query("TNS_ALIAS 'folder_db'")->HasError());
-    CHECK(setenv("TNS_ADMIN", "/nonexistent_oracle_scanner_dir", 1) == 0);
+    SetEnvironment("TNS_ADMIN", "/nonexistent_oracle_scanner_dir");
     CHECK(!query("DSN 'folder_db', CONFIG_DIR '" + folder + "'")->HasError());
     refused("DSN 'folder_db'", "could not be resolved");
-    CHECK(unsetenv("TNS_ADMIN") == 0);
+    UnsetEnvironment("TNS_ADMIN");
     refused("DSN 'missing_alias', CONFIG_DIR '" + folder + "'", "DSN could not be resolved");
     refused("DSN 'a.example:1521'", "DSN could not be resolved");
     refused("DSN 'a.example/svc?https_proxy=p'", "is not supported");
     refused("DSN 'a.example/svc', PROTOCOL 'tcps'", "DSN protocol does not match PROTOCOL 'tcps'");
     refused("DSN 'a.example/svc', WALLET_FILE '/x'", "require PROTOCOL 'tcps'");
 
-    std::remove(tnsnames_path.c_str());
-    rmdir(folder.c_str());
+    std::filesystem::remove(tnsnames_path);
+    std::filesystem::remove(folder);
     std::cout << "DSN and CONFIG_DIR secrets reach the session" << std::endl;
 }
 

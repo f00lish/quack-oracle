@@ -2200,7 +2200,7 @@ std::vector<oracle_scanner::OracleBind> PlsqlArguments(TableFunctionBindInput &i
 // Validates the block and its binds together and returns the binds in the order
 // the block mentions them, which is the order the server returns the outputs in.
 std::vector<oracle_scanner::OracleBind> OrderedPlsqlArguments(const std::string &block,
-                                                              std::vector<oracle_scanner::OracleBind> arguments,
+                                                              const std::vector<oracle_scanner::OracleBind> &arguments,
                                                               const char *function_name) {
     try {
         oracle_scanner::OracleCallRequest request;
@@ -2887,6 +2887,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         cursor->Close();
         cursor.reset();
         std::vector<LogicalType> chunk_types;
+        chunk_types.reserve(columns.size());
         for (const auto &column : columns) {
             chunk_types.push_back(TypeFor(column));
         }
@@ -3079,6 +3080,7 @@ void FillDeferredColumns(OracleQueryGlobalState &state, DataChunk &output, const
         }
     }
     std::vector<std::string> rowids;
+    rowids.reserve(row_of.size());
     for (const auto &entry : row_of) {
         rowids.push_back(entry.first);
     }

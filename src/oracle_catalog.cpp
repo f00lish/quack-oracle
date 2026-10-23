@@ -838,7 +838,7 @@ struct OracleAttachedState {
         }
         // The bulk load was truncated and does not carry the name: ask for the
         // spelling Oracle would have stored an unquoted one in.
-        const auto upper = StringUtil::Upper(requested);
+        auto upper = StringUtil::Upper(requested);
         if (upper != requested && !TryDescribe(upper).empty()) {
             return upper;
         }

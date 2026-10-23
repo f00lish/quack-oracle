@@ -101,6 +101,7 @@ Rows Run(Connection &connection, const std::string &sql) {
             }
             for (idx_t row = 0; row < chunk->size(); row++) {
                 std::vector<Value> line;
+                line.reserve(columns);
                 for (idx_t column = 0; column < columns; column++) {
                     line.push_back(chunk->GetValue(column, row));
                 }

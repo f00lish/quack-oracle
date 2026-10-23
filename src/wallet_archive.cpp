@@ -10,7 +10,8 @@
 #include <memory>
 #include <string>
 
-#include <sys/stat.h>
+#include <filesystem>
+#include <system_error>
 
 namespace oracle_scanner {
 
@@ -46,13 +47,13 @@ bool HasZipSignature(const std::string &path) {
 }
 
 bool PathExists(const std::string &path) {
-    struct stat info {};
-    return stat(path.c_str(), &info) == 0;
+    std::error_code error;
+    return std::filesystem::exists(std::filesystem::path(path), error) && !error;
 }
 
 bool IsDirectory(const std::string &path) {
-    struct stat info {};
-    return stat(path.c_str(), &info) == 0 && (info.st_mode & S_IFDIR) != 0;
+    std::error_code error;
+    return std::filesystem::is_directory(std::filesystem::path(path), error) && !error;
 }
 
 std::string ReadWalletFile(const std::string &path, size_t maximum_size, const char *description) {

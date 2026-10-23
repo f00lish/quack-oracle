@@ -171,7 +171,7 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const 
                 throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC LOB locator length disagrees with its prefix");
             }
             lob.locator = std::move(*locator);
-            result.push_back(EncodeTtcInlineLob(lob));
+            result.emplace_back(EncodeTtcInlineLob(lob));
             continue;
         }
         // The ub4 above is the locator's size, and the locator then follows in

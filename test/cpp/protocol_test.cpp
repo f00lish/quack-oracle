@@ -8258,6 +8258,41 @@ static void TestAnonymousBlocks() {
     std::cout << "anonymous PL/SQL blocks are normalised and their binds ordered" << std::endl;
 }
 
+// The server reports the session state it changed in a message of its own (type
+// 23), and 23ai sends one inside a PL/SQL response, in front of its end-of-call.
+// The report below is what python-oracledb received after setting module, action,
+// client identifier and client info (see PROVENANCE.md).
+static void TestServerPiggybacksAreSkipped() {
+    const std::vector<uint8_t> python_server_piggyback {
+        0x17, 0x05, 0x01, 0x01, 0x10, 0x01, 0x04, 0x16, 0x01, 0x02, 0x02, 0x6d,
+        0x6d, 0x00, 0x01, 0xb8, 0x01, 0x03, 0x03, 0x61, 0x61, 0x61, 0x00, 0x01,
+        0xb9, 0x01, 0x04, 0x04, 0x69, 0x69, 0x69, 0x69, 0x00, 0x01, 0xba, 0x01,
+        0x03, 0x03, 0x63, 0x63, 0x63, 0x00, 0x01, 0xc6, 0x00,
+    };
+    CHECK(SkippedTtcServerPiggybackBytes(python_server_piggyback.data(), python_server_piggyback.size()) ==
+          python_server_piggyback.size());
+    // Followed by a status and the end of the call, as in the response to a ping.
+    auto message = python_server_piggyback;
+    message.insert(message.end(), {0x09, 0x01, 0x01, 0x02, 0xc6, 0x10, 0x1d});
+    CHECK(SkippedTtcServerPiggybackBytes(message.data(), message.size()) == python_server_piggyback.size());
+    const auto decoded = DecodeTtcCallResponse(message, {}, 24, 27);
+    // The status completes the call; the end-of-request marker behind it is the caller's.
+    CHECK(decoded.completed && decoded.bytes_consumed == python_server_piggyback.size() + 6);
+    // Cut short, it is a request for more; a report of a session change is not skipped.
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] {
+        (void)SkippedTtcServerPiggybackBytes(python_server_piggyback.data(), python_server_piggyback.size() - 20);
+    });
+    auto changed = python_server_piggyback;
+    changed.back() = 0x01; // flags: a length of one byte ...
+    changed.push_back(0x01); // ... holding 1, a session change
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)SkippedTtcServerPiggybackBytes(changed.data(), changed.size()); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] {
+        const std::vector<uint8_t> other {0x17, 0x01, 0x00};
+        (void)SkippedTtcServerPiggybackBytes(other.data(), other.size());
+    });
+    std::cout << "a server piggyback inside a response is skipped" << std::endl;
+}
+
 // A VECTOR is written as its image in a locator, as python-oracledb Thin does,
 // and keeps its place among the binds when the statement has short ones after it.
 static void TestVectorBindsMatchPython() {
@@ -8471,6 +8506,7 @@ int main() {
     TestTemporaryLobScope();
     TestEndToEndAttributesMatchPython();
     TestAnonymousBlocks();
+    TestServerPiggybacksAreSkipped();
     TestVectorBindsMatchPython();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();

@@ -44,6 +44,8 @@ constexpr size_t TTC_CLIENT_INFO_MAXIMUM = 64;
 // else is refused rather than guessed at. Returns the offset after it.
 constexpr uint8_t TTC_MESSAGE_SERVER_PIGGYBACK = 23;
 size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset);
+//! The same on a buffer: how many bytes of it the piggyback at its start takes.
+size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size);
 
 std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndToEndAttributes &attributes);
 std::vector<uint8_t> EncodeTtcCloseCursorsPiggyback(uint8_t sequence, const std::vector<uint32_t> &cursor_ids);

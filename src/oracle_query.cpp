@@ -2778,6 +2778,33 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     std::vector<OracleColumn> columns;
+    Value parallel_setting;
+    idx_t sessions = 0;
+    if (!selected.empty() && context.TryGetCurrentSetting("oracle_parallel_scan", parallel_setting) &&
+        !parallel_setting.IsNull()) {
+        sessions = static_cast<idx_t>(MaxValue<int64_t>(0, MinValue<int64_t>(64, parallel_setting.GetValue<int64_t>())));
+    }
+    auto chunks = PlanParallelAttachedScan(context, bind, selected, sessions);
+    if (!chunks.empty()) {
+        // Described once, with no row read: the chunks all have this shape.
+        OpenProjectedScan(context, bind, selected, session, cursor, columns, true);
+        cursor->Close();
+        cursor.reset();
+        std::vector<LogicalType> chunk_types;
+        for (const auto &column : columns) {
+            chunk_types.push_back(TypeFor(column));
+        }
+        auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, std::move(columns),
+                                                       std::move(chunk_types), std::move(input.column_ids), chunk_columns);
+        state->local_filter = std::move(local_filter);
+        state->parallel = true;
+        state->thread_count = MinValue<idx_t>(sessions, chunks.size());
+        state->chunk_sql = std::move(chunks);
+        state->secret_name = bind.secret_name;
+        state->config = bind.config;
+        state->password = bind.password;
+        return std::move(state);
+    }
     OpenProjectedScan(context, bind, selected, session, cursor, columns);
     std::vector<LogicalType> types;
     types.reserve(columns.size());
@@ -2790,15 +2817,48 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     return std::move(state);
 }
 
+unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                         GlobalTableFunctionState *) {
+    return make_uniq<OracleQueryLocalState>();
+}
+
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleQueryGlobalState>();
+    // A parallel scan reads through the thread's own session and cursor, one
+    // chunk of the table after another.
+    OracleQueryLocalState *local = state.parallel ? &input.local_state->Cast<OracleQueryLocalState>() : nullptr;
     // A transaction's fetch obeys the caller's interrupt like its open does.
     std::unique_ptr<OracleCallerInterruptScope> interrupt;
     if (!state.catalog_name.empty()) {
         interrupt = std::make_unique<OracleCallerInterruptScope>(context);
     }
     for (;;) {
+        if (local && !local->cursor) {
+            const auto chunk = state.next_chunk.fetch_add(1);
+            if (chunk >= state.chunk_sql.size()) {
+                output.SetChildCardinality(0);
+                return;
+            }
+            try {
+                if (!local->session) {
+                    local->session = AcquireOracleReadSession(context, state.secret_name, std::string(), state.config,
+                                                              state.password);
+                }
+                local->cursor = local->session->Query(state.chunk_sql[chunk], {});
+            } catch (const std::exception &error) {
+                local->session.Poison();
+                throw IOException("Oracle ATTACH could not open a chunk of the table: %s", error.what());
+            }
+        }
         const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
+            if (local) {
+                try {
+                    return local->cursor->Fetch(STANDARD_VECTOR_SIZE);
+                } catch (...) {
+                    local->session.Poison();
+                    throw;
+                }
+            }
             try {
                 return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
             } catch (...) {
@@ -2843,6 +2903,10 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         // all: `col IS NULL` matched every row, and count(col) counted them. The
         // compiler cannot see that; the adapter suite now does.
         output.SetChildCardinality(batch.rows.size());
+        if (local && batch.exhausted) {
+            local->cursor->Close();
+            local->cursor.reset();
+        }
         if (state.local_filter && !batch.rows.empty()) {
             // The filters Oracle was not sent. A chunk they empty is not the end of
             // the scan — an empty chunk means that — so fetch on until one has rows
@@ -2857,6 +2921,12 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 output.Reset();
                 continue;
             }
+        }
+        if (local && output.size() == 0) {
+            // A chunk of the table ended with nothing left to hand over; the next
+            // one is read before this thread says it is done.
+            output.Reset();
+            continue;
         }
         return;
     }

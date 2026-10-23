@@ -91,6 +91,7 @@ captures = [
     ("python_end_to_end_module", "test/cpp/protocol_test.cpp", "python_end_to_end_module"),
     ("python_end_to_end_all", "test/cpp/protocol_test.cpp", "python_end_to_end_all"),
     ("python_end_to_end_client_info", "test/cpp/protocol_test.cpp", "python_end_to_end_client_info"),
+    ("python_server_piggyback", "test/cpp/protocol_test.cpp", "python_server_piggyback"),
 ]
 
 for name, path, identifier in captures:

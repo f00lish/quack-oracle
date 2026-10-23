@@ -657,6 +657,22 @@ pooled session of its own, not inside an attached transaction.
 
 ## 8. Parallel scan
 
+**Attached tables, automatically.** `SET oracle_parallel_scan = N` lets a scan of an
+attached table read through up to N sessions. It lists the table's extents
+(`DBA_EXTENTS`, joined to `DBA_OBJECTS` for the data object), sorts them by ROWID order
+(object, file, block), cuts between extents into about 4N chunks of equal blocks, and each
+thread reads chunks as `ROWID >= lo AND ROWID < hi` (open at both ends) `AS OF SCN s`,
+where `s` was taken once with `DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER`. Oracle plans
+each as a `TABLE ACCESS BY ROWID RANGE`. Anything the plan needs and cannot get — the
+extents, the change number, a flashback read, a heap table of 2,048 blocks or more —
+means one stream, never an error, and so do a sample and a transaction that has written.
+Partitioned tables work; the cut points run across partitions. Checked on 19c and 23ai by
+`EXCEPT` both ways against the one-stream read, on a plain and a partitioned table, with
+pushed filters, a local filter, `LIMIT` and `DELETE`.
+
+**By key.** `oracle_scan_parallel` splits by ranges of a numeric key you name, and needs
+no privilege beyond the table.
+
 ```sql
 SELECT * FROM oracle_scan_parallel('ora', 'BIG_TABLE', 'ID', shards := 8);
 ```
@@ -679,6 +695,7 @@ their own shard, so nothing is dropped.
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
 | `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
 | `oracle_filter_pushdown` | `true` | See §5. |
+| `oracle_parallel_scan` | `0` | Sessions one scan of an attached table may use, reading ROWID ranges cut at extent boundaries, all at one SCN (§8). `0` or `1`: one stream |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision (plain `NUMBER`, `SUM(x)`, `count(*)`) becomes: `'varchar'` (exact), `'double'`, or `'decimal(p,s)'` such as `'decimal(38,9)'`. Read when a query is bound or a table is first used; the lossy choices round what does not fit, and a DECIMAL that cannot hold a value's integer digits raises. A `DOUBLE` column then accepts `DOUBLE` on write |
 
 Pooling matters more than it looks: opening a session costs a full TNS handshake

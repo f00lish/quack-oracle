@@ -263,7 +263,30 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     std::string catalog_name;
     //! Filters Oracle was not sent, applied to each fetched chunk (see SplitOracleFilters).
     unique_ptr<Expression> local_filter;
+
+    //! A table read in chunks through several sessions: each thread takes the next
+    //! statement and reads it on a session of its own. The session and cursor above
+    //! are then unused.
+    bool parallel = false;
+    std::vector<std::string> chunk_sql;
+    std::atomic<idx_t> next_chunk {0};
+    idx_t thread_count = 1;
+    std::string secret_name;
+    ConnectionConfig config;
+    std::string password;
+
+    idx_t MaxThreads() const override {
+        return parallel ? thread_count : 1;
+    }
 };
+
+//! What one thread of a parallel scan is reading.
+struct OracleQueryLocalState final : LocalTableFunctionState {
+    OracleSessionHandle session;
+    std::unique_ptr<OracleCursor> cursor;
+};
+unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                         GlobalTableFunctionState *global_state);
 
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input);
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output);
@@ -422,6 +445,12 @@ PhysicalOperator &PlanOracleDelete(ClientContext &context, PhysicalPlanGenerator
 //! the projection into Oracle's select list.
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
-                       std::vector<OracleColumn> &columns);
+                       std::vector<OracleColumn> &columns, bool schema_only = false);
+
+//! The statements, one per chunk of the table, that read an attached table through
+//! several sessions at one SCN, cut into ROWID ranges at extent boundaries; empty
+//! when the scan should be one stream (see the implementation for the reasons).
+std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
+                                                  const std::vector<column_t> &selected, idx_t sessions);
 
 } // namespace duckdb

@@ -903,6 +903,35 @@ the `k` from a subset.
 
 ## 7. Read a big table faster
 
+Without choosing a key column or calling anything, an attached table can be read through
+several sessions:
+
+```sql
+SET oracle_parallel_scan = 8;
+SELECT * FROM o.BIG_TABLE;          -- up to 8 sessions, each reading ROWID ranges
+```
+
+The table is cut into ROWID ranges at its extent boundaries (about four chunks to a
+session, so a thread that finishes early takes another), and every chunk reads
+`AS OF SCN` at one change number taken first, so together they are one snapshot, not several
+moments. On a 2,000,000-row table four sessions took 0.9 s against 2.2 s for one, and eight
+0.7 s; the result matched row for row. A partitioned table is cut the same way across its
+partitions. No numeric key is needed.
+
+It reads one stream instead, and says nothing, when: the setting is 0 or 1; the user cannot
+read `DBA_EXTENTS` (the extents give the cut points, and without them a table cannot be
+divided evenly — a sample of its blocks came back in a few clumps and cut a test table 99 to
+1); the table is under 2,048 blocks, index-organized, clustered or temporary; the database
+gives out no change number (`EXECUTE` on `DBMS_FLASHBACK`) or no flashback read of the
+table; the query is a `TABLESAMPLE`; or the transaction has already written to the catalog,
+whose own session is the only one that sees those rows. Filters Oracle can be sent go into
+every chunk. If the table is dropped or truncated while the scan runs, Oracle's own error
+(`ORA-01466`) is the answer.
+
+`oracle_scan_parallel` (below) still exists for a numeric key you want split by value,
+and for a table the user may read but whose extents they may not.
+
+
 A normal scan is one Oracle session on one thread. For a large table, split it
 across several sessions by a numeric key:
 
@@ -931,6 +960,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
+| `oracle_parallel_scan` | `0` | How many sessions one scan of an attached table may read through at once; see [section 7](#7-read-a-big-table-faster) |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS

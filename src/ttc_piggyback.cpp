@@ -82,15 +82,14 @@ std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndTo
     return writer.Take();
 }
 
-size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset) {
+size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size) {
     constexpr uint8_t SESSION_RETURN = 5;
     constexpr size_t MAX_ELEMENTS = 1024;
     constexpr size_t MAX_VALUE_BYTES = 64U << 10U;
-    if (offset >= message.size() || message[offset] != TTC_MESSAGE_SERVER_PIGGYBACK) {
+    if (size == 0 || data[0] != TTC_MESSAGE_SERVER_PIGGYBACK) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected a TTC server piggyback");
     }
-    const std::vector<uint8_t> rest(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-    ByteReader reader(rest);
+    ByteReader reader(data, size);
     reader.ReadByte();
     const auto opcode = reader.ReadByte();
     if (opcode != SESSION_RETURN) {
@@ -118,7 +117,14 @@ size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset
     if (reader.ReadUB4() != 0) {
         throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "TTC session-return report carries a session change");
     }
-    return offset + reader.Position();
+    return reader.Position();
+}
+
+size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset) {
+    if (offset > message.size()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected a TTC server piggyback");
+    }
+    return offset + SkippedTtcServerPiggybackBytes(message.data() + offset, message.size() - offset);
 }
 
 } // namespace oracle_scanner

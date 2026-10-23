@@ -148,6 +148,7 @@ int main() {
         table("T_CHAR (ID NUMBER(3), C CHAR(4))", "create char");
         table("T_LOBW (ID NUMBER(5) PRIMARY KEY, C CLOB, B BLOB, N NCLOB)", "create lobw");
         table("T_XML (ID NUMBER(5) PRIMARY KEY, X XMLTYPE)", "create xml");
+        table("T_PAR (ID NUMBER(10) PRIMARY KEY, G NUMBER(3), PAD VARCHAR2(60))", "create par");
         // BOOLEAN exists from 23ai. A server without it refuses the type, and the
         // stage is skipped rather than failed.
         bool has_boolean = true;
@@ -680,6 +681,37 @@ int main() {
             std::cout << "PASS JSON and VECTOR read and write, inline and past the prefix\n";
         } else {
             std::cout << "SKIP JSON and VECTOR: this server has no such types\n";
+        }
+        {
+            // A table read in ROWID ranges at one SCN is the same table. The test
+            // user cannot read DBA_EXTENTS, so the administrator's own attachment
+            // of the user's schema does the reading.
+            Run(admin,
+                "SELECT * FROM oracle_plsql('admin', 'BEGIN INSERT INTO " + user + ".T_PAR SELECT level, MOD(level, 50), "
+                "RPAD(''p'', 60, ''p'') FROM dual CONNECT BY level <= 300000; COMMIT; "
+                "DBMS_STATS.GATHER_TABLE_STATS(''" + user + "'', ''T_PAR''); END;');",
+                "parallel fill");
+            Run(admin, "ATTACH 'admin' AS adm (TYPE oracle_scanner, SCHEMA '" + user + "');", "attach schema");
+            Run(admin, "SET oracle_parallel_scan = 0;", "serial setting");
+            Run(admin, "CREATE TEMP TABLE par_serial AS SELECT * FROM adm.main.T_PAR;", "serial read");
+            Run(admin, "SET oracle_parallel_scan = 8;", "parallel setting");
+            Run(admin, "CREATE TEMP TABLE par_ranges AS SELECT * FROM adm.main.T_PAR;", "parallel read");
+            Check(Scalar(admin,
+                         "SELECT (SELECT count(*) FROM (SELECT * FROM par_serial EXCEPT SELECT * FROM par_ranges)) + "
+                         "(SELECT count(*) FROM (SELECT * FROM par_ranges EXCEPT SELECT * FROM par_serial)) + "
+                         "abs((SELECT count(*) FROM par_serial) - (SELECT count(*) FROM par_ranges)) + "
+                         "abs((SELECT count(*) FROM par_ranges) - 300000);",
+                         "parallel diff") == "0",
+                  "a table read in ROWID ranges equals the same table read in one stream");
+            // And Oracle really was asked for ranges, each at the one SCN.
+            Check(std::stoll(Scalar(admin,
+                                    "SELECT * FROM oracle_query('admin', 'SELECT COUNT(*) FROM V$SQL WHERE SQL_TEXT LIKE "
+                                    "''SELECT % FROM \"" + user + "\".\"T_PAR\" AS OF SCN % WHERE ROWID%''');",
+                                    "parallel statements")) >= 2,
+                  "the parallel scan sent ROWID-range statements");
+            Run(admin, "SET oracle_parallel_scan = 0;", "serial again");
+            Run(admin, "DETACH adm;", "detach schema");
+            std::cout << "PASS an attached table reads in ROWID ranges at one SCN\n";
         }
         Run(admin, "DETACH raw;", "detach");
     } catch (const std::exception &error) {

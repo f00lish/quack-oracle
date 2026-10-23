@@ -990,6 +990,7 @@ public:
         // TABLESAMPLE SYSTEM becomes Oracle's SAMPLE BLOCK, so a sample of a big
         // table reads a fraction of its blocks instead of all of them.
         function.sampling_pushdown = state->IsTable(object_name);
+        function.init_local = OracleQueryInitLocal;
         function.statistics = OracleAttachedScanStatistics;
         return function;
     }
@@ -1313,9 +1314,9 @@ std::string OracleBindExpression(const OracleColumn &column, size_t bind_positio
 	return column.xml ? "XMLPARSE(DOCUMENT " + placeholder + ")" : placeholder;
 }
 
-void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
-                       OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
-                       std::vector<OracleColumn> &columns) {
+namespace {
+
+std::string ProjectedSelectList(const OracleQueryBindData &bind, const std::vector<column_t> &selected) {
     std::string select_list;
     for (const auto column_id : selected) {
         if (!select_list.empty()) {
@@ -1327,12 +1328,163 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         }
         select_list += OracleSelectExpression(bind.columns[column_id]);
     }
-    auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name) +
-               bind.sample_clause;
-    // The translated predicates, when filter pushdown is enabled and every
-    // filter could be proven. An empty clause means nothing was pushed.
-    if (!bind.where_clause.empty()) {
-        sql += " WHERE " + bind.where_clause;
+    return select_list;
+}
+
+std::string TextLiteral(const std::string &text) {
+    std::string result = "'";
+    for (const auto character : text) {
+        result += character == '\'' ? std::string("''") : std::string(1, character);
+    }
+    return result + "'";
+}
+
+// All rows of a small dictionary query, as text.
+std::vector<std::vector<std::string>> TextRows(OracleSession &session, const std::string &sql) {
+    std::vector<std::vector<std::string>> rows;
+    auto cursor = session.Query(sql, {});
+    const auto &columns = cursor->Columns();
+    for (;;) {
+        const auto batch = cursor->Fetch(STANDARD_VECTOR_SIZE);
+        for (const auto &row : batch.rows) {
+            std::vector<std::string> text;
+            for (size_t index = 0; index < row.size(); index++) {
+                if (!row[index]) {
+                    text.emplace_back();
+                } else if (columns[index].oracle_type == 2) {
+                    text.push_back(oracle_scanner::DecodeOracleNumber(*row[index]));
+                } else {
+                    text.emplace_back(row[index]->begin(), row[index]->end());
+                }
+            }
+            rows.push_back(std::move(text));
+        }
+        if (batch.exhausted) {
+            break;
+        }
+    }
+    cursor->Close();
+    return rows;
+}
+
+} // namespace
+
+std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
+                                                  const std::vector<column_t> &selected, idx_t sessions) {
+    // Only a plain read of a table as it is now: a sample would be taken once per
+    // chunk, and a transaction that has written already holds the one session that
+    // can see its rows. (A scan that feeds an UPDATE or DELETE is fine: it reads
+    // on a session of its own already, and the rows it names are committed ones.)
+    if (sessions < 2 || !bind.sample_clause.empty() || TryTransactionSession(context, bind.catalog_name)) {
+        return {};
+    }
+    try {
+        auto session = oracle_scanner::OpenOracleSession(bind.config, bind.password);
+        // One snapshot for every chunk, taken before any of them reads. Without
+        // a change number the chunks would be several moments, so no change
+        // number means one stream.
+        const auto scn_rows = TextRows(*session, "SELECT dbms_flashback.get_system_change_number FROM dual");
+        if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
+            return {};
+        }
+        const auto &scn = scn_rows[0][0];
+        const bool own = bind.schema_name.empty();
+        const auto name = TextLiteral(bind.object_name);
+        const auto owner = TextLiteral(bind.schema_name);
+        // A heap table only: an index-organized, clustered or temporary table
+        // has no ROWID ranges to cut.
+        const auto kind = TextRows(*session, std::string("SELECT iot_type, temporary, cluster_name FROM ") +
+                                                 (own ? "user_tables" : "all_tables") + " WHERE table_name = " + name +
+                                                 (own ? std::string() : " AND owner = " + owner));
+        if (kind.size() != 1 || !kind[0][0].empty() || kind[0][1] != "N" || !kind[0][2].empty()) {
+            return {};
+        }
+        // The extents of the table, in ROWID order, each with the first ROWID it
+        // can hold. ROWIDs sort by object, file, block, row, so a run of
+        // consecutive extents is one ROWID range, and ranges cut between extents
+        // neither overlap nor leave a gap. This reads DBA_EXTENTS, which not every
+        // user may; without it the table is read with one session, because the
+        // alternatives (a sample of its blocks, which comes back in a few clumps
+        // and cut a 2,000,000-row table 99 to 1; USER_EXTENTS, which does not say
+        // where an extent starts) do not divide it evenly.
+        const auto reference = OracleObjectReference(bind.schema_name, bind.object_name);
+        const auto extents = TextRows(
+            *session,
+            std::string("SELECT ROWIDTOCHAR(DBMS_ROWID.ROWID_CREATE(1, o.data_object_id, e.relative_fno, e.block_id, 0)), "
+                        "e.blocks FROM dba_extents e JOIN dba_objects o ON o.owner = e.owner AND o.object_name = "
+                        "e.segment_name AND (o.subobject_name = e.partition_name OR (o.subobject_name IS NULL AND "
+                        "e.partition_name IS NULL)) WHERE e.owner = ") +
+                (own ? std::string("USER") : owner) + " AND e.segment_name = " + name +
+                " AND e.segment_type LIKE 'TABLE%' AND o.object_type LIKE 'TABLE%' ORDER BY o.data_object_id, "
+                "e.relative_fno, e.block_id");
+        uint64_t total_blocks = 0;
+        for (const auto &extent : extents) {
+            total_blocks += std::stoull(extent[1]);
+        }
+        // A table this small is quicker read by one session than cut up.
+        constexpr uint64_t MINIMUM_BLOCKS = 2048;
+        if (extents.empty() || total_blocks < MINIMUM_BLOCKS) {
+            return {};
+        }
+        // About four chunks to a session, so a thread that finishes early takes
+        // another instead of waiting for the slowest.
+        const uint64_t chunks = MinValue<uint64_t>(MinValue<uint64_t>(sessions * 4, 64), total_blocks / 256);
+        const uint64_t target = (total_blocks + chunks - 1) / chunks;
+        std::vector<std::string> cuts;
+        uint64_t accumulated = 0;
+        for (size_t index = 0; index + 1 < extents.size(); index++) {
+            accumulated += std::stoull(extents[index][1]);
+            if (accumulated >= target) {
+                cuts.push_back(extents[index + 1][0]);
+                accumulated = 0;
+            }
+        }
+        if (cuts.empty()) {
+            return {};
+        }
+        const auto as_of = reference + " AS OF SCN " + scn;
+        // The snapshot must be readable, which needs FLASHBACK on the table.
+        (void)TextRows(*session, "SELECT 1 FROM " + as_of + " WHERE 1 = 0");
+        session->Close();
+
+        const auto select_list = ProjectedSelectList(bind, selected);
+        const auto where = bind.where_clause.empty() ? std::string() : " AND (" + bind.where_clause + ")";
+        // Half-open ranges between consecutive cut points, open at both ends, so
+        // every ROWID belongs to exactly one chunk.
+        std::vector<std::string> statements;
+        for (size_t index = 0; index <= cuts.size(); index++) {
+            std::string range;
+            if (index > 0) {
+                range = "ROWID >= CHARTOROWID(" + TextLiteral(cuts[index - 1]) + ")";
+            }
+            if (index < cuts.size()) {
+                range += (range.empty() ? "" : " AND ") + std::string("ROWID < CHARTOROWID(") + TextLiteral(cuts[index]) + ")";
+            }
+            statements.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + range + where);
+        }
+        return statements.size() >= 2 ? statements : std::vector<std::string>();
+    } catch (const std::exception &) {
+        // Anything the dictionary or the privileges will not give is a reason to
+        // read the table the ordinary way, not to fail a query that would work.
+        return {};
+    }
+}
+
+void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
+                       OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
+                       std::vector<OracleColumn> &columns, bool schema_only) {
+    const auto select_list = ProjectedSelectList(bind, selected);
+    auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
+    if (schema_only) {
+        // Only the describe is wanted: the shape of the columns, with no row read.
+        sql += " WHERE 1 = 0";
+    } else {
+        sql += bind.sample_clause;
+        // The translated predicates, when filter pushdown is enabled and every
+        // filter could be proven. An empty clause means nothing was pushed.
+        if (!bind.where_clause.empty()) {
+            sql += " WHERE " + bind.where_clause;
+        }
     }
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
@@ -1442,6 +1594,13 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
                             "meaning is provably identical are translated; the rest are applied by the scan to the "
                             "rows Oracle returns.",
                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+    DBConfig::GetConfig(loader.GetDatabaseInstance())
+        .AddExtensionOption("oracle_parallel_scan",
+                            "How many Oracle sessions one scan of an attached table may read through at the same SCN, "
+                            "each taking ROWID ranges cut at extent boundaries. 0 or 1 reads with one session. A table "
+                            "under 2,048 blocks, a sample, a transaction that has written, and a database that will not "
+                            "give out an SCN are read with one.",
+                            LogicalType::BIGINT, Value::BIGINT(0));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_unconstrained_number",
                             "What a NUMBER with no declared precision (plain NUMBER, SUM(x), count(*)) becomes: "

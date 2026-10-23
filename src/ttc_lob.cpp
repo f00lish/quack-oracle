@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/ttc_error.hpp"
 #include "oracle_scanner/ttc_transaction.hpp"
 #include "oracle_scanner/ttc_auth.hpp"
@@ -50,6 +51,9 @@ size_t CompleteLobCall(const std::vector<uint8_t> &response, size_t offset, uint
         case TTC_MESSAGE_LOB_END_OF_REQUEST:
             offset++;
             completed = true;
+            break;
+        case TTC_MESSAGE_SERVER_PIGGYBACK:
+            offset += SkippedTtcServerPiggybackBytes(tail.data(), tail.size());
             break;
         default:
             throw ProtocolError(ProtocolErrorKind::MALFORMED,

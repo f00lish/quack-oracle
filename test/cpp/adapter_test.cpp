@@ -2569,6 +2569,86 @@ void TestVectorSearchArguments() {
     std::cout << "oracle_vector_search refuses what it cannot put in a statement safely" << std::endl;
 }
 
+// With oracle_parallel_scan a big table is read as ROWID ranges cut at extent
+// boundaries, all at one SCN, and every ROWID belongs to exactly one range.
+void TestAttachedScanReadsInRowidRanges() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("424242")}}}});
+    script->routes.push_back({"iot_type", {text_columns({"IOT_TYPE", "TEMPORARY", "CLUSTER_NAME"}),
+                                           {{std::nullopt, Text("N"), std::nullopt}}}});
+    // Ten extents of 1,000 blocks, in ROWID order.
+    std::vector<std::vector<std::optional<std::vector<uint8_t>>>> extents;
+    for (int index = 0; index < 10; index++) {
+        extents.push_back({Text("EXTENT" + std::to_string(index)), Number("1000")});
+    }
+    script->routes.push_back({"dba_extents", {{Column("LOW", 1), Column("BLOCKS", 2)}, extents}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary, {{Text("FACTS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["FACTS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+
+    // Off by default: one statement, no ranges.
+    CHECK(!database.Query("SELECT count(*) FROM o.main.FACTS;")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("CHARTOROWID") == std::string::npos);
+    }
+    script->queries.clear();
+
+    database.Run("SET oracle_parallel_scan = 4;");
+    auto result = database.Query("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(!result->HasError());
+    std::vector<std::string> chunks;
+    for (const auto &query : script->queries) {
+        if (query.find("AS OF SCN 424242 WHERE ROWID") != std::string::npos) {
+            chunks.push_back(query);
+        }
+    }
+    // 10,000 blocks over 16 chunks of about 625: each 1,000-block extent is a chunk.
+    CHECK(chunks.size() == 10);
+    std::sort(chunks.begin(), chunks.end());
+    size_t open_below = 0;
+    size_t open_above = 0;
+    for (const auto &chunk : chunks) {
+        const bool has_lower = chunk.find("ROWID >= CHARTOROWID") != std::string::npos;
+        const bool has_upper = chunk.find("ROWID < CHARTOROWID") != std::string::npos;
+        open_below += has_lower ? 0 : 1;
+        open_above += has_upper ? 0 : 1;
+    }
+    CHECK(open_below == 1 && open_above == 1);
+    bool joined = false;
+    for (const auto &chunk : chunks) {
+        joined = joined || chunk.find("ROWID >= CHARTOROWID('EXTENT2') AND ROWID < CHARTOROWID('EXTENT3')") != std::string::npos;
+    }
+    CHECK(joined);
+    // Once the transaction has written, the one session that sees its rows reads, as one stream.
+    database.Run("BEGIN;");
+    database.Run("INSERT INTO o.main.FACTS VALUES (5);");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT count(*) FROM o.main.FACTS;")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("AS OF SCN") == std::string::npos);
+    }
+    database.Run("ROLLBACK;");
+    std::cout << "an attached scan can read in ROWID ranges at one SCN" << std::endl;
+}
+
 void TestCallableArgumentsOfTheNewTypes() {
     using oracle_scanner::BindDirection;
     const auto encode = [](const char *type, const char *text) {
@@ -4298,6 +4378,7 @@ int main() {
     TestJsonAndVectorColumnsThroughSql();
     TestXmlTypeColumnsAreText();
     TestJoinKeysReachOracle();
+    TestAttachedScanReadsInRowidRanges();
     TestCallableArgumentsOfTheNewTypes();
     TestVectorSearchArguments();
     TestParallelScanShardsOneSnapshot();

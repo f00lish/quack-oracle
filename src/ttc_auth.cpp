@@ -54,7 +54,20 @@ std::vector<uint8_t> EncodeTtcAuthFunction(uint8_t function_code, uint8_t sequen
 }
 
 std::vector<TtcParameter> BuildO5LogonPhaseTwoParameters(const O5LogonResponse &response) {
-    if (response.client_session_key_hex.empty() || response.encrypted_password_hex.empty() || response.combo_key.size() != 32) {
+    if (response.client_session_key_hex.empty() || response.encrypted_password_hex.empty()) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "O5LOGON response is incomplete");
+    }
+    // 12C sends a speedy key alongside the password and derives a 32-byte
+    // combo key. 11G has neither: its combo key is 24 bytes and its phase-two
+    // parameters are just the session key and the password.
+    if (response.speedy_key_hex.empty()) {
+        if (response.combo_key.size() != 24) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "O5LOGON response is incomplete");
+        }
+        return {{"AUTH_SESSKEY", response.client_session_key_hex, 1},
+                {"AUTH_PASSWORD", response.encrypted_password_hex, 0}};
+    }
+    if (response.combo_key.size() != 32) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "O5LOGON response is incomplete");
     }
     return {{"AUTH_SESSKEY", response.client_session_key_hex, 1},

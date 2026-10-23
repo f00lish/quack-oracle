@@ -77,6 +77,10 @@ private:
     uint16_t negotiated_sdu;
     uint8_t ttc_field_version = ORACLE_CLIENT_TTC_FIELD_VERSION;
     uint8_t ttc_server_field_version = ORACLE_CLIENT_TTC_FIELD_VERSION;
+    // The server's capability table from the TTC negotiation. The 11G
+    // password verifier needs one bit of it: (ServerCompileTimeCaps[4] & 2)
+    // says whether the session keys are padded.
+    std::vector<uint8_t> runtime_capabilities;
     bool end_of_response_negotiated = false;
     // Whether the listener speaks the legacy session dialect. It answers with
     // a two-byte packet length and expects the Additional Network Option

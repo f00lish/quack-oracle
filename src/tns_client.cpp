@@ -781,6 +781,7 @@ TtcProtocolInfo TnsClientConnection::Negotiate(const TtcNegotiationOptions &opti
     auto result = RunTtcNegotiation(Ttc(), options);
     ttc_field_version = result.field_version;
     ttc_server_field_version = result.server_field_version;
+    runtime_capabilities = result.runtime_capabilities;
     state = OracleConnectionState::TTC_NEGOTIATED;
     return result;
 }
@@ -815,6 +816,19 @@ O5LogonResponse TnsClientConnection::AuthenticateO5Logon(const std::string &user
     request.client_session_key = SecureRandomBytes(32);
     request.password_salt = SecureRandomBytes(16);
     request.speedy_key_salt = SecureRandomBytes(16);
+    // The 11G verifier needs to know whether the server's session keys are
+    // padded, and that is one bit of the capability table:
+    // (ServerCompileTimeCaps[4] & 2) == 0 means padded.
+    //
+    // The bit index is 4, well inside the table on every listener that has
+    // one; a table that is too short leaves the default (padded), which is
+    // what 11.2 uses.
+    if (runtime_capabilities.size() > 4) {
+        request.session_keys_padded = (runtime_capabilities[4] & 2) == 0;
+    }
+    // The session's own legacy marker decides how the challenge states the
+    // length of each piece of a long value.
+    request.legacy_session = legacy_session;
     auto result = RunO5Logon(Ttc(), request);
     state = OracleConnectionState::AUTHENTICATED;
     EndEstablishment();

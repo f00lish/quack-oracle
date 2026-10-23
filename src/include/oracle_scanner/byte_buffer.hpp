@@ -12,6 +12,15 @@ constexpr uint8_t TNS_LONG_LENGTH_INDICATOR = 254;
 constexpr uint8_t TNS_NULL_LENGTH_INDICATOR = 255;
 constexpr size_t TNS_MAX_SHORT_LENGTH = 252;
 
+// How a session states the length of each piece of a long value. Oracle 19c
+// and later state it as a universal integer; the 11.2 dialect states it as
+// one raw byte, which is what the "fe 40 <64 bytes> 20 <32 bytes>" form in
+// a legacy challenge is.
+enum class TtcChunkEncoding {
+    UniversalInteger,
+    RawByte,
+};
+
 class ByteReader {
 public:
     ByteReader(const uint8_t *data, size_t size);
@@ -29,11 +38,15 @@ public:
     uint16_t ReadUB2();
     uint32_t ReadUB4();
     uint64_t ReadUB8();
-    std::optional<std::vector<uint8_t>> ReadLengthPrefixed(size_t maximum_size);
+    std::optional<std::vector<uint8_t>> ReadLengthPrefixed(size_t maximum_size,
+                                                            TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
     std::string ReadNullTerminated(size_t maximum_size);
 
 private:
     uint64_t ReadUniversal(size_t maximum_bytes);
+    // The length of one piece of a long value. A modern session states it as
+    // a universal integer; the 11.2 dialect states it as one raw byte.
+    size_t ReadChunkLength(TtcChunkEncoding chunk_encoding);
 
     const uint8_t *data;
     size_t size;

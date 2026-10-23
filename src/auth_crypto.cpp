@@ -99,6 +99,41 @@ std::vector<uint8_t> Sha512(const std::vector<std::vector<uint8_t>> &parts) {
     return output;
 }
 
+namespace {
+
+// A one-shot digest over a single buffer. SHA-1 and MD5 are here only because
+// the 11G password verifier needs them; 12C is PBKDF2-SHA-512 throughout.
+std::vector<uint8_t> Digest(const EVP_MD *algorithm, const std::vector<uint8_t> &value, const char *what) {
+    EVP_MD_CTX *raw_context = EVP_MD_CTX_new();
+    if (!raw_context) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, std::string("OpenSSL ") + what + " allocation failed");
+    }
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(raw_context, EVP_MD_CTX_free);
+    if (EVP_DigestInit_ex(context.get(), algorithm, nullptr) != 1) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, std::string("OpenSSL ") + what + " initialization failed");
+    }
+    if (!value.empty() && EVP_DigestUpdate(context.get(), value.data(), value.size()) != 1) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, std::string("OpenSSL ") + what + " update failed");
+    }
+    unsigned int output_size = 0;
+    std::vector<uint8_t> output(EVP_MAX_MD_SIZE);
+    if (EVP_DigestFinal_ex(context.get(), output.data(), &output_size) != 1) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, std::string("OpenSSL ") + what + " finalization failed");
+    }
+    output.resize(output_size);
+    return output;
+}
+
+} // namespace
+
+std::vector<uint8_t> Sha1(const std::vector<uint8_t> &value) {
+    return Digest(EVP_sha1(), value, "SHA-1");
+}
+
+std::vector<uint8_t> Md5(const std::vector<uint8_t> &value) {
+    return Digest(EVP_md5(), value, "MD5");
+}
+
 static std::vector<uint8_t> AesCbc(const std::vector<uint8_t> &key, const std::vector<uint8_t> &input, bool encrypt,
                                    bool padding) {
     if (!encrypt && (input.empty() || input.size() % 16 != 0)) {
@@ -181,7 +216,8 @@ std::vector<uint8_t> DecodeHex(const std::string &value, size_t maximum_bytes) {
 }
 
 void RequireSupportedO5LogonVerifier(uint32_t verifier_type) {
-    if (verifier_type == O5LOGON_VERIFIER_12C) {
+    if (verifier_type == O5LOGON_VERIFIER_12C || verifier_type == O5LOGON_VERIFIER_11G_1 ||
+        verifier_type == O5LOGON_VERIFIER_11G_2) {
         return;
     }
     char type[16];
@@ -205,7 +241,8 @@ void RequireSupportedO5LogonVerifier(uint32_t verifier_type) {
     }
     throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
                         "Oracle offered " + kind + " (type " + type +
-                            ") for this account; oracle_scanner authenticates only with the 12C verifier (type 0x4815). " +
+                            ") for this account; oracle_scanner authenticates with the 12C verifier (type 0x4815) and the "
+                            "11G verifiers (types 0xB152 and 0x1B25). " +
                             remedy);
 }
 
@@ -267,8 +304,144 @@ O5LogonResponse BuildO5LogonResponse(const std::string &password, const O5LogonC
     return {UpperHex(encrypted_client_key), UpperHex(speedy_ciphertext), UpperHex(encrypted_password), std::move(combo_key)};
 }
 
+namespace {
+
+// Strips PKCS#5 padding. The 11G session keys are 40 bytes, which is not a
+// block multiple, so the padding is part of the key material and has to be
+// removed explicitly.
+std::vector<uint8_t> StripPkcs5(const std::vector<uint8_t> &value) {
+    if (value.empty()) {
+        return value;
+    }
+    const size_t count = value.back();
+    if (count == 0 || count > 16 || count > value.size()) {
+        return value;
+    }
+    for (size_t index = value.size() - count; index < value.size(); ++index) {
+        if (value[index] != count) {
+            return value;
+        }
+    }
+    return std::vector<uint8_t>(value.begin(), value.end() - static_cast<long>(count));
+}
+
+} // namespace
+
+O5LogonResponse BuildO5Logon11GResponse(const std::string &password, const O5Logon11GChallenge &challenge,
+                                         const std::vector<uint8_t> &client_session_key) {
+    if (password.empty() || password.size() > 1024) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "invalid O5LOGON password");
+    }
+    // The verifier decides the algorithm: 11G and 12C keys are derived
+    // differently, so a challenge that says 12C must not be answered with the
+    // 11G algorithm, and the other way round.
+    RequireSupportedO5LogonVerifier(challenge.verifier_type);
+    if (challenge.verifier_type != O5LOGON_VERIFIER_11G_1 && challenge.verifier_type != O5LOGON_VERIFIER_11G_2) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "the 11G O5LOGON response was asked for a challenge with a different verifier");
+    }
+    auto salt = DecodeHex(challenge.salt_hex, 128);
+    auto encrypted_server_key = DecodeHex(challenge.server_session_key_hex, 256);
+    if (salt.empty()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "malformed 11G O5LOGON challenge: the salt is missing");
+    }
+    if (encrypted_server_key.empty() || encrypted_server_key.size() % 16 != 0) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "malformed 11G O5LOGON challenge: the encrypted session key is not a block sequence");
+    }
+
+    // key = SHA1(password || salt) || 00 00 00 00 -> 24 bytes, an AES-192 key.
+    //
+    // The password takes part exactly as given: it is not upper-cased and not
+    // re-encoded. An 11.2 account whose password contains non-ASCII bytes
+    // authenticates with those bytes.
+    std::vector<uint8_t> password_bytes(password.begin(), password.end());
+    std::vector<uint8_t> key_material = password_bytes;
+    key_material.insert(key_material.end(), salt.begin(), salt.end());
+    auto key = Sha1(key_material);
+    key.insert(key.end(), 4, 0x00);
+    if (key.size() != 24) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "the 11G O5LOGON key is not 24 bytes");
+    }
+
+    // The session keys are 40 bytes, which is not a multiple of the AES block
+    // size: the server sends them as 48 bytes of ciphertext, and 48 bytes of
+    // raw CBC plaintext is 40 bytes of key plus 8 bytes of PKCS#5 padding.
+    //
+    // So the cipher is used raw (no padding of its own) and the PKCS#5
+    // padding is removed by hand -- and only when the capability table says
+    // the keys are padded: (ServerCompileTimeCaps[4] & 2) == 0.
+    auto decrypt_key = [&](const std::vector<uint8_t> &ciphertext) {
+        auto plain = AesCbcDecryptRaw(key, ciphertext);
+        if (!challenge.padded) {
+            if (plain.size() < 40) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                    "malformed 11G O5LOGON challenge: the decrypted session key is shorter than 40 bytes");
+            }
+            return std::vector<uint8_t>(plain.begin(), plain.begin() + 40);
+        }
+        return StripPkcs5(plain);
+    };
+    auto server_session_key = decrypt_key(encrypted_server_key);
+    // The client session key is ours: 40 random bytes, of which the server
+    // sees only the encrypted form. A caller may supply one to make the
+    // output deterministic; an empty vector means "generate one".
+    auto client_session_key_plain = client_session_key.empty() ? SecureRandomBytes(40) : client_session_key;
+    if (client_session_key_plain.size() != 40) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "the 11G O5LOGON client session key must be 40 bytes");
+    }
+    // Both session keys must be at least 40 bytes: the combo key is taken
+    // from bytes 16..40 of them.
+    if (server_session_key.size() < 40 || client_session_key_plain.size() < 40) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "malformed 11G O5LOGON challenge: the decrypted session keys are shorter than 40 bytes");
+    }
+
+    // buffer = server[16:40] XOR client[16:40]
+    std::vector<uint8_t> buffer(24);
+    for (size_t index = 0; index < buffer.size(); ++index) {
+        buffer[index] = static_cast<uint8_t>(server_session_key[16 + index] ^ client_session_key_plain[16 + index]);
+    }
+    // combo = (MD5(buffer[0:16]) || MD5(buffer[16:24]))[:24]
+    //
+    // The trailing [:24] matters: the two digests are 32 bytes together and
+    // only the first 24 of them are used, so the second MD5 contributes just
+    // its first 8 bytes. Using all 32 would derive a different key and the
+    // server would reject the password.
+    std::vector<uint8_t> first_half(buffer.begin(), buffer.begin() + 16);
+    std::vector<uint8_t> second_half(buffer.begin() + 16, buffer.end());
+    auto combo_key = Md5(first_half);
+    auto combo_tail = Md5(second_half);
+    combo_key.insert(combo_key.end(), combo_tail.begin(), combo_tail.begin() + 8);
+    if (combo_key.size() != 24) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "the 11G O5LOGON combo key is not 24 bytes");
+    }
+
+    // The password the server receives: 16 random bytes, then the password,
+    // then PKCS#5 padding. The randomness is what makes the ciphertext
+    // different for the same password.
+    auto random_prefix = SecureRandomBytes(16);
+    std::vector<uint8_t> password_plaintext = random_prefix;
+    password_plaintext.insert(password_plaintext.end(), password_bytes.begin(), password_bytes.end());
+    auto encrypted_password = AesCbcEncrypt(combo_key, password_plaintext);
+
+    // The client session key the server receives: the same session key,
+    // encrypted under the same key. 11G sends the encrypted key, not the
+    // plain one.
+    // The client session key goes out the same way it came in: 40 bytes of
+    // key, PKCS#5 padded to 48, encrypted raw.
+    auto client_session_key_padded = client_session_key_plain;
+    client_session_key_padded.insert(client_session_key_padded.end(), 8, 0x08);
+    auto encrypted_client_key = AesCbcEncryptRaw(key, client_session_key_padded);
+    // 11G has no speedy key: the parameter is not part of the response.
+    return {UpperHex(encrypted_client_key), std::string(), UpperHex(encrypted_password), std::move(combo_key)};
+}
+
 bool VerifyO5LogonServerResponse(const O5LogonResponse &response, const std::string &server_response_hex) {
-    if (response.combo_key.size() != 32) {
+    // 12C derives a 32-byte combo key and 11G a 24-byte one; both are valid
+    // AES key sizes, and the server proof is encrypted under whichever the
+    // challenge asked for.
+    if (response.combo_key.size() != 32 && response.combo_key.size() != 24) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "O5LOGON response has no valid combo key");
     }
     auto ciphertext = DecodeHex(server_response_hex, 256);

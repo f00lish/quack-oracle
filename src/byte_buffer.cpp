@@ -102,7 +102,7 @@ uint64_t ByteReader::ReadUB8() {
 // representation, `std::nullopt`, and never yields a present-but-empty value.
 // ByteWriter::WriteLengthPrefixed is the symmetric half and collapses an empty
 // value to the NULL indicator.
-std::optional<std::vector<uint8_t>> ByteReader::ReadLengthPrefixed(size_t maximum_size) {
+std::optional<std::vector<uint8_t>> ByteReader::ReadLengthPrefixed(size_t maximum_size, TtcChunkEncoding chunk_encoding) {
     auto first = ReadByte();
     if (first == 0 || first == TNS_NULL_LENGTH_INDICATOR) {
         return std::nullopt;
@@ -116,7 +116,7 @@ std::optional<std::vector<uint8_t>> ByteReader::ReadLengthPrefixed(size_t maximu
 
     std::vector<uint8_t> result;
     while (true) {
-        auto chunk_size = static_cast<size_t>(ReadUB4());
+        auto chunk_size = ReadChunkLength(chunk_encoding);
         if (chunk_size == 0) {
             if (result.empty()) {
                 return std::nullopt;
@@ -129,6 +129,26 @@ std::optional<std::vector<uint8_t>> ByteReader::ReadLengthPrefixed(size_t maximu
         auto chunk = ReadRaw(chunk_size);
         result.insert(result.end(), chunk.begin(), chunk.end());
     }
+}
+
+// The length of one piece of a long value. A modern session states it as a
+// universal integer, whose first byte is the width of the number that follows.
+// The 11.2 dialect states it as a single raw byte instead, which is what the
+// "fe 40 <64 bytes> 20 <32 bytes>" form of a legacy challenge is. A byte that
+// cannot be a universal integer width is therefore read as a raw length: that
+// turns a frame this client would refuse into one it understands, and it
+// changes nothing that already parses, because a modern frame never carries
+// such a byte here.
+size_t ByteReader::ReadChunkLength(TtcChunkEncoding chunk_encoding) {
+    if (chunk_encoding == TtcChunkEncoding::RawByte) {
+        return ReadByte();
+    }
+    const auto width = PeekByte();
+    if (width > 4) {
+        ReadByte();
+        return width;
+    }
+    return static_cast<size_t>(ReadUB4());
 }
 
 std::string ByteReader::ReadNullTerminated(size_t maximum_size) {

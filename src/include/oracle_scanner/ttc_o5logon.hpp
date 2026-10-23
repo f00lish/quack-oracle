@@ -18,6 +18,19 @@ struct O5LogonRequest {
     std::vector<uint8_t> client_session_key;
     std::vector<uint8_t> password_salt;
     std::vector<uint8_t> speedy_key_salt;
+    // Whether the 11G server's session keys are padded. It comes from the
+    // capability table: (ServerCompileTimeCaps[4] & 2) == 0 means padded.
+    // 12C ignores it.
+    bool session_keys_padded = true;
+    // Whether the listener speaks the legacy session dialect. It answers with
+    // a two-byte packet length and states the length of each piece of a long
+    // value as one raw byte instead of a universal integer.
+    //
+    // This is the extension's own legacy marker (accept_version <= 314), not
+    // a bit of the capability table: the 19c capability table has
+    // caps[37] == 0x01, so the bit go-ora uses to decide this is not set
+    // there, and copying that test would break the 19c path.
+    bool legacy_session = false;
 };
 
 // Performs the TTC parameter exchange for the 12c verifier. The caller must

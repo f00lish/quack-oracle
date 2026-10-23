@@ -28,7 +28,7 @@ void WriteTwoLengths(ByteWriter &writer, const std::string &value) {
     }
 }
 
-std::string ReadTwoLengths(ByteReader &reader) {
+std::string ReadTwoLengths(ByteReader &reader, TtcChunkEncoding chunk_encoding) {
     const auto declared_size = reader.ReadUB4();
     if (declared_size > MAX_PARAMETER_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC parameter exceeds supported length");
@@ -43,7 +43,7 @@ std::string ReadTwoLengths(ByteReader &reader) {
     // Requiring the two to agree is what made every non-UTF-8 database fail to
     // authenticate. Oracle's own thin clients take what arrives and only trim it
     // when it overruns what was declared.
-    const auto encoded = reader.ReadLengthPrefixed(declared_size);
+    const auto encoded = reader.ReadLengthPrefixed(declared_size, chunk_encoding);
     if (!encoded) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC parameter is missing its value");
     }
@@ -126,7 +126,7 @@ std::vector<uint8_t> EncodeTtcParameters(const std::vector<TtcParameter> &parame
     return writer.Take();
 }
 
-std::vector<TtcParameter> DecodeTtcParameters(const std::vector<uint8_t> &message) {
+std::vector<TtcParameter> DecodeTtcParameters(const std::vector<uint8_t> &message, TtcChunkEncoding chunk_encoding) {
     ByteReader reader(message);
     if (reader.ReadByte() != TTC_MESSAGE_PARAMETER) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC PARAMETER message");
@@ -139,8 +139,8 @@ std::vector<TtcParameter> DecodeTtcParameters(const std::vector<uint8_t> &messag
     result.reserve(count);
     for (uint32_t index = 0; index < count; index++) {
         TtcParameter parameter;
-        parameter.key = ReadTwoLengths(reader);
-        parameter.value = ReadTwoLengths(reader);
+        parameter.key = ReadTwoLengths(reader, chunk_encoding);
+        parameter.value = ReadTwoLengths(reader, chunk_encoding);
         parameter.flags = reader.ReadUB4();
         if (parameter.key.empty()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC parameter key is empty");
@@ -187,6 +187,39 @@ O5LogonChallenge O5LogonChallengeFromParameters(const std::vector<TtcParameter> 
     result.verifier_iterations = ParseIterations(required("AUTH_PBKDF2_VGEN_COUNT"));
     result.combo_key_iterations = ParseIterations(required("AUTH_PBKDF2_SDER_COUNT"));
     result.verifier_type = verifier_type;
+    return result;
+}
+
+O5Logon11GChallenge O5Logon11GChallengeFromParameters(const std::vector<TtcParameter> &parameters, bool padded) {
+    std::map<std::string, std::string> values;
+    uint32_t verifier_type = 0;
+    for (const auto &parameter : parameters) {
+        if (!values.emplace(parameter.key, parameter.value).second) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "O5LOGON response has duplicate parameters");
+        }
+        if (parameter.key == "AUTH_VFR_DATA") {
+            verifier_type = parameter.flags;
+        }
+    }
+    auto required = [&](const char *key) -> const std::string & {
+        const auto found = values.find(key);
+        if (found == values.end()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                std::string("O5LOGON challenge is missing its ") + key + " parameter");
+        }
+        return found->second;
+    };
+    (void)required("AUTH_VFR_DATA");
+    RequireSupportedO5LogonVerifier(verifier_type);
+    if (verifier_type != O5LOGON_VERIFIER_11G_1 && verifier_type != O5LOGON_VERIFIER_11G_2) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "the 11G O5LOGON challenge was asked for a challenge with a different verifier");
+    }
+    O5Logon11GChallenge result;
+    result.salt_hex = required("AUTH_VFR_DATA");
+    result.server_session_key_hex = required("AUTH_SESSKEY");
+    result.verifier_type = verifier_type;
+    result.padded = padded;
     return result;
 }
 

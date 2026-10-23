@@ -2011,6 +2011,213 @@ static void TestServerDnComparison() {
     CHECK(!OracleServerDnMatches("", openssl_form));
 }
 
+
+// The 11G password verifier (0x1B25), the one an 11.2 listener offers.
+//
+// The fixture below is synthetic and deterministic: a made-up salt, a made-up
+// server session key, and a made-up client session key. The expected values
+// were produced by an independent implementation of the same specification, so
+// this pins the algorithm rather than the code's own arithmetic.
+//
+// The algorithm, byte for byte:
+//
+//   key      = SHA1(password || salt) || 00 00 00 00      (24 bytes = AES-192)
+//   server   = AES-192-CBC-decrypt(key, IV=0, EServerSessKey)
+//   client   = AES-192-CBC-decrypt(key, IV=0, EClientSessKey)
+//   buffer   = server[16:40] XOR client[16:40]            (24 bytes)
+//   combo    = (MD5(buffer[0:16]) || MD5(buffer[16:24]))[:24]
+//   password = AES-192-CBC-encrypt(combo, IV=0, random16 || password)
+static void TestO5Logon11GVerifier() {
+    const std::string password_text = "password";
+    const std::string salt_hex = "00010203040506070809";
+    const std::string enc_server_hex =
+        "E4D89E6B25AA4A7E123F9F18119CBA3CD9F0B040FC8D52360ED4010B7D13E1ECD622054CB35897E785EDAB0DBB6E7F57";
+    const std::string client_key_plain_hex =
+        "05101B26313C47525D68737E89949FAAB5C0CBD6E1ECF7020D18232E39444F5A65707B86919CA7B2";
+    const std::string expected_enc_client_hex =
+        "A558D26ADB91D03D32B8A67B71EF1787C5380D29191C56C6DBB0B326F53DA30749E581F726A3AEA5D42EC27C4A2B8330";
+    const std::string expected_combo_hex = "5378AACF4089EF316ED6190987A90325883859B5A23B7C44";
+
+    auto client_key_plain = DecodeHex(client_key_plain_hex, 64);
+    CHECK(client_key_plain.size() == 40);
+
+    O5Logon11GChallenge challenge;
+    challenge.salt_hex = salt_hex;
+    challenge.server_session_key_hex = enc_server_hex;
+    challenge.verifier_type = O5LOGON_VERIFIER_11G_2;
+    challenge.padded = true;
+
+    auto response = BuildO5Logon11GResponse(password_text, challenge, client_key_plain);
+    // The client session key is encrypted under the same key the server
+    // decrypts with, so this value is fully determined.
+    CHECK(response.client_session_key_hex == expected_enc_client_hex);
+    // The combo key is the first 24 bytes of MD5(buffer[0:16]) || MD5(buffer[16:24]).
+    // Using all 32 bytes would derive a different key and the server would
+    // reject the password, so the length is checked too.
+    CHECK(response.combo_key.size() == 24);
+    CHECK(UpperHex(response.combo_key) == expected_combo_hex);
+    // 11G has no speedy key.
+    CHECK(response.speedy_key_hex.empty());
+
+    // The password itself is encrypted under the combo key, after a random
+    // 16-byte prefix. The prefix is random by design, so the ciphertext is
+    // not comparable -- but the plaintext it decrypts to must contain the
+    // password.
+    auto encrypted_password = DecodeHex(response.encrypted_password_hex, 256);
+    CHECK(encrypted_password.size() == 32);
+    auto plaintext = AesCbcDecrypt(response.combo_key, encrypted_password);
+    CHECK(plaintext.size() == 32);
+    const std::string password_bytes = password_text;
+    CHECK(std::search(plaintext.begin(), plaintext.end(), password_bytes.begin(), password_bytes.end()) != plaintext.end());
+}
+
+// A challenge that says 12C must not be answered with the 11G algorithm, and
+// the other way round: the two derive their keys completely differently.
+static void TestO5Logon11GRejectsTheWrongVerifier() {
+    O5Logon11GChallenge challenge;
+    challenge.salt_hex = "00010203040506070809";
+    challenge.server_session_key_hex =
+        "E4D89E6B25AA4A7E123F9F18119CBA3CD9F0B040FC8D52360ED4010B7D13E1ECD622054CB35897E785EDAB0DBB6E7F57";
+    challenge.verifier_type = O5LOGON_VERIFIER_12C;
+    challenge.padded = true;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildO5Logon11GResponse("password", challenge, {}); });
+
+    // A 10G verifier is still unsupported -- it is a different algorithm
+    // again, and answering it with 11G would be wrong.
+    challenge.verifier_type = O5LOGON_VERIFIER_10G;
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { BuildO5Logon11GResponse("password", challenge, {}); });
+}
+
+// A malformed challenge must be reported as malformed, not answered.
+static void TestO5Logon11GRejectsMalformedChallenges() {
+    O5Logon11GChallenge challenge;
+    challenge.verifier_type = O5LOGON_VERIFIER_11G_2;
+    challenge.padded = true;
+    // No salt.
+    challenge.salt_hex = "";
+    challenge.server_session_key_hex =
+        "E4D89E6B25AA4A7E123F9F18119CBA3CD9F0B040FC8D52360ED4010B7D13E1ECD622054CB35897E785EDAB0DBB6E7F57";
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildO5Logon11GResponse("password", challenge, {}); });
+
+    // A session key that is not a block sequence.
+    challenge.salt_hex = "00010203040506070809";
+    challenge.server_session_key_hex = "00112233445566";
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildO5Logon11GResponse("password", challenge, {}); });
+
+    // A client session key of the wrong length.
+    challenge.server_session_key_hex =
+        "E4D89E6B25AA4A7E123F9F18119CBA3CD9F0B040FC8D52360ED4010B7D13E1ECD622054CB35897E785EDAB0DBB6E7F57";
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                        [&] { BuildO5Logon11GResponse("password", challenge, std::vector<uint8_t>(16, 7)); });
+}
+
+// The two verifiers must both be accepted now: 12C has been supported all
+// along, and 11G is what an 11.2 listener offers.
+static void TestO5LogonVerifierAcceptance() {
+    RequireSupportedO5LogonVerifier(O5LOGON_VERIFIER_12C);
+    RequireSupportedO5LogonVerifier(O5LOGON_VERIFIER_11G_1);
+    RequireSupportedO5LogonVerifier(O5LOGON_VERIFIER_11G_2);
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { RequireSupportedO5LogonVerifier(O5LOGON_VERIFIER_10G); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { RequireSupportedO5LogonVerifier(0x1234); });
+}
+
+// A legacy session states the length of each piece of a long value as one raw
+// byte; a modern one states it as a universal integer.
+//
+// The two forms of the same value must decode to the same bytes, and the
+// legacy form must not be mistaken for a universal integer of 64 bytes --
+// which is exactly what the extension used to try to read, and why it
+// reported "universal integer exceeds its declared width".
+static void TestLegacyChunkEncoding() {
+    const std::string value = "0123456789ABCDEF";
+    const std::vector<uint8_t> bytes(value.begin(), value.end());
+    // A long value: the 0xfe form, split into two chunks.
+    std::vector<uint8_t> wire;
+    wire.push_back(TNS_LONG_LENGTH_INDICATOR);
+    // Legacy: one raw byte per chunk length.
+    wire.push_back(8);
+    wire.insert(wire.end(), bytes.begin(), bytes.begin() + 8);
+    wire.push_back(8);
+    wire.insert(wire.end(), bytes.begin() + 8, bytes.end());
+    wire.push_back(0);
+
+    ByteReader legacy_reader(wire.data(), wire.size());
+    auto legacy_value = legacy_reader.ReadLengthPrefixed(64, TtcChunkEncoding::RawByte);
+    if (!legacy_value.has_value()) {
+        CHECK(false && "the legacy chunked value did not decode");
+        return;
+    }
+    CHECK(legacy_value->size() == value.size());
+    CHECK(std::equal(value.begin(), value.end(), legacy_value->begin()));
+
+    // The same value in the modern form: a universal integer per chunk.
+    std::vector<uint8_t> modern_wire;
+    modern_wire.push_back(TNS_LONG_LENGTH_INDICATOR);
+    modern_wire.push_back(1);
+    modern_wire.push_back(8);
+    modern_wire.insert(modern_wire.end(), bytes.begin(), bytes.begin() + 8);
+    modern_wire.push_back(1);
+    modern_wire.push_back(8);
+    modern_wire.insert(modern_wire.end(), bytes.begin() + 8, bytes.end());
+    modern_wire.push_back(0);
+
+    ByteReader modern_reader(modern_wire.data(), modern_wire.size());
+    auto modern_value = modern_reader.ReadLengthPrefixed(64, TtcChunkEncoding::UniversalInteger);
+    if (!modern_value.has_value()) {
+        CHECK(false && "the modern chunked value did not decode");
+        return;
+    }
+    CHECK(*modern_value == *legacy_value);
+
+    // Reading the legacy form as a universal integer is what used to fail:
+    // the first chunk length byte is 8, which is not a valid width.
+    ByteReader wrong_reader(wire.data(), wire.size());
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                        [&] { (void)wrong_reader.ReadLengthPrefixed(64, TtcChunkEncoding::UniversalInteger); });
+}
+
+// An 11G challenge arrives as a TTC PARAMETER message. The 11.2 listener
+// states the length of each piece of a long value as one raw byte, so the
+// challenge has to be decoded with the legacy encoding -- and the verifier in
+// it decides which algorithm answers it.
+static void TestLegacy11GChallengeParameters() {
+    const std::vector<TtcParameter> parameters = {
+        {"AUTH_SESSKEY",
+         "E4D89E6B25AA4A7E123F9F18119CBA3CD9F0B040FC8D52360ED4010B7D13E1ECD622054CB35897E785EDAB0DBB6E7F57", 0},
+        {"AUTH_VFR_DATA", "00010203040506070809", O5LOGON_VERIFIER_11G_2},
+        {"AUTH_GLOBALLY_UNIQUE_DBID", "3D6A841C71213DEB5891D98F64F5D897", 0}};
+
+    auto challenge = O5Logon11GChallengeFromParameters(parameters, true);
+    CHECK(challenge.verifier_type == O5LOGON_VERIFIER_11G_2);
+    CHECK(challenge.salt_hex == "00010203040506070809");
+    CHECK(challenge.padded);
+    CHECK(challenge.server_session_key_hex.size() == 96);
+
+    // A 12C challenge is not an 11G one.
+    const std::vector<TtcParameter> twelve_c = {
+        {"AUTH_VFR_DATA", "00010203040506070809", O5LOGON_VERIFIER_12C},
+        {"AUTH_SESSKEY", "0011223344556677", 0}};
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                        [&] { (void)O5Logon11GChallengeFromParameters(twelve_c, true); });
+
+    // A challenge with no salt at all is malformed.
+    const std::vector<TtcParameter> no_salt = {{"AUTH_SESSKEY", "0011223344556677", 0}};
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)O5Logon11GChallengeFromParameters(no_salt, true); });
+}
+
+// The 11G phase-two parameters are just the session key and the password --
+// there is no speedy key, and the combo key is 24 bytes rather than 32.
+static void TestO5Logon11GPhaseTwoParameters() {
+    O5LogonResponse response;
+    response.client_session_key_hex = "AABB";
+    response.encrypted_password_hex = "CCDD";
+    response.combo_key = std::vector<uint8_t>(24, 9);
+    auto parameters = BuildO5LogonPhaseTwoParameters(response);
+    CHECK(parameters.size() == 2);
+    CHECK(parameters[0].key == "AUTH_SESSKEY");
+    CHECK(parameters[1].key == "AUTH_PASSWORD");
+}
+
 static void TestO5LogonFlow() {
     const std::string password_text = "password";
     std::vector<uint8_t> password(password_text.begin(), password_text.end());
@@ -6936,6 +7143,13 @@ int main() {
     TestLegacyAnoNegotiation();
     TestTtcNegotiation();
     TestO5LogonFlow();
+    TestO5Logon11GVerifier();
+    TestO5Logon11GRejectsTheWrongVerifier();
+    TestO5Logon11GRejectsMalformedChallenges();
+    TestO5LogonVerifierAcceptance();
+    TestLegacyChunkEncoding();
+    TestLegacy11GChallengeParameters();
+    TestO5Logon11GPhaseTwoParameters();
     TestConnectDescriptor();
     TestConnectDescriptorStaysInline();
     TestDescriptorParser();

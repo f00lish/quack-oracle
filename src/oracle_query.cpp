@@ -2333,7 +2333,7 @@ unique_ptr<FunctionData> OracleTransactionPlsqlBind(ClientContext &context, Tabl
             AddTransactionBindBytes(bytes, bind.maximum_bytes);
         }
     }
-    result->arguments = OrderedPlsqlArguments(result->block, std::move(arguments), "oracle_plsql_transaction");
+    result->arguments = OrderedPlsqlArguments(result->block, arguments, "oracle_plsql_transaction");
     auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
     if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot run PL/SQL through an attached read-only Oracle catalog");

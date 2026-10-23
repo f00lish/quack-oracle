@@ -5,6 +5,7 @@
 #include "oracle_scanner/value_codec.hpp"
 
 #include <cmath>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -431,7 +432,7 @@ private:
 
     static std::string Pad(int64_t value, int width) {
         char text[32];
-        std::snprintf(text, sizeof(text), "%0*lld", width, value);
+        std::snprintf(text, sizeof(text), "%0*" PRId64, width, value);
         return text;
     }
 

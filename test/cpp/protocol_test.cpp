@@ -518,19 +518,32 @@ static void TestConnectPackets() {
     const auto &payload = packets[0].payload;
     CHECK(payload.size() == 66 + descriptor.size());
     CHECK(ReadUInt16(payload, 0) == 319 && ReadUInt16(payload, 2) == 300);
-    CHECK(ReadUInt16(payload, 6) == 8192 && ReadUInt16(payload, 8) == 8192 &&
+    // The service options, the connect flags and the data units are ojdbc8's:
+    // an 11.2 listener answers a CONNECT that carries them and goes silent on
+    // one that does not.
+    CHECK(ReadUInt16(payload, 4) == 0x0c41);
+    CHECK(ReadUInt16(payload, 6) == 8192 && ReadUInt16(payload, 8) == 65535 &&
            ReadUInt16(payload, 16) == descriptor.size());
     CHECK(ReadUInt16(payload, 18) == 74);
-    CHECK(payload[24] == 0x84 && payload[25] == 0x84 && payload[52] == 0x20 && payload[56] == 0x20 &&
+    CHECK(payload[24] == 0x81 && payload[25] == 0x81 && payload[52] == 0x20 && payload[55] == 0x20 &&
            payload[65] == 0x01);
     CHECK(std::string(payload.begin() + 66, payload.end()) == descriptor);
 
+    // A descriptor that outgrows the inline limit travels in a DATA
+    // continuation -- and an 11.2 listener never reads the descriptor from
+    // there. So the inline limit is generous and a long descriptor stays
+    // inside the CONNECT packet, the way every official client sends it.
     std::string long_descriptor(231, 'x');
     packets = BuildTnsConnectPackets(long_descriptor);
+    CHECK(packets.size() == 1 && packets[0].type == TnsPacketType::CONNECT);
+    CHECK(std::string(packets[0].payload.begin() + 66, packets[0].payload.end()) == long_descriptor);
+    // Past the limit the continuation is still used.
+    std::string huge_descriptor(2049, 'x');
+    packets = BuildTnsConnectPackets(huge_descriptor);
     CHECK(packets.size() == 2 && packets[0].payload.size() == 66);
-    CHECK(packets[1].type == TnsPacketType::DATA && packets[1].payload.size() == 2 + long_descriptor.size());
+    CHECK(packets[1].type == TnsPacketType::DATA && packets[1].payload.size() == 2 + huge_descriptor.size());
     CHECK(packets[1].payload[0] == 0 && packets[1].payload[1] == 0);
-    CHECK(std::string(packets[1].payload.begin() + 2, packets[1].payload.end()) == long_descriptor);
+    CHECK(std::string(packets[1].payload.begin() + 2, packets[1].payload.end()) == huge_descriptor);
     ExpectError(ProtocolErrorKind::MALFORMED, [] { BuildTnsConnectPackets("x", {300, 318, 8192, 65535}); });
 }
 

@@ -54,7 +54,7 @@ std::vector<TnsPacket> BuildTnsConnectPackets(const std::string &descriptor, con
     // and go-ora sends the same urgent-data bit (0x0400) with 0x0801.
     StoreUInt16(payload, 4, static_cast<uint16_t>(0x0841 | (options.supports_oob ? 0x0400 : 0)));
     StoreUInt16(payload, 6, options.requested_sdu);
-    StoreUInt16(payload, 8, 0xffff); // transmission data unit: the maximum a client asks for
+    StoreUInt16(payload, 8, options.requested_tdu); // transmission data unit
     StoreUInt16(payload, 10, 0x4f98); // current thin-client protocol characteristics
     StoreUInt16(payload, 14, 0x0001); // connect value
     StoreUInt16(payload, 16, static_cast<uint16_t>(descriptor.size()));

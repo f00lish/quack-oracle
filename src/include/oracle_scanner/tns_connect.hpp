@@ -15,7 +15,9 @@ struct TnsConnectOptions {
     uint16_t desired_version = 319;
     uint16_t minimum_version = 300;
     uint16_t requested_sdu = 8192;
-    uint16_t requested_tdu = 8192;
+    // ojdbc8 asks for the maximum transmission data unit, and an 11.2
+    // listener answers the CONNECT that carries it.
+    uint16_t requested_tdu = 65535;
     // TCPS cannot carry Oracle Net's TCP urgent-byte OOB probe.
     bool supports_oob = true;
     // The CONNECT packet's header flags. Zero for a first contact; a CONNECT

@@ -838,6 +838,58 @@ static void TestTtcErrorDiagnostics() {
     CHECK(DecodeTtcErrorPrefix(end_of_call(0, 7, true), 12).bytes_consumed < end_of_call(0, 7, true).size());
 }
 
+// The TTIOER body of a legacy (11.2) session is not the 12C one: it carries
+// the end-of-call status and the end-to-end sequence ahead of the row
+// counter, keeps the ORA number in the return code, and ends the fixed part
+// with four length-prefixed blobs instead of the rowid and batch arrays.
+//
+// These two bodies are the ones a live 11.2 listener sent: one for a
+// statement that named a column that does not exist, one for the internal
+// conversion error it answers with when a statement arrives in a shape it
+// cannot convert. They are byte-for-byte what the server sent, with no
+// credential or connection detail in them.
+//
+// A 12C decoder walks off the end of such a body at the message text and
+// reports a universal-integer width error, which hides the server's own
+// message. That is what the legacy decoder is for.
+static void TestLegacyTtcErrorBody() {
+    const std::vector<uint8_t> unknown_column = {
+        0x04, 0x01, 0x01, 0x01, 0x04, 0x00, 0x02, 0x03, 0x88, 0x00, 0x00, 0x01, 0x03, 0x01, 0x11,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x4f, 0x52, 0x41, 0x2d, 0x30, 0x30, 0x39, 0x30, 0x34,
+        0x3a, 0x20, 0x22, 0x4b, 0x22, 0x3a, 0x20, 0xe6, 0xa0, 0x87, 0xe8, 0xaf, 0x86, 0xe7, 0xac,
+        0xa6, 0xe6, 0x97, 0xa0, 0xe6, 0x95, 0x88, 0x0a,
+        };
+    const auto decoded_column = DecodeTtcLegacyErrorPrefix(unknown_column);
+    CHECK(decoded_column.error_number == 904);
+    CHECK(decoded_column.message.rfind("ORA-00904:", 0) == 0);
+    // The decode ends on the last byte of the body: nothing was read past it
+    // and nothing was left over.
+    CHECK(decoded_column.bytes_consumed == unknown_column.size());
+
+    const std::vector<uint8_t> conversion_overflow = {
+        0x04, 0x01, 0x01, 0x01, 0x03, 0x00, 0x02, 0x0c, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x39, 0x4f, 0x52, 0x41, 0x2d, 0x30, 0x33, 0x31, 0x32, 0x30, 0x3a, 0x20,
+        0x74, 0x77, 0x6f, 0x2d, 0x74, 0x61, 0x73, 0x6b, 0x20, 0x63, 0x6f, 0x6e, 0x76, 0x65, 0x72,
+        0x73, 0x69, 0x6f, 0x6e, 0x20, 0x72, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x65, 0x3a, 0x20, 0x69,
+        0x6e, 0x74, 0x65, 0x67, 0x65, 0x72, 0x20, 0x6f, 0x76, 0x65, 0x72, 0x66, 0x6c, 0x6f, 0x77,
+        0x0a,
+        };
+    const auto decoded_overflow = DecodeTtcLegacyErrorPrefix(conversion_overflow);
+    CHECK(decoded_overflow.error_number == 3120);
+    CHECK(decoded_overflow.message == "ORA-03120: two-task conversion routine: integer overflow");
+    CHECK(decoded_overflow.bytes_consumed == conversion_overflow.size());
+
+    // The dispatcher picks the layout by the session dialect, so the same
+    // body read as a 12C one must not silently succeed with a wrong answer.
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)DecodeTtcErrorPrefix(unknown_column, 12); });
+    // The legacy path is reached through the same entry point.
+    const auto dispatched = DecodeTtcErrorPrefix(unknown_column, 12, true);
+    CHECK(dispatched.error_number == 904);
+    CHECK(dispatched.bytes_consumed == unknown_column.size());
+}
+
 static void TestTtcParameters() {
     const std::vector<TtcParameter> parameters = {
         {"AUTH_VFR_DATA", "00112233445566778899AABBCCDDEEFF", O5LOGON_VERIFIER_12C},
@@ -7130,6 +7182,7 @@ int main() {
     TestStatementChannelJoinsFragmentedExecuteResponse();
     TestTtcCancellation();
     TestTtcErrorDiagnostics();
+    TestLegacyTtcErrorBody();
     TestTtcParameters();
     TestTtcAuthEncoding();
     TestTtcFetchCodec();

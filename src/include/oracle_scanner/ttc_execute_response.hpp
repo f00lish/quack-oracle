@@ -30,6 +30,6 @@ TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message,
 // type is ERROR even when its extended error number is zero, so callers must
 // decode it before deciding whether the execution failed.
 TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message,
-                                        uint8_t ttc_field_version = 12);
+                                        uint8_t ttc_field_version = 12, bool legacy_session = false);
 
 } // namespace oracle_scanner

@@ -24,6 +24,7 @@ struct TtcCallResponse {
 };
 
 TtcCallResponse DecodeTtcCallResponse(const std::vector<uint8_t> &message, const std::vector<OracleBind> &binds,
-                                      uint8_t ttc_field_version = 12, uint8_t server_field_version = 12);
+                                      uint8_t ttc_field_version = 12, uint8_t server_field_version = 12,
+                                      bool legacy_session = false);
 
 } // namespace oracle_scanner

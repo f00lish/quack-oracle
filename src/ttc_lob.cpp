@@ -80,7 +80,7 @@ TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t 
 }
 
 TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, size_t locator_size,
-                                        uint8_t server_field_version) {
+                                        uint8_t server_field_version, bool legacy_session) {
     if (response.empty()) {
         throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC LOB response is empty");
     }
@@ -89,7 +89,7 @@ TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, si
     // server's own reason into a complaint about the shape of its refusal. An
     // end-of-call cut short reads as TRUNCATED from the decoder itself.
     if (IsTtcErrorMessage(response)) {
-        const auto completion = DecodeTtcErrorPrefix(response, server_field_version);
+        const auto completion = DecodeTtcErrorPrefix(response, server_field_version, legacy_session);
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                             completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
                             completion.error_number);
@@ -107,7 +107,7 @@ TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, si
         case TTC_MESSAGE_ERROR: {
             // An error there is the server refusing the read — a stale locator,
             // a missing privilege — and it has to reach the caller.
-            const auto completion = DecodeTtcErrorPrefix(tail, server_field_version);
+            const auto completion = DecodeTtcErrorPrefix(tail, server_field_version, legacy_session);
             if (completion.error_number != 0) {
                 throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                                     completion.message.empty() ? "Oracle refused a LOB read" : completion.message,

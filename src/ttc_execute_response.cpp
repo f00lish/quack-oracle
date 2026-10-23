@@ -37,7 +37,8 @@ TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message,
     return result;
 }
 
-TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
+TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
+                                        bool legacy_session) {
     try {
         // Oracle puts RETURN_PARAMETER ahead of the final TTIOER for DML
         // too. Drain those prefixes but intentionally do not use the PL/SQL
@@ -52,7 +53,7 @@ TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uin
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC non-query execute response has no completion");
         }
         const std::vector<uint8_t> completion(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-        return DecodeTtcErrorPrefix(completion, ttc_field_version);
+        return DecodeTtcErrorPrefix(completion, ttc_field_version, legacy_session);
     } catch (const ProtocolError &error) {
         const auto message_type = message.empty() ? std::string("none") : std::to_string(message.front());
         throw ProtocolError(error.Kind(), std::string("TTC non-query execute completion (message type ") + message_type +

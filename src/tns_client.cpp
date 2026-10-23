@@ -663,7 +663,8 @@ TnsClientConnection::TnsClientConnection(std::unique_ptr<ByteStream> stream_p, u
       // the modern form to a legacy listener leaves it waiting, because the
       // length it reads is not the length that was sent.
       packets(std::make_unique<TnsPacketStream>(*stream, !legacy_session_p, negotiated_sdu_p)),
-      ttc(std::make_unique<TtcChannel>(*packets, negotiated_sdu_p, 16U << 20U, cancellation_supported)),
+      ttc(std::make_unique<TtcChannel>(*packets, negotiated_sdu_p, 16U << 20U, cancellation_supported,
+                                      legacy_session_p)),
       negotiated_sdu(negotiated_sdu_p), end_of_response_negotiated(end_of_response_negotiated_p),
       legacy_session(legacy_session_p),
       connect_descriptor(std::move(connect_descriptor_p)), auth_connect_string(std::move(auth_connect_string_p)),
@@ -832,7 +833,27 @@ O5LogonResponse TnsClientConnection::AuthenticateO5Logon(const std::string &user
     auto result = RunO5Logon(Ttc(), request);
     state = OracleConnectionState::AUTHENTICATED;
     EndEstablishment();
+    // Every official client asks the server for its version once the logon
+    // has completed: go-ora does it from its connect path, and the JDBC
+    // driver sends the same request before its first statement. A legacy
+    // (11.2) listener expects it, and answers the first statement that
+    // arrives without one with an internal conversion error rather than with
+    // the statement's own result.
+    RequestDbVersion();
     return result;
+}
+
+void TnsClientConnection::RequestDbVersion() {
+    if (state != OracleConnectionState::AUTHENTICATED) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "the database version request requires an authenticated session");
+    }
+    Ttc().Send(EncodeTtcDbVersionRequest(1));
+    const auto response = Ttc().Receive();
+    // The answer carries the server's banner and its packed version. Both are
+    // informational here: the point of the exchange is that the server has
+    // seen it, so a failure to parse it must not fail the connection.
+    (void)DecodeTtcDbVersionResponse(response,
+                                     legacy_session ? TtcChunkEncoding::RawByte : TtcChunkEncoding::UniversalInteger);
 }
 
 void TnsClientConnection::Close() {

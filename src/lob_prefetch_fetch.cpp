@@ -220,8 +220,10 @@ TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_co
 } // namespace
 
 LobPrefetchFetchResponseDecoder::LobPrefetchFetchResponseDecoder(const std::vector<OracleColumn> &columns_p,
-    const OracleLobPrefetchLimits &limits_p,uint8_t server_field_version_p,const std::optional<TtcRowData> &preceding_row_p)
-    : columns(columns_p), limits(limits_p), server_field_version(server_field_version_p), preceding_row(preceding_row_p) {
+    const OracleLobPrefetchLimits &limits_p,uint8_t server_field_version_p,const std::optional<TtcRowData> &preceding_row_p,
+    bool legacy_session_p)
+    : columns(columns_p), limits(limits_p), server_field_version(server_field_version_p), legacy_session(legacy_session_p),
+      preceding_row(preceding_row_p) {
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
@@ -364,7 +366,7 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
             // failure to do so is a real disagreement with the server rather
             // than something to paper over by swallowing the rest of the
             // message.
-            const auto completion = DecodeTtcErrorPrefix(Tail(message, offset), server_field_version);
+            const auto completion = DecodeTtcErrorPrefix(Tail(message, offset), server_field_version, legacy_session);
             result.exhausted = completion.error_number == 1403;
             result.completion = completion;
             if (completion.error_number != 0 && !result.exhausted) {

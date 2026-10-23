@@ -8,9 +8,9 @@
 namespace oracle_scanner {
 
 TtcChannel::TtcChannel(TnsPacketStream &packets_p, size_t negotiated_sdu_p, size_t maximum_message_size,
-                       bool cancellation_supported_p)
+                       bool cancellation_supported_p, bool legacy_session_p)
     : packets(packets_p), negotiated_sdu(negotiated_sdu_p), assembler(maximum_message_size),
-      cancellation_supported(cancellation_supported_p) {
+      cancellation_supported(cancellation_supported_p), legacy_session(legacy_session_p) {
     if (negotiated_sdu <= TNS_PACKET_HEADER_SIZE + 2 || negotiated_sdu > MAX_TNS_PACKET_LENGTH) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC negotiated SDU is invalid");
     }
@@ -33,7 +33,7 @@ TtcTransactionStatus TtcChannel::ReceiveTransactionStatus(uint8_t server_field_v
     // error decoder and negotiated server version; never guess from text or
     // mistake a rejected COMMIT for a malformed STATUS acknowledgement.
     if (IsTtcErrorMessage(response)) {
-        const auto error = DecodeTtcErrorPrefix(response,server_field_version);
+        const auto error = DecodeTtcErrorPrefix(response,server_field_version,legacy_session);
         if (error.error_number != 0) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                                 error.message.empty() ? "Oracle transaction call failed" : error.message,

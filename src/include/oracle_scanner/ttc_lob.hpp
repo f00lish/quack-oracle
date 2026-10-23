@@ -51,7 +51,7 @@ TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t 
 //! and nothing else does; a refusal throws INVALID_STATE with Oracle's error
 //! number. bytes_consumed covers the end-of-call too.
 TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, size_t locator_size,
-                                        uint8_t server_field_version);
+                                        uint8_t server_field_version, bool legacy_session = false);
 
 // A CLOB read comes back as AL16UTF16 — two bytes per BMP character, surrogate
 // pairs above it — whatever the database character set is and whatever the

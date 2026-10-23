@@ -15,7 +15,11 @@ constexpr uint32_t MAX_PREFETCH_ROWS = 1U << 20U;
 constexpr uint32_t MAX_BUFFER_BYTES = 16U << 20U;
 constexpr uint32_t OALL8_PARSE = 0x01;
 constexpr uint32_t OALL8_EXECUTE = 0x20;
-constexpr uint32_t OALL8_FETCH = 0x40;
+// 0x40 means "neither parse nor execute": it asks the server to fetch from an
+// already-open cursor. It is not a fetch request of its own -- a request that
+// both parses and executes must leave this bit clear, and go-ora's option
+// builder only ever sets it when both other bits are clear.
+constexpr uint32_t OALL8_CURSOR_FETCH_ONLY = 0x40;
 constexpr uint32_t OALL8_BIND = 0x08;
 constexpr uint32_t OALL8_NOT_PLSQL = 0x8000;
 constexpr uint32_t OALL8_PLSQL_BIND = 0x400;
@@ -187,7 +191,11 @@ std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsReque
     writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(request.sequence);
     uint32_t core_options = OALL8_PARSE | OALL8_EXECUTE;
     if (request.is_query) {
-        core_options |= OALL8_FETCH | OALL8_IMPLICIT_RESULTSETS;
+        // A query parses and executes; the implicit result set is what makes
+        // the server open a cursor for it. The fetch-only bit must stay clear
+        // or the server reads the request as a fetch from a cursor that was
+        // never opened.
+        core_options |= OALL8_IMPLICIT_RESULTSETS;
     }
     if (!request.is_plsql) {
         core_options |= OALL8_NOT_PLSQL;
@@ -223,7 +231,7 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(request.sequence);
     uint32_t options = OALL8_PARSE | OALL8_EXECUTE | OALL8_BIND;
     if (request.is_query) {
-        options |= OALL8_FETCH | OALL8_IMPLICIT_RESULTSETS;
+        options |= OALL8_IMPLICIT_RESULTSETS;
     }
     if (request.is_plsql) {
         options |= OALL8_PLSQL_BIND;

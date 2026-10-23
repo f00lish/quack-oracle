@@ -61,7 +61,24 @@ private:
 
 bool IsTtcErrorMessage(const std::vector<uint8_t> &message);
 OracleServerError ParseTtcServerError(const std::vector<uint8_t> &message);
-TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version = 12);
+// Decodes one TTIOER body. A legacy (11.2) session uses a different layout
+// for that body, so the caller must say which one applies; guessing produces
+// a universal-integer width error instead of the server's own message.
+TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version = 12,
+                                   bool legacy_session = false);
+
+// Decodes the TTIOER body of a legacy (11.2) session. The layout is not the
+// 12C one: the legacy summary carries the end-of-call status and the
+// end-to-end sequence ahead of the row counter, keeps the ORA number in the
+// return code itself, and ends the fixed part with four length-prefixed
+// blobs instead of the 12C rowid/batch arrays. A 12C decoder walks off the
+// end of the body at the text length and reports a universal-integer width
+// error instead of the server's own message.
+//
+// The layout was derived from go-ora's legacy summary reader and verified
+// byte-for-byte against two live 11.2 error responses (ORA-00904 and
+// ORA-03120): the decoded text ends exactly on the last byte of the body.
+TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message);
 [[noreturn]] void ThrowTtcServerError(const std::vector<uint8_t> &message);
 
 } // namespace oracle_scanner

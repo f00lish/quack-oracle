@@ -60,6 +60,10 @@ public:
     O5LogonResponse AuthenticateO5Logon(const std::string &username, const std::string &password,
                                         uint32_t auth_mode = 1,
                                         const std::vector<TtcParameter> &phase_one_parameters = {});
+    // Asks the server for its version. Every official client does this once
+    // the logon completes, and a legacy (11.2) listener expects it before the
+    // first statement.
+    void RequestDbVersion();
     void Close();
     // Lifts the connect budget and cancellation, which otherwise keep bounding
     // every read and write until O5LOGON completes. AuthenticateO5Logon calls it

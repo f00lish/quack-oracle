@@ -29,7 +29,8 @@ struct TtcFetchResponse {
 // previous response's last row.
 TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, const std::vector<OracleColumn> &columns,
                                         uint8_t ttc_field_version = 12,
-                                        const std::optional<TtcRowData> &preceding_row = std::nullopt);
+                                        const std::optional<TtcRowData> &preceding_row = std::nullopt,
+                                        bool legacy_session = false);
 
 // Decodes one fetch response as it arrives in DATA fragments, without decoding
 // any row twice. Each call to Decode is given the whole response received so
@@ -44,7 +45,7 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
 class TtcFetchResponseDecoder {
 public:
     TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
-                            const std::optional<TtcRowData> &preceding_row);
+                            const std::optional<TtcRowData> &preceding_row, bool legacy_session = false);
 
     // True once the response is complete. Throws TRUNCATED, as
     // DecodeTtcFetchResponse does, when the bytes end inside a message, and
@@ -60,6 +61,9 @@ private:
 
     const std::vector<OracleColumn> &columns;
     uint8_t ttc_field_version;
+    // Whether the server speaks the legacy (11.2) session dialect, which
+    // changes the layout of the TTIOER error body inside a fetch response.
+    bool legacy_session = false;
     std::optional<TtcRowData> preceding_row;
     // The columns a row without a row header carries, and which are LOBs.
     std::vector<size_t> row_columns;

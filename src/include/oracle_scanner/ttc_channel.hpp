@@ -17,7 +17,7 @@ namespace oracle_scanner {
 class TtcChannel {
 public:
     TtcChannel(TnsPacketStream &packets, size_t negotiated_sdu, size_t maximum_message_size = 16U << 20U,
-               bool cancellation_supported = true);
+               bool cancellation_supported = true, bool legacy_session = false);
 
     // Queues a server cursor release for the next TTC function call. Oracle
     // defines CLOSE_CURSORS as a piggyback, so sending it independently would
@@ -31,6 +31,15 @@ public:
     void Cancel();
     void Send(const std::vector<uint8_t> &message);
     std::vector<uint8_t> Receive();
+
+    // Whether the listener speaks the legacy (11.2) session dialect. The
+    // dialect decides the layout of several TTC bodies -- the TTIOER error
+    // body above all -- so a decoder that does not know it decodes a legacy
+    // message with the modern layout and reports a width error instead of
+    // the server's own message.
+    bool LegacySession() const {
+        return legacy_session;
+    }
 
     // One TTC call is a request and the response that answers it, and the two
     // are only a pair because nothing else uses the channel in between. A
@@ -50,6 +59,7 @@ private:
     std::vector<uint32_t> pending_close_cursors;
     uint8_t next_piggyback_sequence = 1;
     bool cancellation_supported;
+    bool legacy_session = false;
     std::atomic<bool> cancellation_requested {false};
     std::mutex outbound_mutex;
     std::recursive_mutex call_mutex;

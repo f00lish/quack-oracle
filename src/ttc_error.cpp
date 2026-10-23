@@ -131,7 +131,11 @@ OracleServerError ParseTtcServerError(const std::vector<uint8_t> &message) {
     return result;
 }
 
-TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
+TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
+                                   bool legacy_session) {
+    if (legacy_session) {
+        return DecodeTtcLegacyErrorPrefix(message);
+    }
     ByteReader reader(message);
     try {
     if (reader.ReadByte() != TTC_MESSAGE_ERROR) {
@@ -212,6 +216,75 @@ TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t t
         }
     }
     return {error_number, cursor_id, current_row, row_count, std::move(error_message), reader.Position()};
+    } catch (const ProtocolError &error) {
+        throw ProtocolError(error.Kind(), "TTC ERROR at offset " + std::to_string(reader.Position()) + ": " + error.what());
+    }
+}
+
+TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message) {
+    // The legacy summary is the 11.2 shape of a TTIOER body. Its field order
+    // and widths come from go-ora's summary reader for a session that
+    // negotiated both the end-of-call status and the end-to-end sequence
+    // capabilities, and whose TTC version is below 7.
+    //
+    // The differences from the 12C body are the reason a 12C decoder cannot
+    // be reused here:
+    //   - two extra leading fields (end-of-call status, end-to-end sequence);
+    //   - the ORA number is the return code, not a later error-number field;
+    //   - the fixed part ends with four length-prefixed blobs, and there is
+    //     neither a row count nor a trailing SQL type and checksum.
+    ByteReader reader(message);
+    try {
+        if (reader.ReadByte() != TTC_MESSAGE_ERROR) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ERROR message");
+        }
+        reader.ReadUB4(); // end-of-call status
+        reader.ReadUB2(); // end-to-end sequence
+        const auto current_row = reader.ReadUB4();
+        const auto error_number = reader.ReadUB2();
+        reader.ReadUB2(); // array element error
+        reader.ReadUB2(); // array element error
+        const auto cursor_id = reader.ReadUB4();
+        reader.ReadUB4(); // signed SQL offset; callers use server message text
+        reader.Skip(2);   // sql type, fatal
+        reader.Skip(2);   // flags, cursor options
+        reader.Skip(2);   // UPI, warning
+        reader.ReadUB4(); // rowid RBA
+        reader.ReadUB2(); // rowid partition
+        reader.Skip(1);   // rowid flag
+        reader.ReadUB4(); // rowid block
+        reader.ReadUB2(); // rowid slot
+        reader.ReadUB4(); // OS error
+        reader.Skip(1);   // statement number
+        reader.Skip(1);   // call number
+        reader.ReadUB2(); // padding
+        reader.ReadUB4(); // successful iterations
+        // Four length-prefixed blobs close the fixed part. A blob with a
+        // non-zero length carries that many bytes.
+        for (int index = 0; index < 4; index++) {
+            const auto length = reader.ReadUB4();
+            if (length != 0) {
+                (void)reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES);
+            }
+        }
+        std::string error_message;
+        if (error_number != 0) {
+            std::optional<std::vector<uint8_t>> text;
+            try {
+                text = reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES);
+            } catch (const ProtocolError &error) {
+                throw ProtocolError(error.Kind(), "TTC ERROR text at offset " + std::to_string(reader.Position()) + ": " + error.what());
+            }
+            if (!text) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC ERROR has a null error-message field");
+            }
+            error_message.assign(text->begin(), text->end());
+            while (!error_message.empty() &&
+                   (error_message.back() == '\n' || error_message.back() == '\r' || error_message.back() == ' ')) {
+                error_message.pop_back();
+            }
+        }
+        return {error_number, cursor_id, current_row, 0, std::move(error_message), reader.Position()};
     } catch (const ProtocolError &error) {
         throw ProtocolError(error.Kind(), "TTC ERROR at offset " + std::to_string(reader.Position()) + ": " + error.what());
     }

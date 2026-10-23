@@ -2691,8 +2691,8 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         const auto before = session->IoStats();
-        cursor = session->Query(bind.aggregate_sql, {});
-        opened.sql = bind.aggregate_sql;
+        cursor = session->Query(bind.statement_sql, {});
+        opened.sql = bind.statement_sql;
         opened.io = session->IoStats() - before;
     } catch (const std::exception &error) {
         session.Poison();
@@ -2734,7 +2734,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
 
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleQueryBindData>();
-    if (bind.aggregate_scan) {
+    if (bind.statement_scan) {
         return OracleAggregateInit(context, bind, input);
     }
     if (bind.transactional_query) {

@@ -236,11 +236,11 @@ struct OracleQueryBindData final : TableFunctionData {
     idx_t top_n_rows = 0;
     //! ` ORDER BY ... FETCH FIRST n ROWS ONLY` when the scan applies it, built at init.
     std::string order_clause;
-    //! A scan that Oracle aggregates: the optimizer replaced an AGGREGATE over an
-    //! attached table with this statement. `columns` and `types` are its result
+    //! A scan of one statement the optimizer wrote — an AGGREGATE or a JOIN of
+    //! attached tables that Oracle computes. `columns` and `types` are its result
     //! columns as the plan expects them, declared rather than described.
-    bool aggregate_scan = false;
-    std::string aggregate_sql;
+    bool statement_scan = false;
+    std::string statement_sql;
     ConnectionConfig config;
     std::string password;
     std::string object_name;

@@ -695,6 +695,7 @@ their own shard, so nothing is dropped.
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
 | `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
 | `oracle_filter_pushdown` | `true` | See §5. |
+| `oracle_join_pushdown` | `true` | An inner join of two attached tables of one database, compared on number, date or timestamp columns, becomes one statement over two inline views that carry each side's filters; not with a filter Oracle was not sent, a sample, or a LOB/JSON/VECTOR/XML/ROWID column |
 | `oracle_aggregate_pushdown` | `true` | An AGGREGATE over an attached table (`count`, `sum` of exact numbers, `min`/`max`, group keys of numbers, dates and timestamps; no DISTINCT/FILTER/GROUPING SETS) is replaced by one `GROUP BY` statement, when every filter was sent to Oracle |
 | `oracle_top_n_pushdown` | `true` | An `ORDER BY … LIMIT` over an attached table whose keys are all numbers, dates or timestamps is sent as `ORDER BY … NULLS FIRST/LAST FETCH FIRST (limit+offset) ROWS ONLY`; DuckDB's `TOP_N` still sorts the result. Not with a filter Oracle was not sent, a sample, or a parallel scan |
 | `oracle_parallel_scan` | `0` | Sessions one scan of an attached table may use, reading ROWID ranges cut at extent boundaries, all at one SCN (§8). `0` or `1`: one stream |

@@ -496,6 +496,18 @@ must have no sample and no join filter coming later; otherwise the plan is uncha
 group keys, NULLs, ties, decimals, dates, timestamps, pushed filters) returned the same rows with
 and without it on 19c and 23ai.
 
+**Joins.** An inner join of two tables attached from the same Oracle database
+(`SELECT … FROM o.ORDERS x JOIN o.CUSTOMERS y ON x.cust = y.id WHERE …`) is one statement,
+`FROM (SELECT … WHERE <x's filters>) a JOIN (SELECT … WHERE <y's filters>) b ON …`, so the join's
+result travels and not both tables. Conditions are comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`)
+between columns of the same number, date or timestamp type; all filters on both sides must have
+gone to Oracle, neither side may be a sample, and the columns read must not be LOB, JSON, VECTOR,
+XML or ROWID. Outer, semi and anti joins, text keys and joins of more than two tables (a join of
+three comes out as a pushed pair joined by DuckDB to the third) are left to DuckDB.
+`SET oracle_join_pushdown = false` turns it off. 40 random joins (equality, inequality, composite
+conditions, self-joins, NULLs, pushed filters on both sides) returned the same rows with and
+without it on 19c and 23ai.
+
 **Samples.** `SELECT … FROM o.BIG TABLESAMPLE SYSTEM (1%)` and
 `USING SAMPLE 1000 ROWS (system)` are taken by Oracle (`SAMPLE (p)`, or `SAMPLE BLOCK (p)`
 for tables of tens of millions of rows, with `SEED` for `REPEATABLE`), so 1% of a
@@ -1006,6 +1018,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
+| `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (inner join on number, date or timestamp columns) |
 | `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`/`sum`/`min`/`max` with `GROUP BY` over number, date and timestamp keys |
 | `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key; see [section 4](#pushing-filters-down-to-oracle) |
 | `oracle_parallel_scan` | `0` | How many sessions one scan of an attached table may read through at once; see [section 7](#7-read-a-big-table-faster) |

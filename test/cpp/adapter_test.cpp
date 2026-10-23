@@ -624,6 +624,7 @@ struct TestDatabase {
             "SERVICE_NAME 'service', USER 'app_user', PASSWORD 'placeholder');");
         // The fake answers plain scans; the one test of aggregate pushdown turns it on.
         Run("SET oracle_aggregate_pushdown = false;");
+        Run("SET oracle_join_pushdown = false;");
     }
 
     std::unique_ptr<MaterializedQueryResult> Query(const std::string &sql) {
@@ -2554,6 +2555,18 @@ void TestJoinKeysReachOracle() {
     CHECK(script->queries.back().find("GROUP BY \"ID\"") != std::string::npos &&
           script->queries.back().find("SUM(\"ID\")") != std::string::npos &&
           script->queries.back().find("WHERE \"ID\" > 5") != std::string::npos);
+    // An inner join of two attached tables is one statement, each side an inline view with its own filters.
+    database.Run("SET oracle_join_pushdown = true;");
+    script->routes.insert(script->routes.begin(),
+                          {"JOIN (SELECT", {{Column("C0", 2, 10, 0), Column("C1", 2, 10, 0)},
+                                            {{Number("1000"), Number("1100")}, {Number("1100"), Number("1100")}}}});
+    auto joined = database.Query("SELECT a.ID, b.ID FROM o.main.FACTS a JOIN o.main.FACTS b ON a.ID <= b.ID "
+                                 "WHERE a.ID > 5 AND b.ID < 9000 ORDER BY 1, 2;");
+    CHECK(!joined->HasError() && joined->RowCount() == 2 && joined->GetValue(0, 0).ToString() == "1000");
+    CHECK(script->queries.back().find("FROM (SELECT \"ID\" FROM \"FACTS\" WHERE \"ID\" > 5") !=
+              std::string::npos &&
+          script->queries.back().find("a.\"ID\" <= b.\"ID\"") != std::string::npos);
+    database.Run("SET oracle_join_pushdown = false;");
     // An aggregate with a FILTER is left to DuckDB.
     CHECK(!database.Query("SELECT count(*) FILTER (WHERE ID > 1050) FROM o.main.FACTS;")->HasError());
     CHECK(script->queries.back().find("GROUP BY") == std::string::npos);

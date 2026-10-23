@@ -179,7 +179,7 @@ jobs:
         run: GEN=ninja make release
 
       - name: Run the C++ suites
-        run: ctest --test-dir build/release/extension/oracle_scanner --output-on-failure
+        run: ctest --test-dir build/release/extension/oracle_scanner --output-on-failure --timeout 600
 
       - name: Prove no Oracle client is linked or loaded
         run: scripts/check_no_oracle_client.sh

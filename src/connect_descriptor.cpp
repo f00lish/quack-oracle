@@ -191,18 +191,23 @@ static std::string BuildDescriptor(const ConnectionConfig &config, const Connect
     ValidateAddress(address.host, address.port);
     const auto identity = CurrentOracleClientIdentity(config.client_program);
     std::ostringstream result;
+    // The layout is ojdbc8's: the address block names the port before the
+    // host, and the connect data names the client identity before the
+    // service. A listener answers the descriptor shape it knows, and
+    // ojdbc8's is the shape proven against this 11.2.
     result << "(DESCRIPTION=(ADDRESS=(PROTOCOL="
-           << (address.protocol == TransportProtocol::TCPS ? "tcps" : "tcp") << ")(HOST=" << address.host
-           << ")(PORT=" << address.port << "))(CONNECT_DATA=(SERVICE_NAME=" << config.service_name << ')';
+           << (address.protocol == TransportProtocol::TCPS ? "TCPS" : "TCP") << ")(PORT=" << address.port << ")(HOST="
+           << address.host << "))(CONNECT_DATA=";
+    if (include_cid) {
+        result << "(CID=(PROGRAM=" << identity.program << ")(HOST=" << identity.machine << ")(USER=" << identity.os_user
+               << "))";
+    }
+    result << "(SERVICE_NAME=" << config.service_name << ')';
     if (!config.instance_name.empty()) {
         result << "(INSTANCE_NAME=" << config.instance_name << ')';
     }
     if (!config.server_type.empty()) {
         result << "(SERVER=" << Upper(config.server_type) << ')';
-    }
-    if (include_cid) {
-        result << "(CID=(PROGRAM=" << identity.program << ")(HOST=" << identity.machine << ")(USER=" << identity.os_user
-               << "))";
     }
     if (!config.connection_id.empty()) {
         result << "(CONNECTION_ID=" << config.connection_id << ')';

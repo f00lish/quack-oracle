@@ -243,7 +243,7 @@ static void TestWalletArchive() {
         "unit_low = (description= (address=(protocol=tcps)(port=1522)(host=db.example.com))"
         "(connect_data=(service_name=unit_low.example.com)))\n";
     const auto duplicate_aliases = tnsnames +
-                                   "UNIT_LOW = (DESCRIPTION=(ADDRESS=(PROTOCOL=tcps)(PORT=1522)(HOST=other.example.com))"
+                                   "UNIT_LOW = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(PORT=1522)(HOST=other.example.com))"
                                    "(CONNECT_DATA=(SERVICE_NAME=other.example.com)))\n";
     {
         std::ofstream plain(pem_path, std::ios::binary);
@@ -2062,7 +2062,7 @@ static void TestConnectDescriptor() {
     config.host = "db.example.com";
     config.service_name = "ORCLPDB1";
     auto descriptor = BuildConnectDescriptor(config);
-    CHECK(descriptor.find("(PROTOCOL=tcp)") != std::string::npos);
+    CHECK(descriptor.find("(PROTOCOL=TCP)") != std::string::npos);
     CHECK(descriptor.find("(HOST=db.example.com)") != std::string::npos);
     CHECK(descriptor.find("(SERVICE_NAME=ORCLPDB1)") != std::string::npos);
     CHECK(BuildAuthConnectString(config).find("(CID=") == std::string::npos);
@@ -2081,9 +2081,9 @@ static void TestConnectDescriptor() {
     config.tls_server_name = "wallet.example.com";
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildConnectDescriptor(config); });
     config.protocol = TransportProtocol::TCPS;
-    CHECK(BuildConnectDescriptor(config).find("(PROTOCOL=tcps)") != std::string::npos);
+    CHECK(BuildConnectDescriptor(config).find("(PROTOCOL=TCPS)") != std::string::npos);
     config.tls_sni_name = "sni.example.com";
-    CHECK(BuildConnectDescriptor(config).find("(PROTOCOL=tcps)") != std::string::npos);
+    CHECK(BuildConnectDescriptor(config).find("(PROTOCOL=TCPS)") != std::string::npos);
     config.tls_sni_name = "bad)(HOST=attacker";
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildConnectDescriptor(config); });
     config.tls_sni_name.clear();
@@ -4117,7 +4117,7 @@ static void TestDescriptorRoutingParameters() {
 
     // Direct addresses form one implicit list governed by the DESCRIPTION.
     auto direct = ParseConnectDescriptor(
-        "(DESCRIPTION=(FAILOVER=off)(LOAD_BALANCE=yes)(ADDRESS=(HOST=a.example))(ADDRESS=(PROTOCOL=tcp)(HOST=b.example)"
+        "(DESCRIPTION=(FAILOVER=off)(LOAD_BALANCE=yes)(ADDRESS=(HOST=a.example))(ADDRESS=(PROTOCOL=TCP)(HOST=b.example)"
         "(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=svc)(INSTANCE_NAME=svc1)(SERVER=dedicated)))");
     CHECK(direct.address_lists.size() == 1 && direct.address_lists[0].addresses.size() == 2);
     CHECK(!direct.address_lists[0].failover && direct.address_lists[0].load_balance);
@@ -4177,7 +4177,7 @@ static void TestDescriptorRoutingParameters() {
 static void TestRedirectAddressParsing() {
     auto parsed = ParseRedirectAddresses("(ADDRESS=(PROTOCOL=TCP)(HOST=node1-vip)(PORT=1521))");
     CHECK(parsed.size() == 1 && parsed[0].address.host == "node1-vip" && parsed[0].protocol_given);
-    parsed = ParseRedirectAddresses("(ADDRESS_LIST=(ADDRESS=(HOST=node1)(PORT=1521))(ADDRESS=(PROTOCOL=tcp)(HOST=node2)(PORT=1522)))");
+    parsed = ParseRedirectAddresses("(ADDRESS_LIST=(ADDRESS=(HOST=node1)(PORT=1521))(ADDRESS=(PROTOCOL=TCP)(HOST=node2)(PORT=1522)))");
     CHECK(parsed.size() == 2 && !parsed[0].protocol_given && parsed[1].address.port == 1522);
     // A full DESCRIPTION, with keys that are the listener's own business.
     parsed = ParseRedirectAddresses(

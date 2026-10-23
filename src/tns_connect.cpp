@@ -45,19 +45,26 @@ std::vector<TnsPacket> BuildTnsConnectPackets(const std::string &descriptor, con
     std::vector<uint8_t> payload(CONNECT_FIXED_PAYLOAD_SIZE + (descriptor_is_inline ? descriptor.size() : 0), 0);
     StoreUInt16(payload, 0, options.desired_version);
     StoreUInt16(payload, 2, options.minimum_version);
-    StoreUInt16(payload, 4, static_cast<uint16_t>(0x0001 | (options.supports_oob ? 0x0400 : 0)));
+    // The service options, the connect flags and the two 32-bit data units
+    // below are ojdbc8's, byte for byte, because a CONNECT that carries them
+    // is the one an 11.2 listener answers. The same CONNECT with the
+    // extension's own values -- service options 0x0401, transmission data
+    // unit 8192, connect flags 0x8484 -- gets an ACCEPT and then silence on
+    // the very next request. ojdbc8 8.2.0 sent these to this very database,
+    // and go-ora sends the same urgent-data bit (0x0400) with 0x0801.
+    StoreUInt16(payload, 4, static_cast<uint16_t>(0x0841 | (options.supports_oob ? 0x0400 : 0)));
     StoreUInt16(payload, 6, options.requested_sdu);
-    StoreUInt16(payload, 8, options.requested_tdu);
+    StoreUInt16(payload, 8, 0xffff); // transmission data unit: the maximum a client asks for
     StoreUInt16(payload, 10, 0x4f98); // current thin-client protocol characteristics
     StoreUInt16(payload, 14, 0x0001); // connect value
     StoreUInt16(payload, 16, static_cast<uint16_t>(descriptor.size()));
     StoreUInt16(payload, 18, static_cast<uint16_t>(CONNECT_HEADER_TOTAL_SIZE));
     StoreUInt32(payload, 20, 0); // no extra receive buffer reservation
-    payload[24] = 0x84;
-    payload[25] = 0x84; // protocol capabilities used by current thin clients
-    payload[52] = 0x20;
-    payload[56] = 0x20;
-    payload[25] = 0x84; // security renegotiation plus no native authentication
+    payload[24] = 0x81;
+    payload[25] = 0x81; // connect flags, as ojdbc8 sends them
+    payload[52] = 0x20; // session data unit, 8192
+    payload[55] = 0x20; // transmission data unit, 2 MB -- one byte lower than before,
+                        // which had put 0x20 in the wrong field and asked for 512 MB
     payload[65] = options.supports_oob ? 0x01 : 0x00;
     if (descriptor_is_inline) {
         std::copy(descriptor.begin(), descriptor.end(), payload.begin() + CONNECT_FIXED_PAYLOAD_SIZE);

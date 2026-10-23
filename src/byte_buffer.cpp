@@ -100,6 +100,15 @@ uint16_t ByteReader::ReadUB2() {
     return static_cast<uint16_t>(ReadUniversal(2));
 }
 
+int8_t ByteReader::ReadScale() {
+    const auto first = ReadByte();
+    if ((first & 0x80U) == 0) {
+        return static_cast<int8_t>(first);
+    }
+    // A negative length marker: the value follows in the next byte.
+    return static_cast<int8_t>(ReadByte());
+}
+
 uint64_t ByteReader::ReadUB8() {
     return ReadUniversal(8);
 }

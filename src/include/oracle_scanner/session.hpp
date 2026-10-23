@@ -34,6 +34,11 @@ struct OracleColumn {
     // NVARCHAR2 and CHAR from NCHAR, which share a type code but not an
     // encoding, so it decides whether a character column can be read at all.
     uint8_t character_set_form = 0;
+    // The database character set the column's text is in. The describe
+    // response states it next to the form, and the row decoder needs it to
+    // turn bytes into characters: a column in a database that is not AL32UTF8
+    // carries its text in that database's own encoding.
+    uint16_t character_set_id = 0;
     // Oracle declares a maximum byte length per column, and a column whose
     // maximum is zero can only ever be SQL NULL. The server then leaves it out
     // of ROW_DATA completely — no value and no NULL length byte — so the fetch

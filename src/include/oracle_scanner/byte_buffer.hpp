@@ -45,6 +45,15 @@ public:
     // Those fields are read with this, so the width a field is normally called
     // stays the limit everywhere else.
     uint32_t ReadUB4Unbounded();
+
+    // The scale of a column in a describe response is not a fixed-width
+    // field. An 11.2 listener sends it as one byte, but when the value
+    // cannot be stated in that byte it sends a negative-length form: the
+    // length byte has bit 7 set and the value follows in the next byte
+    // (`81 7f` is a scale of 127). Reading one byte and stopping there
+    // leaves the response desynchronized by one byte, and reading the
+    // second byte as if it were the next field shifts every later field.
+    int8_t ReadScale();
     std::optional<std::vector<uint8_t>> ReadLengthPrefixed(size_t maximum_size,
                                                             TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
     std::string ReadNullTerminated(size_t maximum_size);

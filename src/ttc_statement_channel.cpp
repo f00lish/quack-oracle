@@ -166,7 +166,8 @@ TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStat
                                         completion.error_number);
                 }
             }
-            decoded = DecodeTtcExecuteResponse(message, ttc_field_version, server_field_version);
+            decoded = DecodeTtcExecuteResponse(message, ttc_field_version, server_field_version,
+                                                    channel.LegacySession());
             return decoded->completed;
         });
         return std::move(*decoded);

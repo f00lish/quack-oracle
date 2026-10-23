@@ -10,10 +10,10 @@
 namespace oracle_scanner {
 
 TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
-                                            uint8_t server_field_version) {
+                                            uint8_t server_field_version, bool legacy_session) {
     TtcDescribeInfo describe;
     try {
-        describe = DecodeTtcDescribeInfoPrefix(message, ttc_field_version);
+        describe = DecodeTtcDescribeInfoPrefix(message, ttc_field_version, legacy_session);
     } catch (const ProtocolError &error) {
         throw ProtocolError(error.Kind(), std::string("TTC execute DESCRIBE_INFO: ") + error.what());
     }

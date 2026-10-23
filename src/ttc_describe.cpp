@@ -47,18 +47,18 @@ std::string ReadDeclaredText(ByteReader &reader) {
     return {value->begin(), value->end()};
 }
 
-OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version) {
+OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version, bool legacy_session) {
     OracleColumn column;
     column.oracle_type = reader.ReadByte();
     reader.ReadByte(); // flags
     column.precision = static_cast<int8_t>(reader.ReadByte());
-    column.scale = static_cast<int8_t>(reader.ReadByte());
+    column.scale = reader.ReadScale();
     const auto maximum_size = reader.ReadUB4();
     reader.ReadUB4(); // maximum array elements
     reader.ReadUB8(); // continuation flags
     ReadDeclaredBytes(reader); // object id
     reader.ReadUB2(); // version
-    reader.ReadUB2(); // character set id
+    column.character_set_id = reader.ReadUB2(); // character set id
     column.character_set_form = reader.ReadByte();
     const auto size = reader.ReadUB4();
     // TTIPRO's server version is not the version gate for OALL8 describe
@@ -66,7 +66,14 @@ OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version) {
     // oaccolid followed by nullable. This is also the shape emitted after the
     // OALL8 request used by python-oracledb, so retain it unconditionally for
     // the supported modern TTC execution profile.
-    reader.ReadUB4(); // oaccolid
+    //
+    // An 11.2 listener does not send oaccolid at all: its describe response
+    // goes straight from the size field to nullable. Reading the field there
+    // shifts every later field by two bytes, and the name that comes out is
+    // the declared length of the text rather than the text itself.
+    if (!legacy_session) {
+        reader.ReadUB4(); // oaccolid
+    }
     column.nullable = reader.ReadByte() != 0;
     reader.ReadByte(); // V7 name length
     column.name = ReadDeclaredText(reader);
@@ -103,7 +110,8 @@ OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version) {
 
 } // namespace
 
-TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
+TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
+                                            bool legacy_session) {
     ByteReader reader(message);
     if (reader.ReadByte() != TTC_MESSAGE_DESCRIBE_INFO) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC DESCRIBE_INFO message");
@@ -119,7 +127,7 @@ TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message,
     result.columns.reserve(column_count);
     for (uint32_t index = 0; index < column_count; ++index) {
         try {
-            result.columns.push_back(DecodeColumn(reader, ttc_field_version));
+            result.columns.push_back(DecodeColumn(reader, ttc_field_version, legacy_session));
         } catch (const ProtocolError &error) {
             throw ProtocolError(error.Kind(), "TTC describe column " + std::to_string(index) + " at offset " +
                                                    std::to_string(reader.Position()) + ": " + error.what());

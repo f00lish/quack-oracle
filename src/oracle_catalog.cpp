@@ -155,6 +155,10 @@ struct OracleAttachedState {
     // leaves this empty rather than falling back to anything.
     mutable bool primary_keys_loaded = false;
     mutable std::unordered_map<std::string, std::vector<std::string>> primary_key_cache;
+    // The names of the schema's tables, as opposed to its views: a sample can be
+    // taken of a table, and Oracle refuses one of most views.
+    mutable bool tables_loaded = false;
+    mutable std::unordered_set<std::string> table_names;
     // NUM_ROWS from the optimizer statistics, for the tables that have any.
     mutable bool row_estimates_loaded = false;
     mutable std::unordered_map<std::string, uint64_t> row_estimates;
@@ -625,6 +629,38 @@ struct OracleAttachedState {
         }
     }
 
+    bool IsTable(const std::string &object_name) const {
+        std::lock_guard<std::mutex> lock(metadata_lock);
+        if (!tables_loaded) {
+            tables_loaded = true;
+            try {
+                OracleMetadataLease session(transaction_pool, config, password);
+                auto cursor = TranslatingOracleErrors("Oracle ATTACH could not list tables", [&] {
+                    return session->Query("SELECT table_name FROM " + View("tables") +
+                                              (owner.empty() ? std::string() : " WHERE owner = " + Literal(owner)),
+                                          {});
+                });
+                for (;;) {
+                    const auto batch = TranslatingOracleErrors("Oracle ATTACH could not list tables",
+                                                               [&] { return cursor->Fetch(STANDARD_VECTOR_SIZE); });
+                    for (const auto &row : batch.rows) {
+                        if (!row.empty() && row[0]) {
+                            table_names.emplace(row[0]->begin(), row[0]->end());
+                        }
+                    }
+                    if (batch.exhausted) {
+                        break;
+                    }
+                }
+                cursor->Close();
+                session.Finish();
+            } catch (const std::exception &) {
+                table_names.clear();
+            }
+        }
+        return table_names.count(object_name) > 0;
+    }
+
     // What Oracle's own statistics say the table holds (USER_TABLES.NUM_ROWS),
     // read once for the whole schema. DuckDB plans joins from it: without an
     // estimate it believes every attached table has one row, builds its hash
@@ -951,6 +987,9 @@ public:
             context.TryGetCurrentSetting("oracle_filter_pushdown", pushdown) && BooleanValue::Get(pushdown);
         function.projection_pushdown = true;
         function.cardinality = OracleAttachedScanCardinality;
+        // TABLESAMPLE SYSTEM becomes Oracle's SAMPLE BLOCK, so a sample of a big
+        // table reads a fraction of its blocks instead of all of them.
+        function.sampling_pushdown = state->IsTable(object_name);
         function.statistics = OracleAttachedScanStatistics;
         return function;
     }
@@ -1288,7 +1327,8 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         }
         select_list += OracleSelectExpression(bind.columns[column_id]);
     }
-    auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
+    auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name) +
+               bind.sample_clause;
     // The translated predicates, when filter pushdown is enabled and every
     // filter could be proven. An empty clause means nothing was pushed.
     if (!bind.where_clause.empty()) {

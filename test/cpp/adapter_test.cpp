@@ -2529,6 +2529,18 @@ void TestJoinKeysReachOracle() {
     CHECK(script->queries.back().find("WHERE") != std::string::npos &&
           (script->queries.back().find("BETWEEN") != std::string::npos ||
            script->queries.back().find("IN (") != std::string::npos));
+    // A system sample of a table is taken by Oracle, not by reading every row. A filter
+    // above the sample stays above it, in DuckDB; a filter below it is part of the scan,
+    // and the sample then stays in DuckDB, after the filter.
+    auto sampled = database.Query("SELECT count(*) FROM o.main.FACTS TABLESAMPLE SYSTEM (10%) REPEATABLE (7);");
+    CHECK(!sampled->HasError());
+    CHECK(script->queries.back().find("FROM \"FACTS\" SAMPLE (10.000000) SEED (7)") != std::string::npos);
+    auto after = database.Query("SELECT count(*) FROM o.main.FACTS TABLESAMPLE SYSTEM (10%) WHERE ID > 0;");
+    CHECK(!after->HasError() && script->queries.back().find("SAMPLE (10.000000)") != std::string::npos &&
+          script->queries.back().find("WHERE") == std::string::npos);
+    auto before = database.Query("SELECT count(*) FROM (SELECT * FROM o.main.FACTS WHERE ID > 0) TABLESAMPLE SYSTEM (10%);");
+    CHECK(!before->HasError() && script->queries.back().find("SAMPLE") == std::string::npos &&
+          script->queries.back().find("WHERE") != std::string::npos);
     std::cout << "a join's keys reach Oracle as a WHERE clause" << std::endl;
 }
 

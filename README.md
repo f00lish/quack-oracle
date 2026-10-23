@@ -470,6 +470,15 @@ table. Few keys go as an `IN` list; more as the ranges of the key they fall in
 describes only as a bloom filter is applied locally. It needs a numeric key and is
 only ever a narrowing: DuckDB still checks every row against the join.
 
+**Samples.** `SELECT … FROM o.BIG TABLESAMPLE SYSTEM (1%)` and
+`USING SAMPLE 1000 ROWS (system)` are taken by Oracle (`SAMPLE (p)`, or `SAMPLE BLOCK (p)`
+for tables of tens of millions of rows, with `SEED` for `REPEATABLE`), so 1% of a
+2,000,000-row table sends 20,000 rows, not 2,000,000. Block sampling on a table of a few
+hundred thousand rows came back as 0 rows in some runs, so smaller tables are sampled by
+row. A sample of a view, a `BERNOULLI` sample and a sample taken after a filter inside
+the sampled query stay in DuckDB. `LIMIT` needs nothing of the kind: the scan reads one
+batch of 2,048 rows and stops (`SELECT * FROM o.BIG LIMIT 10` moved 2,048 rows of 2,000,000).
+
 DuckDB can only choose that plan if it knows the Oracle table is the big side.
 It reads the table's row count from Oracle's optimizer statistics
 (`USER_TABLES.NUM_ROWS`), so a table that has never had statistics gathered looks

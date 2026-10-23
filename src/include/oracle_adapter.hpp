@@ -218,6 +218,8 @@ struct OracleQueryBindData final : TableFunctionData {
     // was pushed. Built at init, where the filters and the read columns are
     // both known.
     std::string where_clause;
+    //! ` SAMPLE BLOCK (p) [SEED (n)]` when DuckDB handed the scan a system sample, else empty.
+    std::string sample_clause;
     ConnectionConfig config;
     std::string password;
     std::string object_name;

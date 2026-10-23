@@ -2638,6 +2638,46 @@ unique_ptr<GlobalTableFunctionState> OracleCursorInit(ClientContext &, TableFunc
 
 } // namespace
 
+// DuckDB hands a scan a system sample only when the scan has said it takes one
+// and there are no filters (a sample is taken before a filter, not after). A
+// percentage maps to the same percentage of Oracle's rows, or of its blocks for
+// a table big enough to have thousands of them: block sampling reads a fraction
+// of the table but takes whole runs of blocks at a time, so on a table of a few
+// hundred thousand rows the same 1% came back as 0 rows in some runs and 3%
+// in others. Row sampling reads every block and sends back only the sample. A row count arrives
+// as the rate DuckDB worked out from the table's estimated size, doubled: block
+// sampling is lumpy, and DuckDB puts a LIMIT of the requested rows on top, so
+// a few too many rows cost nothing and too few would.
+std::string OracleSampleClause(optional_ptr<SampleOptions> options, const std::optional<uint64_t> &estimated_rows) {
+	if (!options || options->method != SampleMethod::SYSTEM_SAMPLE) {
+		return std::string();
+	}
+	double percent;
+	if (options->is_percentage) {
+		percent = options->sample_size.GetValue<double>();
+	} else {
+		if (options->sample_rate < 0) {
+			return std::string();
+		}
+		percent = options->sample_rate * 100.0 * 2.0;
+	}
+	if (percent >= 100.0) {
+		return std::string();
+	}
+	percent = MaxValue<double>(percent, 0.000001);
+	char text[64];
+	std::snprintf(text, sizeof(text), "%.6f", percent);
+	// Sampling by block starts to pay, and its lumpiness to average out, in the
+	// tens of millions of rows.
+	constexpr uint64_t BLOCK_SAMPLING_ROWS = 20000000;
+	const bool by_block = estimated_rows && *estimated_rows >= BLOCK_SAMPLING_ROWS;
+	std::string clause = std::string(by_block ? " SAMPLE BLOCK (" : " SAMPLE (") + text + ")";
+	if (options->repeatable && options->seed.IsValid()) {
+		clause += " SEED (" + std::to_string(static_cast<uint64_t>(options->GetSeed()) % 4294967296ULL) + ")";
+	}
+	return clause;
+}
+
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleQueryBindData>();
     if (bind.transactional_query) {
@@ -2734,6 +2774,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             }
         }
     }
+    bind.sample_clause = OracleSampleClause(input.sample_options.get(), bind.estimated_rows);
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     std::vector<OracleColumn> columns;

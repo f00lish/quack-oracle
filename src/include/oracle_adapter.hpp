@@ -191,6 +191,13 @@ struct OracleTransactionStatus {
 
 OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const std::string &catalog_name);
 
+//! One sort key of a Top-N pushed into a scan: a column of the table.
+struct OracleTopNKey {
+    column_t column;
+    bool descending;
+    bool nulls_first;
+};
+
 struct OracleQueryBindData final : TableFunctionData {
     // oracle_query has to run its statement while binding, because only the
     // Oracle describe can tell DuckDB what the result columns are.
@@ -222,6 +229,13 @@ struct OracleQueryBindData final : TableFunctionData {
     std::string where_clause;
     //! ` SAMPLE BLOCK (p) [SEED (n)]` when DuckDB handed the scan a system sample, else empty.
     std::string sample_clause;
+    //! The sort keys of a TOP_N the optimizer found over this scan, and how many
+    //! rows it keeps (limit plus offset), or none. Set at plan time by
+    //! OptimizeOraclePlan; used only when every filter went to Oracle.
+    vector<OracleTopNKey> top_n;
+    idx_t top_n_rows = 0;
+    //! ` ORDER BY ... FETCH FIRST n ROWS ONLY` when the scan applies it, built at init.
+    std::string order_clause;
     ConnectionConfig config;
     std::string password;
     std::string object_name;
@@ -478,6 +492,10 @@ struct OracleScanOpening {
     std::string sql;
     OracleIoStats io;
 };
+//! Installs the plan rewrites for attached tables (src/oracle_optimizer.cpp).
+void RegisterOracleOptimizer(DatabaseInstance &db);
+std::string OracleTopNClause(const OracleQueryBindData &bind);
+
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
                        std::vector<OracleColumn> &columns, bool schema_only = false,

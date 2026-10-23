@@ -2777,6 +2777,10 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         }
     }
     bind.sample_clause = OracleSampleClause(input.sample_options.get(), bind.estimated_rows);
+    // A Top-N the optimizer found over this scan is applied by Oracle only when
+    // every filter went to Oracle too: a filter DuckDB applies afterwards would
+    // see the first n rows instead of the first n that pass it.
+    bind.order_clause = (!local_filter && bind.sample_clause.empty()) ? OracleTopNClause(bind) : std::string();
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     std::vector<OracleColumn> columns;

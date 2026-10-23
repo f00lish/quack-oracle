@@ -1376,7 +1376,8 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
     // chunk, and a transaction that has written already holds the one session that
     // can see its rows. (A scan that feeds an UPDATE or DELETE is fine: it reads
     // on a session of its own already, and the rows it names are committed ones.)
-    if (sessions < 2 || !bind.sample_clause.empty() || TryTransactionSession(context, bind.catalog_name)) {
+    if (sessions < 2 || !bind.sample_clause.empty() || !bind.order_clause.empty() ||
+        TryTransactionSession(context, bind.catalog_name)) {
         return {};
     }
     try {
@@ -1486,6 +1487,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         if (!bind.where_clause.empty()) {
             sql += " WHERE " + bind.where_clause;
         }
+        sql += bind.order_clause;
     }
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
@@ -1590,6 +1592,7 @@ void ApplyUnconstrainedNumberSetting(ClientContext &context, std::vector<OracleC
 }
 
 void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
+    RegisterOracleOptimizer(loader.GetDatabaseInstance());
     // On by default. Once a filter is handed to a scan DuckDB removes it from
     // the plan, so the scan must apply it exactly: the filters this translator
     // can prove go to Oracle, and the scan applies the rest itself to the rows

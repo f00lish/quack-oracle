@@ -695,6 +695,7 @@ their own shard, so nothing is dropped.
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
 | `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
 | `oracle_filter_pushdown` | `true` | See §5. |
+| `oracle_top_n_pushdown` | `true` | An `ORDER BY … LIMIT` over an attached table whose keys are all numbers, dates or timestamps is sent as `ORDER BY … NULLS FIRST/LAST FETCH FIRST (limit+offset) ROWS ONLY`; DuckDB's `TOP_N` still sorts the result. Not with a filter Oracle was not sent, a sample, or a parallel scan |
 | `oracle_parallel_scan` | `0` | Sessions one scan of an attached table may use, reading ROWID ranges cut at extent boundaries, all at one SCN (§8). `0` or `1`: one stream |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision (plain `NUMBER`, `SUM(x)`, `count(*)`) becomes: `'varchar'` (exact), `'double'`, or `'decimal(p,s)'` such as `'decimal(38,9)'`. Read when a query is bound or a table is first used; the lossy choices round what does not fit, and a DECIMAL that cannot hold a value's integer digits raises. A `DOUBLE` column then accepts `DOUBLE` on write |
 

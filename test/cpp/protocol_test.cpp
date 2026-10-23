@@ -98,6 +98,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -5902,7 +5903,7 @@ static void TestSsoWallet() {
 
     // A wallet folder, as python-oracledb's wallet_location names one.
     const auto folder = base + "_folder";
-    CHECK(mkdir(folder.c_str(), 0700) == 0);
+    CHECK(std::filesystem::create_directory(folder));
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletIdentityPem(folder, false); });
     {
         std::ofstream output(folder + "/cwallet.sso", std::ios::binary);
@@ -5919,7 +5920,7 @@ static void TestSsoWallet() {
     CHECK(ReadWalletIdentityPem(folder, true) == plain_pem);
     std::remove((folder + "/cwallet.sso").c_str());
     std::remove((folder + "/ewallet.pem").c_str());
-    rmdir(folder.c_str());
+    std::filesystem::remove(folder);
 
     std::remove(sso_only_path.c_str());
     std::remove(both_path.c_str());
@@ -5987,7 +5988,7 @@ static void TestEasyConnectAndTnsNamesFolder() {
     const std::string tnsnames =
         "# comment\nfolder_db = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=f.example)(PORT=1521))"
         "(CONNECT_DATA=(SERVICE_NAME=folder.example)))\n";
-    CHECK(mkdir(base.c_str(), 0700) == 0);
+    CHECK(std::filesystem::create_directory(base));
     ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { (void)ReadTnsNamesSource(base); });
     {
         std::ofstream output(base + "/tnsnames.ora", std::ios::binary);
@@ -6009,7 +6010,7 @@ static void TestEasyConnectAndTnsNamesFolder() {
     std::remove((base + "/tnsnames.ora").c_str());
     std::remove((base + "/nul.ora").c_str());
     std::remove(zip_path.c_str());
-    rmdir(base.c_str());
+    std::filesystem::remove(base);
     std::cout << "easy connect and tnsnames folder ok" << std::endl;
 }
 

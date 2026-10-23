@@ -38,7 +38,7 @@ POSIX_HEADERS = re.compile(r'#\s*include\s*<(arpa/[^>]+|sys/[^>]+|netinet/[^>]+|
 
 POSIX_CALLS = re.compile(
     r'\b(socket|bind|listen|accept|inet_pton|inet_ntop|setsockopt|getsockname|getaddrinfo|'
-    r'pthread_[a-z_]+|sigemptyset|sigaddset|sigwait|sigpending|fork|execve|dup2|pipe)\s*\('
+    r'pthread_[a-z_]+|sigemptyset|sigaddset|sigwait|sigpending|fork|execve|dup2|pipe|mkdir|rmdir|setenv|unsetenv)\s*\('
 )
 
 

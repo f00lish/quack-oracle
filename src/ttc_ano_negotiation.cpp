@@ -41,7 +41,12 @@ std::vector<uint8_t> BuildLegacyAnoRequest() {
     // listener reads it as "how long is this message", counted from the
     // magic. A listener that gets a different number here answers nothing.
     writer.WriteUInt16BE(static_cast<uint16_t>(6 + LEGACY_ANO_CAPABILITIES.size()));
-    writer.WriteRaw(LEGACY_ANO_CAPABILITIES.begin(), LEGACY_ANO_CAPABILITIES.size());
+    // .data(), not .begin(): on MSVC a std::array::const_iterator is a
+    // checked iterator class, not a pointer, so it matches neither WriteRaw
+    // overload. The protocol tests compile this on GCC/Clang, where the
+    // iterator is a plain pointer and the mistake stays invisible until the
+    // Windows build tries to compile it.
+    writer.WriteRaw(LEGACY_ANO_CAPABILITIES.data(), LEGACY_ANO_CAPABILITIES.size());
     return writer.Take();
 }
 

@@ -1365,18 +1365,21 @@ static void TestLegacyAnoNegotiation() {
     server.WriteByte(0).WriteByte(0);
     const std::vector<uint8_t> data_type_response {TTC_MESSAGE_DATA_TYPES, 0, 0};
     std::vector<uint8_t> inbound;
-    for (const auto &packet : EncodeTnsDataPackets(answer, true, 64)) {
+    for (const auto &packet : EncodeTnsDataPackets(answer, true, 1024)) {
         inbound.insert(inbound.end(), packet.begin(), packet.end());
     }
-    for (const auto &packet : EncodeTnsDataPackets(server.Take(), true, 64)) {
+    for (const auto &packet : EncodeTnsDataPackets(server.Take(), true, 1024)) {
         inbound.insert(inbound.end(), packet.begin(), packet.end());
     }
-    for (const auto &packet : EncodeTnsDataPackets(data_type_response, true, 64)) {
+    for (const auto &packet : EncodeTnsDataPackets(data_type_response, true, 1024)) {
         inbound.insert(inbound.end(), packet.begin(), packet.end());
     }
+    // A 1024-byte SDU keeps the ANO request in one DATA packet. With a
+    // smaller one it is split across several, and the outbound buffer
+    // holds all of them rather than the one packet being checked.
     FragmentedStream stream(inbound, 5);
-    TnsPacketStream packets(stream, true, 64);
-    TtcChannel channel(packets, 64);
+    TnsPacketStream packets(stream, true, 1024);
+    TtcChannel channel(packets, 1024);
     RunLegacyAnoNegotiation(channel);
     const auto written = DecodeTnsPacket(stream.output, true);
     CHECK(written.type == TnsPacketType::DATA);

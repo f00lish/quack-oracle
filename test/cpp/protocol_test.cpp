@@ -45,6 +45,7 @@
 #include "oracle_scanner/tns_handshake.hpp"
 #include "oracle_scanner/tns_client.hpp"
 #include "oracle_scanner/transport_factory.hpp"
+#include "oracle_scanner/ttc_ano_negotiation.hpp"
 #include "oracle_scanner/ttc_channel.hpp"
 #include "oracle_scanner/ttc_error.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
@@ -1310,6 +1311,78 @@ static void TestTtcRowDataCodec() {
     malformed.push_back(0);
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeTtcRowData(malformed, 3); });
     CHECK(DecodeTtcRowDataPrefix(malformed, 3).bytes_consumed == writer.Data().size());
+}
+
+static void TestLegacyAnoNegotiation() {
+    // The request is a fixed capability advertisement, captured from a JDBC
+    // client talking to a live 11.2 listener and reproduced byte for byte: a
+    // listener that sees anything else does not answer at all, which is what
+    // made 11.2 look like a server that had gone silent.
+    const auto request = BuildLegacyAnoRequest();
+    CHECK(request.size() == 140);
+    CHECK(request[0] == 0xde && request[1] == 0xad && request[2] == 0xbe && request[3] == 0xef);
+    // The length counts the magic, itself and the capability table.
+    CHECK(request[4] == 0x00 && request[5] == 0x8c);
+    // The platform id the capture carried, and the first framing item.
+    CHECK(request[6] == 0x17 && request[7] == 0x70 && request[8] == 0x19 && request[9] == 0x01);
+    CHECK(request[10] == 0x00 && request[11] == 0x04);
+    // The service versions decline native network encryption, which is true
+    // of this client as well.
+    CHECK(request[89] == 0xfc && request[90] == 0xff);
+
+    // The listener answers with the same framing and its own platform id. The
+    // bytes below are the answer a live 11.2 listener gave.
+    const std::vector<uint8_t> answer {
+    0xde, 0xad, 0xbe, 0xef, 0x00, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+    0x00, 0x00, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
+    0x05, 0x0b, 0x20, 0x01, 0x00, 0x00, 0x02, 0x00, 0x06, 0x00, 0x1f, 0x00,
+    0x0e, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x04, 0x00, 0x05, 0x0b, 0x20, 0x01, 0x00, 0x00, 0x02, 0x00,
+    0x06, 0xfb, 0xff, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x05, 0x0b, 0x20, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00,
+    0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x05,
+    0x0b, 0x20, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00,
+    };
+    ValidateLegacyAnoResponse(answer);
+    // A length that does not match the message is not an answer.
+    auto wrong_length = answer;
+    wrong_length[5] = static_cast<uint8_t>(wrong_length[5] - 1);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateLegacyAnoResponse(wrong_length); });
+    // Neither is a message that does not start with the magic.
+    auto wrong_magic = answer;
+    wrong_magic[0] = 0x00;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateLegacyAnoResponse(wrong_magic); });
+    ExpectError(ProtocolErrorKind::TRUNCATED, [] { ValidateLegacyAnoResponse({0xde, 0xad}); });
+
+    // The whole exchange: the request goes out as one DATA packet, the answer
+    // comes back, and the TTC negotiation that follows still works.
+    TtcNegotiationOptions options;
+    options.driver_name = "oracle_scanner_test";
+    ByteWriter server;
+    server.WriteByte(TTC_MESSAGE_PROTOCOL).WriteByte(6).WriteByte(0).WriteNullTerminated("Oracle Database");
+    server.WriteUInt16LE(ORACLE_CHARSET_AL32UTF8).WriteByte(0).WriteUInt16LE(0).WriteUInt16BE(0);
+    server.WriteByte(0).WriteByte(0);
+    const std::vector<uint8_t> data_type_response {TTC_MESSAGE_DATA_TYPES, 0, 0};
+    std::vector<uint8_t> inbound;
+    for (const auto &packet : EncodeTnsDataPackets(answer, true, 64)) {
+        inbound.insert(inbound.end(), packet.begin(), packet.end());
+    }
+    for (const auto &packet : EncodeTnsDataPackets(server.Take(), true, 64)) {
+        inbound.insert(inbound.end(), packet.begin(), packet.end());
+    }
+    for (const auto &packet : EncodeTnsDataPackets(data_type_response, true, 64)) {
+        inbound.insert(inbound.end(), packet.begin(), packet.end());
+    }
+    FragmentedStream stream(inbound, 5);
+    TnsPacketStream packets(stream, true, 64);
+    TtcChannel channel(packets, 64);
+    RunLegacyAnoNegotiation(channel);
+    const auto written = DecodeTnsPacket(stream.output, true);
+    CHECK(written.type == TnsPacketType::DATA);
+    CHECK(std::vector<uint8_t>(written.payload.begin() + 2, written.payload.end()) == request);
+    auto info = RunTtcNegotiation(channel, options);
+    CHECK(info.server_version == 6 && info.server_banner == "Oracle Database");
 }
 
 static void TestTtcNegotiation() {
@@ -6796,6 +6869,7 @@ int main() {
     TestTtcErrorNamesTheFailingIteration();
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
+    TestLegacyAnoNegotiation();
     TestTtcNegotiation();
     TestO5LogonFlow();
     TestConnectDescriptor();

@@ -4,6 +4,7 @@
 #include "oracle_scanner/client_identity.hpp"
 #include "oracle_scanner/connect_descriptor.hpp"
 #include "oracle_scanner/tns_handshake.hpp"
+#include "oracle_scanner/ttc_ano_negotiation.hpp"
 #include "oracle_scanner/ttc_channel.hpp"
 #include "oracle_scanner/ttc_negotiation.hpp"
 #include "oracle_scanner/ttc_o5logon.hpp"
@@ -40,6 +41,10 @@ public:
     // Whether the server offered a transport-level end of response. Without it
     // only the TTC decoder can tell where a response ends.
     bool EndOfResponseNegotiated() const;
+    // Whether the listener speaks the legacy session dialect. It answers with
+    // a two-byte packet length and expects the Additional Network Option
+    // negotiation before the TTC one, unlike 12.1 and later.
+    bool LegacySession() const;
     OracleConnectionState State() const;
     // The connect data the accepted CONNECT carried, and what O5LOGON will send
     // as AUTH_CONNECT_STRING. After a redirect the first is the listener's
@@ -64,7 +69,7 @@ public:
 private:
     TnsClientConnection(std::unique_ptr<ByteStream> stream, uint16_t negotiated_sdu, std::string connect_descriptor,
                         std::string auth_connect_string, OracleClientIdentity client_identity, bool cancellation_supported,
-                        bool end_of_response_negotiated);
+                        bool end_of_response_negotiated, bool legacy_session);
 
     std::unique_ptr<ByteStream> stream;
     std::unique_ptr<TnsPacketStream> packets;
@@ -73,6 +78,10 @@ private:
     uint8_t ttc_field_version = ORACLE_CLIENT_TTC_FIELD_VERSION;
     uint8_t ttc_server_field_version = ORACLE_CLIENT_TTC_FIELD_VERSION;
     bool end_of_response_negotiated = false;
+    // Whether the listener speaks the legacy session dialect. It answers with
+    // a two-byte packet length and expects the Additional Network Option
+    // negotiation before the TTC one.
+    bool legacy_session = false;
     std::string connect_descriptor;
     std::string auth_connect_string;
     OracleClientIdentity client_identity;

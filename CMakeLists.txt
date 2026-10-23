@@ -56,6 +56,7 @@ set(EXTENSION_SOURCES
     src/descriptor_parser.cpp
     src/data_assembler.cpp
     src/ttc_channel.cpp
+    src/ttc_ano_negotiation.cpp
     src/ttc_error.cpp
     src/ttc_parameter.cpp
     src/ttc_auth.cpp
@@ -145,6 +146,7 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/descriptor_parser.cpp
                  src/data_assembler.cpp
                  src/ttc_channel.cpp
+                 src/ttc_ano_negotiation.cpp
                  src/ttc_error.cpp
                  src/ttc_parameter.cpp
                  src/ttc_auth.cpp

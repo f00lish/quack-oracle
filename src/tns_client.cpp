@@ -656,10 +656,16 @@ private:
 TnsClientConnection::TnsClientConnection(std::unique_ptr<ByteStream> stream_p, uint16_t negotiated_sdu_p,
                                          std::string connect_descriptor_p, std::string auth_connect_string_p,
                                          OracleClientIdentity client_identity_p, bool cancellation_supported,
-                                         bool end_of_response_negotiated_p)
-    : stream(std::move(stream_p)), packets(std::make_unique<TnsPacketStream>(*stream, true, negotiated_sdu_p)),
+                                         bool end_of_response_negotiated_p, bool legacy_session_p)
+    : stream(std::move(stream_p)),
+      // A legacy listener reads a two-byte packet length and answers 11.2's
+      // post-ACCEPT packets in that form; a modern one reads four. Sending
+      // the modern form to a legacy listener leaves it waiting, because the
+      // length it reads is not the length that was sent.
+      packets(std::make_unique<TnsPacketStream>(*stream, !legacy_session_p, negotiated_sdu_p)),
       ttc(std::make_unique<TtcChannel>(*packets, negotiated_sdu_p, 16U << 20U, cancellation_supported)),
       negotiated_sdu(negotiated_sdu_p), end_of_response_negotiated(end_of_response_negotiated_p),
+      legacy_session(legacy_session_p),
       connect_descriptor(std::move(connect_descriptor_p)), auth_connect_string(std::move(auth_connect_string_p)),
       client_identity(std::move(client_identity_p)) {
 }
@@ -690,10 +696,17 @@ std::unique_ptr<TnsClientConnection> TnsClientConnection::Connect(const Connecti
     // redirected the transport elsewhere. python-oracledb sends its original
     // connect string there too; the listener-facing CONNECT carried the
     // redirect's own data.
+    // A listener below 12.1 speaks the legacy session dialect: it reads a
+    // two-byte packet length and expects the Additional Network Option
+    // negotiation before the TTC one. The version it accepted in its ACCEPT
+    // packet is what tells the two apart — 11.2 answers 314, 19c answers 318
+    // or 319.
+    const auto legacy_session = accepted.result.accept_version <= LEGACY_SESSION_MAX_TNS_VERSION;
     auto connection = std::unique_ptr<TnsClientConnection>(new TnsClientConnection(
         std::move(accepted.stream), accepted.result.negotiated_sdu, accepted.descriptor,
         BuildAuthConnectString(effective_config, accepted.original),
-        CurrentOracleClientIdentity(effective_config.client_program), !uses_tls, accepted.result.end_of_response));
+        CurrentOracleClientIdentity(effective_config.client_program), !uses_tls, accepted.result.end_of_response,
+        legacy_session));
     // The connect budget and cancellation keep holding through TTC negotiation
     // and O5LOGON, and are lifted when authentication completes.
     connection->end_establishment = [establishment] { establishment->Disarm(); };
@@ -737,6 +750,10 @@ bool TnsClientConnection::EndOfResponseNegotiated() const {
     return end_of_response_negotiated;
 }
 
+bool TnsClientConnection::LegacySession() const {
+    return legacy_session;
+}
+
 OracleConnectionState TnsClientConnection::State() const {
     return state;
 }
@@ -744,6 +761,13 @@ OracleConnectionState TnsClientConnection::State() const {
 TtcProtocolInfo TnsClientConnection::Negotiate(const TtcNegotiationOptions &options) {
     if (state != OracleConnectionState::TRANSPORT_CONNECTED) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "TTC negotiation is not valid in the current connection state");
+    }
+    if (legacy_session) {
+        // A legacy listener wants the Additional Network Option negotiation
+        // first: it states which session services the two of them will use.
+        // Skipping it leaves the listener waiting, which is what turned 11.2
+        // into a connection that timed out with nothing to report.
+        RunLegacyAnoNegotiation(Ttc());
     }
     auto result = RunTtcNegotiation(Ttc(), options);
     ttc_field_version = result.field_version;

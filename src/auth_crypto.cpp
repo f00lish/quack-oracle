@@ -322,7 +322,7 @@ std::vector<uint8_t> StripPkcs5(const std::vector<uint8_t> &value) {
             return value;
         }
     }
-    return std::vector<uint8_t>(value.begin(), value.end() - static_cast<long>(count));
+    return std::vector<uint8_t>(value.begin(), value.end() - count);
 }
 
 } // namespace

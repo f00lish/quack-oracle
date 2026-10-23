@@ -2066,9 +2066,13 @@ static void TestO5Logon11GVerifier() {
     // not comparable -- but the plaintext it decrypts to must contain the
     // password.
     auto encrypted_password = DecodeHex(response.encrypted_password_hex, 256);
+    // 16 random bytes + the 8-byte password is 24 bytes of plaintext, which
+    // PKCS#7 pads to the next 16-byte boundary -- 32 bytes of ciphertext.
     CHECK(encrypted_password.size() == 32);
     auto plaintext = AesCbcDecrypt(response.combo_key, encrypted_password);
-    CHECK(plaintext.size() == 32);
+    // Decrypting removes the padding, so the plaintext is the 24 bytes that
+    // went in -- not the padded 32.
+    CHECK(plaintext.size() == 24);
     const std::string password_bytes = password_text;
     CHECK(std::search(plaintext.begin(), plaintext.end(), password_bytes.begin(), password_bytes.end()) != plaintext.end());
 }

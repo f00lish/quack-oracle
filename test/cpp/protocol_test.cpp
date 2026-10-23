@@ -1365,12 +1365,50 @@ static void TestTtcExecuteNoBindsCodec() {
     const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
     ByteReader reader(encoded);
     CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION && reader.ReadByte() == TTC_FUNCTION_EXECUTE && reader.ReadByte() == 3);
-    CHECK(reader.ReadUB4() == 0x8067 && reader.ReadUB4() == 0 && reader.ReadByte() == 1);
+    // 0x8027 is the options word: the request's own 7, plus PARSE, EXECUTE,
+    // NOT_PLSQL and the implicit result set. The fetch-only bit (0x40) is
+    // absent on purpose -- go-ora sets that bit only when a request neither
+    // parses nor executes, so a request that both parses and executes must
+    // leave it clear or the server reads the request as a fetch from a cursor
+    // that was never opened.
+    CHECK(reader.ReadUB4() == 0x8027 && reader.ReadUB4() == 0 && reader.ReadByte() == 1);
     CHECK(reader.ReadUB4() == request.sql.size() && reader.ReadByte() == 1 && reader.ReadUB4() == 13);
     const std::vector<uint8_t> sql_bytes(request.sql.begin(), request.sql.end());
     CHECK(std::search(encoded.begin(), encoded.end(), sql_bytes.begin(), sql_bytes.end()) != encoded.end());
     request.sql.clear();
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeTtcExecuteNoBindsRequest(request); });
+}
+
+// The fetch-only option bit means "neither parse nor execute": it asks the
+// server to fetch from an already-open cursor. A query parses and executes,
+// so it must not carry that bit. Setting it is not a harmless extra -- the
+// server then reads the request as a fetch from a cursor that was never
+// opened, and answers with an internal conversion error instead of the
+// statement's own result.
+static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
+    TtcExecuteNoBindsRequest request;
+    request.sql = "select 1 from dual";
+    request.is_query = true;
+    const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
+    ByteReader reader(encoded);
+    CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION && reader.ReadByte() == TTC_FUNCTION_EXECUTE);
+    (void)reader.ReadByte(); // sequence
+    const auto options = reader.ReadUB4();
+    CHECK((options & 0x40) == 0);
+    CHECK((options & 0x01) != 0);  // parse
+    CHECK((options & 0x20) != 0);  // execute
+    CHECK((options & 0x8000) != 0); // not PL/SQL
+
+    // A DML request carries the same core bits and also leaves the bit
+    // clear; only a request that neither parses nor executes may set it.
+    TtcExecuteNoBindsRequest dml;
+    dml.sql = "update t set a = 1";
+    dml.is_query = false;
+    ByteReader dml_reader(EncodeTtcExecuteNoBindsRequest(dml));
+    (void)dml_reader.ReadByte();
+    (void)dml_reader.ReadByte();
+    (void)dml_reader.ReadByte();
+    CHECK((dml_reader.ReadUB4() & 0x40) == 0);
 }
 
 static void TestTtcRowDataCodec() {
@@ -1525,7 +1563,11 @@ static void TestTtcExecuteNoBindsShape() {
     const auto encoded = EncodeTtcExecuteNoBindsRequest(query);
     ByteReader reader(encoded);
     CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION && reader.ReadByte() == TTC_FUNCTION_EXECUTE && reader.ReadByte() == 1);
-    CHECK(reader.ReadUB4() == 0x8061 && reader.ReadUB4() == 0);
+    // A query's options word carries PARSE, EXECUTE, NOT_PLSQL and the
+    // implicit result set. It does not carry the fetch-only bit: that bit
+    // means "neither parse nor execute", and go-ora only sets it for a
+    // request that does neither.
+    CHECK(reader.ReadUB4() == 0x8021 && reader.ReadUB4() == 0);
     CHECK(reader.ReadByte() == 1 && reader.ReadUB4() == query.sql.size());
     CHECK(reader.ReadByte() == 1 && reader.ReadUB4() == 13);
 
@@ -7195,6 +7237,7 @@ int main() {
     TestTtcOutBindsRow();
     TestTtcCallResponse();
     TestTtcExecuteNoBindsCodec();
+    TestTtcExecuteQueryLeavesTheFetchOnlyBitClear();
     TestTtcExecuteNoBindsShape();
     TestTtcExecuteRefCursorBindShape();
 #if !defined(_WIN32)

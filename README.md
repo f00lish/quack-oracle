@@ -280,8 +280,8 @@ SQL or transaction recovery. If an established session is lost, the statement
 running on it fails with an error and nothing is re-sent; the next statement
 opens a new connection, which may land on another address. Descriptor settings
 that would promise otherwise are refused by name rather than ignored:
-`FAILOVER_MODE` (TAF), `DESCRIPTION_LIST`, `SOURCE_ROUTE=ON`, `SID`,
-`SERVER=POOLED`, `HTTPS_PROXY`, and any other key this client does not know.
+`FAILOVER_MODE` (TAF), a `DESCRIPTION_LIST` whose descriptions name different
+databases, `SOURCE_ROUTE=ON`, `SERVER=POOLED`, `HTTPS_PROXY`, and any other key this client does not know.
 `ENABLE`, `EXPIRE_TIME`, `SDU`, `TDU`, `SEND_BUF_SIZE`, `RECV_BUF_SIZE`,
 `TYPE_OF_SERVICE` and `USE_SNI` are accepted and ignored.
 
@@ -295,6 +295,7 @@ that would promise otherwise are refused by name rather than ignored:
 | `DSN` | One string in python-oracledb's forms: an Easy Connect string (`tcps://host:2484/service?retry_count=3`), a full `(DESCRIPTION=...)`, or an alias name. Use *instead of* HOST/PORT/SERVICE_NAME. See [CAPABILITIES](docs/CAPABILITIES.md) for the Easy Connect parameters |
 | `TNS_ALIAS` | An alias from the `tnsnames.ora` in `CONFIG_DIR`, or else inside the wallet — use *instead of* HOST/PORT/SERVICE_NAME |
 | `MODULE`, `ACTION`, `CLIENT_IDENTIFIER`, `CLIENT_INFO` | Session attributes Oracle shows in `V$SESSION` and `SYS_CONTEXT('USERENV', ...)`, set when each session opens (limits 48, 32, 64 and 64 bytes). Setting a module clears the action unless one is given |
+| `SID` | The database by SID instead of `SERVICE_NAME`; one of the two |
 | `CONFIG_DIR` | A folder holding `tnsnames.ora` (or that file) for `TNS_ALIAS`, or for an alias given as `DSN`. Without it, the wallet, then the `TNS_ADMIN` environment variable |
 | `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` given inline — use *instead of* HOST/PORT/SERVICE_NAME and TNS_ALIAS. See [Several addresses and listener redirects](#several-addresses-and-listener-redirects) |
 | `WALLET_FILE` | A cloud wallet ZIP, an unpacked wallet folder, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |
@@ -312,18 +313,20 @@ the database is stored in. Verified live against `TR8MSWIN1254`,
 `WE8MSWIN1252`, `ZHS16GBK` and `AL32UTF8`, reading and writing text that only
 exists in each of those character sets.
 
-**A service name, not a SID.** The connect descriptor this client builds always
-uses `(CONNECT_DATA=(SERVICE_NAME=...))`; there is no `SID` field. On an older
-non-CDB instance where you are used to connecting by SID, ask the database for a
-service name it also answers to:
+**A service name, or a SID.** Prefer `SERVICE_NAME`; a database that only answers
+to a SID (an older non-CDB instance, or the root of a container database) can be
+reached with `SID 'ORCL'` in the secret instead, or `(CONNECT_DATA=(SID=...))` in a
+descriptor. A secret or descriptor names one of the two, never both. To find a
+service name the database also answers to, ask it:
 
 ```sql
 SELECT value FROM v$parameter WHERE name = 'service_names';
 ```
 
-or read them off the listener with `lsnrctl services`. Every supported Oracle
-version registers at least one service name, so this is a lookup, not a
-migration.
+A `DESCRIPTION_LIST` whose descriptions all name the same database (the same
+service name or SID, instance and certificate DN) is read as their addresses in
+order, so a primary and a standby listed as two descriptions fail over as two
+address lists would. Descriptions that name different databases are refused.
 
 **Certificate and hostname verification are always on and cannot be turned
 off.** That is deliberate: there is no insecure mode to fall back to. TLS

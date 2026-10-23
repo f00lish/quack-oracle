@@ -145,7 +145,7 @@ std::string ConnectionTargetKey(const ConnectionConfig &config) {
         result << ']';
     }
     const auto &routing = config.routing;
-    result << '/' << config.service_name << '/' << config.instance_name << '/' << Upper(config.server_type) << '/'
+    result << '/' << config.service_name << "/sid=" << config.sid << '/' << config.instance_name << '/' << Upper(config.server_type) << '/'
            << (routing.failover ? 'F' : 'f') << (routing.load_balance ? 'L' : 'l') << '/' << routing.retry_count << '/'
            << routing.retry_delay_seconds << '/' << routing.connect_budget_seconds << '/'
            << config.connect_timeout_seconds;
@@ -157,9 +157,12 @@ void ValidateConnectionConfig(const ConnectionConfig &config) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle host or TLS name exceeds the supported size");
     }
     ValidateAddresses(config);
-    if (!IsDescriptorAtom(config.service_name)) {
+    if (config.service_name.empty() == config.sid.empty()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle needs exactly one of a service name and a SID");
+    }
+    if (!IsDescriptorAtom(config.service_name.empty() ? config.sid : config.service_name)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,
-                            "Oracle service name is empty or contains descriptor syntax");
+                            "Oracle service name or SID is empty or contains descriptor syntax");
     }
     if (config.connection_id.size() > 128 || config.connection_id.find_first_of("()\0") != std::string::npos) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle connection id contains descriptor syntax");
@@ -193,7 +196,7 @@ static std::string BuildDescriptor(const ConnectionConfig &config, const Connect
     std::ostringstream result;
     result << "(DESCRIPTION=(ADDRESS=(PROTOCOL="
            << (address.protocol == TransportProtocol::TCPS ? "tcps" : "tcp") << ")(HOST=" << address.host
-           << ")(PORT=" << address.port << "))(CONNECT_DATA=(SERVICE_NAME=" << config.service_name << ')';
+           << ")(PORT=" << address.port << "))(CONNECT_DATA=(" << (config.sid.empty() ? "SERVICE_NAME=" + config.service_name : "SID=" + config.sid) << ')';
     if (!config.instance_name.empty()) {
         result << "(INSTANCE_NAME=" << config.instance_name << ')';
     }

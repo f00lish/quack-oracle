@@ -90,6 +90,8 @@ struct ConnectionConfig {
     std::string host;
     uint16_t port = 1521;
     std::string service_name;
+    // Names the database by SID instead; exactly one of the two is set.
+    std::string sid;
     // Optional CONNECT_DATA elements a descriptor may carry. INSTANCE_NAME pins
     // the connection to one database instance; SERVER is DEDICATED or SHARED.
     std::string instance_name;

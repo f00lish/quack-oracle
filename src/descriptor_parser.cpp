@@ -389,8 +389,7 @@ void ParseConnectData(const Node &connect_data, ParsedConnectDescriptor &result)
             continue;
         }
         if (key == "SID") {
-            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
-                                "Oracle descriptor SID is not supported; connect by SERVICE_NAME");
+            continue;
         }
         if (key == "FAILOVER_MODE") {
             // Transparent Application Failover. This client does not replay
@@ -403,7 +402,18 @@ void ParseConnectData(const Node &connect_data, ParsedConnectDescriptor &result)
         throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
                             "Oracle descriptor CONNECT_DATA element " + key + " is not supported");
     }
-    result.service_name = RequiredChild(connect_data, "SERVICE_NAME").value;
+    // One of the two names the database; both would be a descriptor that
+    // contradicts itself.
+    const auto *service = OptionalScalar(connect_data, "SERVICE_NAME");
+    const auto *sid = OptionalScalar(connect_data, "SID");
+    if (service && sid) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor names both SERVICE_NAME and SID");
+    }
+    if (sid) {
+        result.sid = sid->value;
+    } else {
+        result.service_name = RequiredChild(connect_data, "SERVICE_NAME").value;
+    }
     if (const auto *instance = OptionalScalar(connect_data, "INSTANCE_NAME")) {
         result.instance_name = instance->value;
     }
@@ -421,11 +431,6 @@ void ParseConnectData(const Node &connect_data, ParsedConnectDescriptor &result)
 }
 
 void CheckRoot(const Node &root) {
-    if (root.key == "DESCRIPTION_LIST") {
-        throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
-                            "Oracle DESCRIPTION_LIST is not supported; give a single DESCRIPTION with an "
-                            "ADDRESS_LIST instead");
-    }
     if (root.key != "DESCRIPTION" || !root.value.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor root must be DESCRIPTION");
     }
@@ -433,9 +438,79 @@ void CheckRoot(const Node &root) {
 
 } // namespace
 
+static ParsedConnectDescriptor ParseDescription(const Node &root);
+
 ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor) {
     auto root = Parser(descriptor).Parse();
-    CheckRoot(root);
+    if (root.key != "DESCRIPTION_LIST") {
+        CheckRoot(root);
+        return ParseDescription(root);
+    }
+    // A list of descriptions is read as one description whose address lists
+    // are theirs in order, which is how a client with a single connect-data
+    // can use it: every description has to name the same database, or the list
+    // would mean different connections and is refused. A description's own
+    // settings beyond that (its timeouts) are the first one's.
+    if (root.children.empty() || root.children.size() > MAX_CONNECT_ADDRESSES) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DESCRIPTION_LIST has an invalid number of descriptions");
+    }
+    bool list_failover = true;
+    bool list_load_balance = false;
+    ParsedConnectDescriptor merged;
+    bool first = true;
+    for (const auto &child : root.children) {
+        if (child.key == "FAILOVER") {
+            list_failover = ParseSwitch(child);
+            continue;
+        }
+        if (child.key == "LOAD_BALANCE") {
+            list_load_balance = ParseSwitch(child);
+            continue;
+        }
+        if (child.key != "DESCRIPTION" || !child.value.empty()) {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                                "Oracle DESCRIPTION_LIST element " + child.key + " is not supported");
+        }
+        auto part = ParseDescription(child);
+        if (first) {
+            merged = std::move(part);
+            first = false;
+            continue;
+        }
+        if (part.service_name != merged.service_name || part.sid != merged.sid ||
+            part.instance_name != merged.instance_name || part.server_type != merged.server_type ||
+            part.server_cert_dn != merged.server_cert_dn) {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                                "Oracle DESCRIPTION_LIST descriptions that name different databases, instances or "
+                                "certificate DNs are not supported");
+        }
+        merged.endpoints.insert(merged.endpoints.end(), part.endpoints.begin(), part.endpoints.end());
+        merged.address_lists.insert(merged.address_lists.end(), part.address_lists.begin(), part.address_lists.end());
+        if (!merged.retry_count) {
+            merged.retry_count = part.retry_count;
+        }
+        if (!merged.retry_delay_seconds) {
+            merged.retry_delay_seconds = part.retry_delay_seconds;
+        }
+        if (!merged.connect_timeout_seconds) {
+            merged.connect_timeout_seconds = part.connect_timeout_seconds;
+        }
+        if (!merged.transport_connect_timeout_seconds) {
+            merged.transport_connect_timeout_seconds = part.transport_connect_timeout_seconds;
+        }
+    }
+    if (first) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DESCRIPTION_LIST contains no DESCRIPTION");
+    }
+    if (merged.endpoints.size() > MAX_CONNECT_ADDRESSES) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor has an invalid number of addresses");
+    }
+    merged.failover = list_failover;
+    merged.load_balance = list_load_balance;
+    return merged;
+}
+
+static ParsedConnectDescriptor ParseDescription(const Node &root) {
     ParsedConnectDescriptor result;
     // Direct ADDRESS children form one implicit list, placed where the first
     // of them is and governed by the DESCRIPTION's own FAILOVER and
@@ -528,6 +603,7 @@ ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor) {
         config.host = endpoint.host;
         config.port = endpoint.port;
         config.service_name = result.service_name;
+        config.sid = result.sid;
         config.instance_name = result.instance_name;
         config.protocol = endpoint.protocol;
         ValidateConnectionConfig(config);

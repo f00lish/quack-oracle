@@ -205,13 +205,13 @@ CREATE TEMPORARY SECRET oracle_descriptor_list (
     TYPE oracle,
     USER 'scott',
     PASSWORD 'tiger',
-    CONNECT_DESCRIPTOR '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc))))'
+    CONNECT_DESCRIPTOR '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db2.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=other))))'
 );
 
 statement error
 SELECT * FROM oracle_query('oracle_descriptor_list', 'SELECT 1 FROM dual');
 ----
-DESCRIPTION_LIST is not supported
+different databases
 
 # Isolated Oracle DML owns and commits its native session, so it cannot be
 # presented as part of a DuckDB transaction.

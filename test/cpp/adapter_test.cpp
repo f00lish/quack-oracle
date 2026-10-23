@@ -2759,8 +2759,9 @@ void TestConnectDescriptorSecretReachesTheSession() {
             "(ADDRESS=(HOST=a.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))'",
             "CONNECT_TIMEOUT disagrees with the CONNECT_DESCRIPTOR TRANSPORT_CONNECT_TIMEOUT");
     refused("CONNECT_DESCRIPTOR '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))"
-            "(CONNECT_DATA=(SERVICE_NAME=svc))))'",
-            "DESCRIPTION_LIST is not supported");
+            "(CONNECT_DATA=(SERVICE_NAME=svc)))(DESCRIPTION=(ADDRESS=(HOST=b)(PORT=1))"
+            "(CONNECT_DATA=(SERVICE_NAME=other))))'",
+            "different databases");
     refused("CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=svc)"
             "(FAILOVER_MODE=(TYPE=select))))'",
             "FAILOVER_MODE (TAF) is not supported");
@@ -2811,6 +2812,26 @@ void TestDsnSecretReachesTheSession() {
         addresses += list.addresses.size();
     }
     CHECK(addresses == 2);
+
+    // A SID names the database the older way, from a secret or a descriptor; a
+    // list of descriptions that name one database is read as its addresses.
+    CHECK(!query("HOST 'h.example', SID 'orcl'")->HasError());
+    CHECK(configs->back().sid == "orcl" && configs->back().service_name.empty());
+    CHECK(!query("DSN '(DESCRIPTION=(ADDRESS=(HOST=a.example)(PORT=1521))(CONNECT_DATA=(SID=orcl2)))'")->HasError());
+    CHECK(configs->back().sid == "orcl2" && configs->back().service_name.empty());
+    CHECK(!query("DSN '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=p.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))"
+                 "(DESCRIPTION=(ADDRESS=(HOST=q.example)(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=svc))))'")
+               ->HasError());
+    CHECK(configs->back().service_name == "svc" && configs->back().routing.address_lists.size() == 2);
+    {
+        // A missing name is a refusal that says so, not an internal error.
+        auto neither = query("HOST 'h.example'");
+        CHECK(neither->HasError() && neither->GetError().find("requires a non-empty service_name") != std::string::npos);
+    }
+    {
+        auto both = query("HOST 'h.example', SERVICE_NAME 'svc', SID 'orcl'");
+        CHECK(both->HasError() && both->GetError().find("both SERVICE_NAME and SID") != std::string::npos);
+    }
 
     // Session attributes ride on the secret.
     CHECK(!query("DSN 'a.example/svc', MODULE 'etl', ACTION 'load', CLIENT_IDENTIFIER 'u1', CLIENT_INFO 'run 7'")->HasError());

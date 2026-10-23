@@ -21,7 +21,7 @@ namespace duckdb {
 namespace {
 
 std::string RequireString(const KeyValueSecret &secret, const char *key) {
-    const auto value = secret.TryGetValue(key, true);
+    const auto value = secret.TryGetValue(key);
     if (value.IsNull() || value.ToString().empty()) {
         throw BinderException("Oracle secret requires a non-empty %s", key);
     }
@@ -105,7 +105,7 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
     // a descriptor, an Easy Connect string and an alias). Exactly one, so no
     // setting is ever silently overridden by another.
     const bool names_host = !OptionalString(*secret, "host").empty() ||
-                            !OptionalString(*secret, "service_name").empty() || !secret->TryGetValue("port").IsNull();
+                            !OptionalString(*secret, "service_name").empty() || !OptionalString(*secret, "sid").empty() || !secret->TryGetValue("port").IsNull();
     if (!protocol.IsNull() && StringUtil::Lower(protocol.ToString()) != "tcp" &&
         StringUtil::Lower(protocol.ToString()) != "tcps") {
         throw BinderException("Oracle secret PROTOCOL must be 'tcp' or 'tcps'");
@@ -183,6 +183,7 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
                 config.connect_timeout_seconds = *parsed.transport_connect_timeout_seconds;
             }
             config.service_name = parsed.service_name;
+            config.sid = parsed.sid;
             config.instance_name = parsed.instance_name;
             config.server_type = parsed.server_type;
             config.protocol = oracle_scanner::TransportProtocol::TCP;
@@ -219,7 +220,15 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
         }
     } else {
         config.host = RequireString(*secret, "host");
-        config.service_name = RequireString(*secret, "service_name");
+        const auto sid = OptionalString(*secret, "sid");
+        if (!sid.empty() && !OptionalString(*secret, "service_name").empty()) {
+            throw BinderException("Oracle secret names both SERVICE_NAME and SID");
+        }
+        if (sid.empty()) {
+            config.service_name = RequireString(*secret, "service_name");
+        } else {
+            config.sid = sid;
+        }
         const auto port = OptionalUInt(*secret, "port", 1521);
         if (port == 0 || port > 65535) {
             throw BinderException("Oracle secret '%s' has an invalid port", secret_name);

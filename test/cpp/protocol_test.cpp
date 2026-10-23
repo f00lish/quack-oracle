@@ -3988,10 +3988,13 @@ static void TestDescriptorRoutingParameters() {
 
     // What would silently change meaning is refused by name.
     const std::vector<std::string> unsupported {
-        "(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s))))",
+        "(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))"
+        "(DESCRIPTION=(ADDRESS=(HOST=b)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=other))))",
+        "(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))"
+        "(DESCRIPTION=(ADDRESS=(HOST=b)(PORT=1))(CONNECT_DATA=(SID=s))))",
+        "(DESCRIPTION_LIST=(MYSTERY=1)(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s))))",
         "(DESCRIPTION=(SOURCE_ROUTE=on)(ADDRESS=(HOST=a)(PORT=1))(ADDRESS=(HOST=b)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(FAILOVER_MODE=(TYPE=select)(METHOD=basic))))",
-        "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SID=orcl)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(SERVER=pooled)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1)(HTTPS_PROXY=proxy))(CONNECT_DATA=(SERVICE_NAME=s)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(UR=A)))",
@@ -4002,6 +4005,22 @@ static void TestDescriptorRoutingParameters() {
     for (const auto &descriptor : unsupported) {
         ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)ParseConnectDescriptor(descriptor); });
     }
+    // A SID names the database the older way; a descriptor has one of the two.
+    const auto by_sid = ParseConnectDescriptor("(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SID=orcl)))");
+    CHECK(by_sid.sid == "orcl" && by_sid.service_name.empty());
+    ExpectError(ProtocolErrorKind::MALFORMED, [] {
+        (void)ParseConnectDescriptor("(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SID=a)(SERVICE_NAME=b)))");
+    });
+    // A list of descriptions that name one database is read as their addresses in order.
+    const auto listed = ParseConnectDescriptor(
+        "(DESCRIPTION_LIST=(FAILOVER=on)(LOAD_BALANCE=off)"
+        "(DESCRIPTION=(CONNECT_TIMEOUT=7)(ADDRESS_LIST=(ADDRESS=(HOST=a)(PORT=1))(ADDRESS=(HOST=b)(PORT=2)))"
+        "(CONNECT_DATA=(SERVICE_NAME=s)))"
+        "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=c)(PORT=3))(CONNECT_DATA=(SERVICE_NAME=s))))");
+    CHECK(listed.service_name == "s" && listed.endpoints.size() == 3 && listed.address_lists.size() == 2 &&
+          listed.endpoints[2].host == "c" && listed.endpoints[2].port == 3 && *listed.connect_timeout_seconds == 7);
+    CHECK(listed.failover && !listed.load_balance);
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ParseConnectDescriptor("(DESCRIPTION_LIST=)"); });
     const std::vector<std::string> malformed {
         "(DESCRIPTION=(FAILOVER=on)(FAILOVER=off)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
         "(DESCRIPTION=(FAILOVER=maybe)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",

@@ -114,6 +114,7 @@ CREATE SECRET ora (
 | `DSN` | One string, read as a full `(DESCRIPTION=...)` if it starts with `(`, as an Easy Connect string if it names a host or service (`host:port/service`), and otherwise as an alias |
 | `TNS_ALIAS` | An alias resolved from `tnsnames.ora` in `CONFIG_DIR`, or else inside the `WALLET_FILE` |
 | `MODULE`, `ACTION`, `CLIENT_IDENTIFIER`, `CLIENT_INFO` | End-to-end attributes sent once as the session opens, the way python-oracledb's `module`, `action`, `client_identifier` and `clientinfo` are, so a DBA sees which DuckDB job a session belongs to. Longer than 48, 32, 64 and 64 bytes is refused |
+| `SID` | The database by SID instead of `SERVICE_NAME` (one of the two, not both); also `(CONNECT_DATA=(SID=...))` in a descriptor |
 | `CONFIG_DIR` | A folder holding `tnsnames.ora`, or that file itself, for `TNS_ALIAS` or an alias given as `DSN` |
 | `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` inline; no wallet needed |
 | `USER`, `PASSWORD` | Credentials |
@@ -164,8 +165,8 @@ percent-decoded, and a service name is required.
   protocol disagrees with `PROTOCOL`; a `TRANSPORT_CONNECT_TIMEOUT` that
   disagrees with the secret's `CONNECT_TIMEOUT`.
 - Descriptor settings whose meaning this client would silently drop:
-  `DESCRIPTION_LIST`, `FAILOVER_MODE` (TAF), `SOURCE_ROUTE=ON`, `SID`,
-  `SERVER=POOLED`, `HTTPS_PROXY`, a millisecond timeout, and any key it does
+  a `DESCRIPTION_LIST` whose descriptions name different databases,
+  `FAILOVER_MODE` (TAF), `SOURCE_ROUTE=ON`, `SERVER=POOLED`, `HTTPS_PROXY`, a millisecond timeout, and any key it does
   not know. (`ENABLE`, `EXPIRE_TIME`, `SDU`, `TDU`, `SEND_BUF_SIZE`,
   `RECV_BUF_SIZE`, `TYPE_OF_SERVICE`, `USE_SNI` are accepted and ignored.)
 - A listener redirect that changes the protocol — TCPS is never sent to TCP.

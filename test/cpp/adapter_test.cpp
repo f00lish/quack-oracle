@@ -2812,6 +2812,15 @@ void TestDsnSecretReachesTheSession() {
     }
     CHECK(addresses == 2);
 
+    // Session attributes ride on the secret.
+    CHECK(!query("DSN 'a.example/svc', MODULE 'etl', ACTION 'load', CLIENT_IDENTIFIER 'u1', CLIENT_INFO 'run 7'")->HasError());
+    CHECK(configs->back().module == "etl" && configs->back().action == "load" &&
+          configs->back().client_identifier == "u1" && configs->back().client_info == "run 7");
+    {
+        auto too_long = query("DSN 'a.example/svc', ACTION '" + std::string(33, 'x') + "'");
+        CHECK(too_long->HasError() && too_long->GetError().find("ACTION is longer than 32 bytes") != std::string::npos);
+    }
+
     // tcps:// selects TLS the way a TCPS descriptor does.
     CHECK(!query("DSN 'tcps://secure.example:2484/svc', TLS_SERVER_NAME 'cert.example'")->HasError());
     CHECK(configs->back().protocol == oracle_scanner::TransportProtocol::TCPS &&

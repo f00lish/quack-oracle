@@ -8157,6 +8157,49 @@ static void TestTemporaryLobScope() {
     std::cout << "temporary LOB scope converts, chunks and releases" << std::endl;
 }
 
+// Session attributes travel as a piggyback in front of the next call, in the
+// shape python-oracledb Thin 4.0.1 sends when `module`, `action`,
+// `client_identifier` or `clientinfo` is set (see PROVENANCE.md).
+static void TestEndToEndAttributesMatchPython() {
+    const std::vector<uint8_t> python_end_to_end_module {
+        0x11, 0x87, 0x03, 0x00, 0x00, 0x00, 0x01, 0x18, 0x00, 0x00, 0x01, 0x01,
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x6d,
+    };
+    const std::vector<uint8_t> python_end_to_end_all {
+        0x11, 0x87, 0x03, 0x00, 0x00, 0x00, 0x02, 0x01, 0x19, 0x01, 0x01, 0x03,
+        0x01, 0x01, 0x02, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x63, 0x63, 0x63, 0x02,
+        0x6d, 0x6d, 0x03, 0x61, 0x61, 0x61, 0x04, 0x69, 0x69, 0x69, 0x69,
+    };
+    const std::vector<uint8_t> python_end_to_end_client_info {
+        0x11, 0x87, 0x03, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x69, 0x6e, 0x66, 0x6f,
+    };
+    const auto without_token = [](std::vector<uint8_t> bytes) {
+        bytes.erase(bytes.begin() + 3);
+        return bytes;
+    };
+    TtcEndToEndAttributes module_only;
+    module_only.module = "m";
+    CHECK(EncodeTtcEndToEndPiggyback(3, module_only) == without_token(python_end_to_end_module));
+    TtcEndToEndAttributes everything;
+    everything.client_identifier = "ccc";
+    everything.module = "mm";
+    everything.action = "aaa";
+    everything.client_info = "iiii";
+    CHECK(EncodeTtcEndToEndPiggyback(3, everything) == without_token(python_end_to_end_all));
+    TtcEndToEndAttributes info_only;
+    info_only.client_info = "info";
+    CHECK(EncodeTtcEndToEndPiggyback(3, info_only) == without_token(python_end_to_end_client_info));
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EncodeTtcEndToEndPiggyback(1, TtcEndToEndAttributes()); });
+    TtcEndToEndAttributes too_long;
+    too_long.action = std::string(33, 'x');
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)EncodeTtcEndToEndPiggyback(1, too_long); });
+    std::cout << "end-to-end attributes match python-oracledb's" << std::endl;
+}
+
 // A VECTOR is written as its image in a locator, as python-oracledb Thin does,
 // and keeps its place among the binds when the statement has short ones after it.
 static void TestVectorBindsMatchPython() {
@@ -8368,6 +8411,7 @@ int main() {
     TestRequestHeadersCarryATokenFromFieldVersion18();
     TestTemporaryLobsMatchPython();
     TestTemporaryLobScope();
+    TestEndToEndAttributesMatchPython();
     TestVectorBindsMatchPython();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();

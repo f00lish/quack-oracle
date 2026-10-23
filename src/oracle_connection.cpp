@@ -7,6 +7,7 @@
 #include "oracle_io_deadline.hpp"
 
 #include "oracle_scanner/descriptor_parser.hpp"
+#include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -63,6 +64,21 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
     config.user = RequireString(*secret, "user");
     password = RequireString(*secret, "password");
     config.connect_timeout_seconds = OptionalUInt(*secret, "connect_timeout", 10);
+    config.client_identifier = OptionalString(*secret, "client_identifier");
+    config.module = OptionalString(*secret, "module");
+    config.action = OptionalString(*secret, "action");
+    config.client_info = OptionalString(*secret, "client_info");
+    // Oracle's limits, in bytes, checked here so a long value is refused when
+    // the secret is used rather than truncated by the server.
+    const auto limited = [&](const std::string &value, size_t maximum, const char *name) {
+        if (value.size() > maximum) {
+            throw BinderException("Oracle secret %s is longer than %llu bytes", name, static_cast<uint64_t>(maximum));
+        }
+    };
+    limited(config.client_identifier, oracle_scanner::TTC_CLIENT_IDENTIFIER_MAXIMUM, "CLIENT_IDENTIFIER");
+    limited(config.module, oracle_scanner::TTC_MODULE_MAXIMUM, "MODULE");
+    limited(config.action, oracle_scanner::TTC_ACTION_MAXIMUM, "ACTION");
+    limited(config.client_info, oracle_scanner::TTC_CLIENT_INFO_MAXIMUM, "CLIENT_INFO");
     // An interrupted query stops a connect that is still working through
     // addresses and retries. Held weakly: this config outlives the statement
     // in bind data and pools, and must never keep a context alive.

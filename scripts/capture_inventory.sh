@@ -88,6 +88,9 @@ captures = [
     ("python_lob_write_response", "test/cpp/protocol_test.cpp", "python_lob_write_response"),
     ("python_lob_free_piggyback", "test/cpp/protocol_test.cpp", "python_lob_free_piggyback"),
     ("python_lob_locator_binds", "test/cpp/protocol_test.cpp", "python_lob_locator_binds"),
+    ("python_end_to_end_module", "test/cpp/protocol_test.cpp", "python_end_to_end_module"),
+    ("python_end_to_end_all", "test/cpp/protocol_test.cpp", "python_end_to_end_all"),
+    ("python_end_to_end_client_info", "test/cpp/protocol_test.cpp", "python_end_to_end_client_info"),
 ]
 
 for name, path, identifier in captures:

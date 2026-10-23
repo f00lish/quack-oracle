@@ -294,6 +294,7 @@ that would promise otherwise are refused by name rather than ignored:
 | `PROTOCOL` | `tcp` (the default) or `tcps` for TLS |
 | `DSN` | One string in python-oracledb's forms: an Easy Connect string (`tcps://host:2484/service?retry_count=3`), a full `(DESCRIPTION=...)`, or an alias name. Use *instead of* HOST/PORT/SERVICE_NAME. See [CAPABILITIES](docs/CAPABILITIES.md) for the Easy Connect parameters |
 | `TNS_ALIAS` | An alias from the `tnsnames.ora` in `CONFIG_DIR`, or else inside the wallet — use *instead of* HOST/PORT/SERVICE_NAME |
+| `MODULE`, `ACTION`, `CLIENT_IDENTIFIER`, `CLIENT_INFO` | Session attributes Oracle shows in `V$SESSION` and `SYS_CONTEXT('USERENV', ...)`, set when each session opens (limits 48, 32, 64 and 64 bytes). Setting a module clears the action unless one is given |
 | `CONFIG_DIR` | A folder holding `tnsnames.ora` (or that file) for `TNS_ALIAS`, or for an alias given as `DSN`. Without it, the wallet, then the `TNS_ADMIN` environment variable |
 | `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` given inline — use *instead of* HOST/PORT/SERVICE_NAME and TNS_ALIAS. See [Several addresses and listener redirects](#several-addresses-and-listener-redirects) |
 | `WALLET_FILE` | A cloud wallet ZIP, an unpacked wallet folder, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |

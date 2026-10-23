@@ -329,6 +329,25 @@ std::unique_ptr<NativeOracleSession> NativeOracleSession::Connect(const Connecti
     connection->AuthenticateO5Logon(config.user, password);
     auto session = std::unique_ptr<NativeOracleSession>(new NativeOracleSession(std::move(connection)));
     session->deadline_binding = config.io_deadline_binding;
+    TtcEndToEndAttributes attributes;
+    if (!config.client_identifier.empty()) {
+        attributes.client_identifier = config.client_identifier;
+    }
+    if (!config.module.empty()) {
+        attributes.module = config.module;
+    }
+    if (!config.action.empty()) {
+        attributes.action = config.action;
+    }
+    if (!config.client_info.empty()) {
+        attributes.client_info = config.client_info;
+    }
+    if (!attributes.Empty()) {
+        // Sent at once, in front of a ping, so the first statement does not
+        // have to find the server's report of it in its own response.
+        session->connection->Ttc().QueueEndToEndAttributes(attributes);
+        session->connection->Ttc().Ping(session->NextSequence(), session->connection->TtcServerFieldVersion());
+    }
     return session;
 }
 

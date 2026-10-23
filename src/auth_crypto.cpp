@@ -12,6 +12,7 @@
 #include <openssl/sha.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <limits>
 #include <memory>
@@ -322,7 +323,7 @@ std::vector<uint8_t> StripPkcs5(const std::vector<uint8_t> &value) {
             return value;
         }
     }
-    return std::vector<uint8_t>(value.begin(), value.end() - count);
+    return std::vector<uint8_t>(value.begin(), value.end() - static_cast<std::ptrdiff_t>(count));
 }
 
 } // namespace

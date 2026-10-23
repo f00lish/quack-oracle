@@ -470,6 +470,16 @@ table. Few keys go as an `IN` list; more as the ranges of the key they fall in
 describes only as a bloom filter is applied locally. It needs a numeric key and is
 only ever a narrowing: DuckDB still checks every row against the join.
 
+**Join keys.** When one side of a join is an attached table, DuckDB sends the other side's keys to
+the scan once they are known; they reach Oracle as `IN` lists (numbers also as `BETWEEN` ranges),
+so a small build side reads a few rows instead of the table. Text keys of `VARCHAR2` columns work
+the same way, because equality does not depend on collation. DuckDB builds an `IN` list only up to
+its own `dynamic_or_filter_threshold` (50 by default); `SET dynamic_or_filter_threshold = 5000`
+lets a larger build side through, and a list over Oracle's 1000-entry limit is sent as several
+lists joined by `OR`, up to 16384 values (more than that is read unfiltered, as before). A
+composite key is filtered column by column, never as a tuple, since DuckDB hands the scan one
+filter per column.
+
 **Top-N.** `SELECT … FROM o.SALES WHERE … ORDER BY amount DESC LIMIT 100` is ranked by
 Oracle (`ORDER BY "AMOUNT" DESC NULLS LAST FETCH FIRST 100 ROWS ONLY`), so 100 rows
 travel, not the table; the `TOP_N` stays in DuckDB's plan and sorts what came back, so

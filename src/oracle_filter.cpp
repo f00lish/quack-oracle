@@ -36,6 +36,8 @@ namespace {
 // Oracle refuses an expression list longer than 1,000 entries, so a longer one
 // could not be sent even if every value were provable.
 constexpr size_t MAX_IN_LIST_VALUES = 1000;
+// How many values an IN list may carry in all, as several lists of the size above.
+constexpr size_t MAX_IN_VALUES = 16384;
 
 [[noreturn]] void Refuse(const std::string &reason) {
     throw NotImplementedException(
@@ -329,18 +331,30 @@ std::string TranslateExpression(const Expression &expression, const OracleColumn
                 Refuse("an empty IN list");
             }
             RequireColumnReference(*children[0]);
-            if (children.size() - 1 > MAX_IN_LIST_VALUES) {
-                // Oracle's own limit on an expression list is 1000.
-                Refuse("an IN list longer than " + std::to_string(MAX_IN_LIST_VALUES) + " values");
+            if (children.size() - 1 > MAX_IN_VALUES) {
+                Refuse("an IN list longer than " + std::to_string(MAX_IN_VALUES) + " values");
             }
+            // Oracle refuses more than 1000 entries in one list, so a longer one is
+            // sent as a disjunction of lists, which is the same predicate.
+            std::string result;
             std::string list;
-            for (size_t index = 1; index < children.size(); index++) {
-                if (!list.empty()) {
-                    list += ", ";
+            size_t in_list = 0;
+            const auto flush = [&] {
+                if (in_list > 0) {
+                    result += (result.empty() ? "" : " OR ") + quoted_name + " IN (" + list + ")";
                 }
-                list += OracleLiteral(RequireConstant(*children[index]), column);
+                list.clear();
+                in_list = 0;
+            };
+            for (size_t index = 1; index < children.size(); index++) {
+                if (in_list == MAX_IN_LIST_VALUES) {
+                    flush();
+                }
+                list += (in_list == 0 ? "" : ", ") + OracleLiteral(RequireConstant(*children[index]), column);
+                in_list++;
             }
-            return quoted_name + " IN (" + list + ")";
+            flush();
+            return children.size() - 1 > MAX_IN_LIST_VALUES ? "(" + result + ")" : result;
         }
         default:
             Refuse("operator " + ExpressionTypeToString(op.GetExpressionType()));

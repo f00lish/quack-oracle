@@ -2555,6 +2555,14 @@ void TestJoinKeysReachOracle() {
     CHECK(script->queries.back().find("GROUP BY \"ID\"") != std::string::npos &&
           script->queries.back().find("SUM(\"ID\")") != std::string::npos &&
           script->queries.back().find("WHERE \"ID\" > 5") != std::string::npos);
+    // An IN list over Oracle's 1000-entry limit is sent as several lists joined by OR.
+    std::string many_keys = "SELECT ID FROM o.main.FACTS WHERE ID IN (1";
+    for (int key = 3; key < 5000; key += 2) {
+        many_keys += ", " + std::to_string(key);
+    }
+    CHECK(!database.Query(many_keys + ");")->HasError());
+    CHECK(script->queries.back().find("\"ID\" IN (") != std::string::npos &&
+          script->queries.back().find(") OR \"ID\" IN (") != std::string::npos);
     // An inner join of two attached tables is one statement, each side an inline view with its own filters.
     database.Run("SET oracle_join_pushdown = true;");
     script->routes.insert(script->routes.begin(),

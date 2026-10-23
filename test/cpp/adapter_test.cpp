@@ -2332,6 +2332,55 @@ void TestFunctionsCanReturnARefCursor() {
     std::cout << "functions can return a REF CURSOR" << std::endl;
 }
 
+// The shard boundaries are computed without overflow whatever the key range:
+// each shard starts where the one before it ended, the first at the minimum and
+// the last at the maximum, so nothing is lost or read twice.
+void TestParallelScanRangesDoNotOverflow() {
+    struct Case {
+        const char *low;
+        const char *high;
+        int shards;
+    };
+    const Case cases[] = {{"-9223372036854775808", "9223372036854775807", 4},
+                          {"-9223372036854775808", "9223372036854775807", 7},
+                          {"-9000000000000000000", "9000000000000000000", 32},
+                          {"0", "1000000000000000000", 32},
+                          {"5", "5", 4},
+                          {"5", "7", 8},
+                          {"-3", "3", 3}};
+    for (const auto &item : cases) {
+        auto script = std::make_shared<FakeScript>();
+        script->routes.push_back({"get_system_change_number", {{Column("SCN", 2)}, {{Number("1")}}}});
+        script->routes.push_back({"WHERE 1 = 0", {{Column("ID", 2, 18, 0)}, {}}});
+        script->routes.push_back({"MIN(", {{Column("LO", 2), Column("HI", 2), Column("NULLS", 2)},
+                                           {{Number(item.low), Number(item.high), Number("0")}}}});
+        script->tables["ITEMS"] = {{Column("ID", 2, 18, 0)}, {{Number("1")}}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        CHECK(!database.Query("SELECT count(*) FROM oracle_scan_parallel('ora', 'items', 'id', shards => " +
+                              std::to_string(item.shards) + ");")
+                   ->HasError());
+        std::vector<std::pair<long long, long long>> ranges;
+        for (const auto &statement : script->queries) {
+            const auto low_at = statement.find("\"ID\" >= ");
+            const auto high_at = statement.find("\"ID\" <= ");
+            if (statement.find("AS OF SCN") != std::string::npos && low_at != std::string::npos && high_at != std::string::npos) {
+                ranges.emplace_back(std::stoll(statement.substr(low_at + 8)), std::stoll(statement.substr(high_at + 8)));
+            }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        CHECK(!ranges.empty());
+        CHECK(ranges.front().first == std::stoll(item.low) && ranges.back().second == std::stoll(item.high));
+        for (size_t index = 0; index < ranges.size(); index++) {
+            CHECK(ranges[index].first <= ranges[index].second);
+            if (index != 0) {
+                CHECK(ranges[index].first == ranges[index - 1].second + 1);
+            }
+        }
+    }
+    std::cout << "parallel scan ranges cover every key once, at the extremes too" << std::endl;
+}
+
 // Sharding a table by key ranges. The parallelism is the easy half; what this
 // pins is the half that would be wrong silently — every shard reading the same
 // snapshot, and the ranges covering every key exactly once.
@@ -3715,6 +3764,7 @@ int main() {
     TestAttachedCatalogNamesTheNewTypes();
     TestJsonAndVectorColumnsThroughSql();
     TestParallelScanShardsOneSnapshot();
+    TestParallelScanRangesDoNotOverflow();
     TestWriteBindsFollowTheOracleColumnType();
     TestCallableSignatureResolution();
     TestAutomaticCallBindsFromTheSignature();

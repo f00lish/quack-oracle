@@ -85,7 +85,7 @@ std::string UnsupportedReason(const std::string &dictionary_type) {
         return "LOB locators are outside this version's boundary";
     }
     if (dictionary_type == "NCHAR" || dictionary_type == "NVARCHAR2") {
-        return "national character set values are UTF-16 on the wire and are not decoded";
+        return "NCHAR and NVARCHAR2 arguments cannot be bound in this version, though columns of those types are read and written";
     }
     if (dictionary_type == "OBJECT" || dictionary_type == "TABLE" || dictionary_type == "VARRAY" ||
         dictionary_type == "PL/SQL RECORD" || dictionary_type == "PL/SQL TABLE" ||
@@ -93,10 +93,10 @@ std::string UnsupportedReason(const std::string &dictionary_type) {
         return "object, record and collection types are outside this version's boundary";
     }
     if (dictionary_type == "PL/SQL BOOLEAN") {
-        return "PL/SQL BOOLEAN has no SQL wire representation";
+        return "a PL/SQL BOOLEAN has no SQL type to bind it as; a SQL BOOLEAN column is read and written, but a procedure argument is not";
     }
     if (dictionary_type.rfind("INTERVAL", 0) == 0) {
-        return "INTERVAL values have no decoder yet";
+        return "INTERVAL arguments cannot be bound in this version, though columns of those types are read and written";
     }
     if (dictionary_type.rfind("TIMESTAMP WITH", 0) == 0) {
         // The column policy reads TIMESTAMP WITH TIME ZONE, but a bind also has

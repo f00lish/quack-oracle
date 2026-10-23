@@ -128,12 +128,18 @@
 using namespace oracle_scanner;
 using namespace duckdb_miniz;
 
+static int g_expect_error_counter = 0;
+
 template <class FUNCTION>
 static void ExpectError(ProtocolErrorKind kind, FUNCTION function) {
+    const int call_id = ++g_expect_error_counter;
+    std::cerr << "[expect-error] #" << call_id << " kind=" << static_cast<int>(kind) << std::endl;
     try {
         function();
+        std::cerr << "[expect-error] #" << call_id << " DID NOT RAISE" << std::endl;
         CHECK(false && "expected ProtocolError");
     } catch (const ProtocolError &error) {
+        std::cerr << "[expect-error] #" << call_id << " raised kind=" << static_cast<int>(error.Kind()) << std::endl;
         CHECK(error.Kind() == kind);
     }
 }

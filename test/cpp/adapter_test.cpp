@@ -627,6 +627,10 @@ struct TestDatabase {
     }
 
     std::unique_ptr<MaterializedQueryResult> Query(const std::string &sql) {
+        // ORACLE_TEST_TRACE=1 names each statement before it runs, so a hang says where.
+        if (std::getenv("ORACLE_TEST_TRACE")) {
+            std::cout << "  > " << sql.substr(0, 160) << std::endl;
+        }
         return std::make_unique<MaterializedQueryResult>(con.Query(sql));
     }
 

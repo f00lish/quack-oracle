@@ -15,11 +15,12 @@ constexpr uint32_t MAX_PREFETCH_ROWS = 1U << 20U;
 constexpr uint32_t MAX_BUFFER_BYTES = 16U << 20U;
 constexpr uint32_t OALL8_PARSE = 0x01;
 constexpr uint32_t OALL8_EXECUTE = 0x20;
-// 0x40 means "neither parse nor execute": it asks the server to fetch from an
-// already-open cursor. It is not a fetch request of its own -- a request that
-// both parses and executes must leave this bit clear, and go-ora's option
-// builder only ever sets it when both other bits are clear.
-constexpr uint32_t OALL8_CURSOR_FETCH_ONLY = 0x40;
+// The option word also has a 0x40 bit, and it is not a fetch request of its
+// own: it means "neither parse nor execute", so the server reads the request
+// as a fetch from an already-open cursor. go-ora's option builder only ever
+// sets it when both other bits are clear, so a request that parses and
+// executes must leave it clear. The bit is named here for the reader; no
+// request this file builds sets it.
 constexpr uint32_t OALL8_BIND = 0x08;
 constexpr uint32_t OALL8_NOT_PLSQL = 0x8000;
 constexpr uint32_t OALL8_PLSQL_BIND = 0x400;

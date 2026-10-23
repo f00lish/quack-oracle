@@ -566,7 +566,8 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
         if (!value.type().IsNumeric()) {
             RefuseBind(column, value, "a NUMBER column takes a numeric or decimal-text value");
         }
-        if (type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE) {
+        if ((type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE) &&
+            column.unconstrained_number != OracleColumn::UNCONSTRAINED_DOUBLE) {
             // Going through binary floating point would round the value on its
             // way into an exact decimal column.
             RefuseBind(column, value, "FLOAT and DOUBLE are not exact; cast to DECIMAL or VARCHAR first");

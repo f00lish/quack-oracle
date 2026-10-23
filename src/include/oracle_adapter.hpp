@@ -84,6 +84,18 @@ auto TranslatingOracleErrors(const char *operation, FUNCTION function) -> declty
 LogicalType TypeFor(const OracleColumn &column);
 //! The DuckDB type an Oracle column maps to, with no support check.
 LogicalType MappedType(const OracleColumn &column);
+//! How a NUMBER column is held in DuckDB; see MapNumber in oracle_types.cpp.
+struct NumberMapping {
+	enum Kind { TEXT, BIGINT, DECIMAL, DOUBLE };
+	Kind kind = TEXT;
+	uint8_t width = 0;
+	uint8_t scale = 0;
+};
+NumberMapping MapNumber(const OracleColumn &column);
+//! Stamps the oracle_unconstrained_number setting onto columns that have no
+//! declared precision. Called wherever a statement's or a table's columns are
+//! first described, so the type a column gets is settled once.
+void ApplyUnconstrainedNumberSetting(ClientContext &context, std::vector<OracleColumn> &columns);
 //! Converts one wire value using the column's Oracle type; absent means NULL.
 Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8_t>> &wire);
 //! Stores one wire value in row `row` of a vector of the column's type: the

@@ -280,8 +280,62 @@ struct OracleCloseCallGlobalState final : GlobalTableFunctionState {
 std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const char *function_name);
 std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, const char *function_name);
 
+// The parameter types the attached catalog writes but that have no Oracle
+// counterpart of their own spelling: they go through the one encoder a column
+// write uses, so a value means the same in a query parameter as in an INSERT.
+// Returns false for a type that is not one of them.
+bool ExtraBind(const Value &value, const std::string &name, oracle_scanner::OracleBind &bind) {
+    OracleColumn column;
+    column.name = "parameter " + name;
+    Value effective = value;
+    switch (value.type().id()) {
+    case LogicalTypeId::BOOLEAN:
+        column.oracle_type = 252;
+        break;
+    case LogicalTypeId::INTERVAL: {
+        // Months alone are a year-to-month interval; days and time a day-to-second one.
+        const auto interval = value.GetValue<interval_t>();
+        column.oracle_type = interval.days == 0 && interval.micros == 0 && interval.months != 0 ? 182 : 183;
+        break;
+    }
+    case LogicalTypeId::TIMESTAMP_TZ:
+        // An instant: bound as the TIMESTAMP of its UTC wall time, which the
+        // UTC session turns back into the same instant.
+        column.oracle_type = 231;
+        break;
+    case LogicalTypeId::TIMESTAMP_NS:
+        column.oracle_type = 180;
+        break;
+    case LogicalTypeId::TIMESTAMP_MS:
+    case LogicalTypeId::TIMESTAMP_SEC:
+        column.oracle_type = 180;
+        effective = value.DefaultCastAs(LogicalType::TIMESTAMP);
+        break;
+    case LogicalTypeId::HUGEINT:
+    case LogicalTypeId::UHUGEINT:
+        column.oracle_type = 2;
+        break;
+    default:
+        return false;
+    }
+    bind = OracleBindForColumn(effective, column, name);
+    return true;
+}
+
 std::optional<uint16_t> OracleInputType(LogicalTypeId type) {
     switch (type) {
+    case LogicalTypeId::BOOLEAN:
+        return 252;
+    case LogicalTypeId::INTERVAL:
+        return 183;
+    case LogicalTypeId::TIMESTAMP_TZ:
+    case LogicalTypeId::TIMESTAMP_NS:
+    case LogicalTypeId::TIMESTAMP_MS:
+    case LogicalTypeId::TIMESTAMP_SEC:
+        return 180;
+    case LogicalTypeId::HUGEINT:
+    case LogicalTypeId::UHUGEINT:
+        return 2;
     case LogicalTypeId::VARCHAR:
         return 1;
     case LogicalTypeId::DATE:
@@ -402,6 +456,8 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
                    type == LogicalTypeId::UINTEGER || type == LogicalTypeId::UBIGINT || type == LogicalTypeId::DECIMAL) {
             binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 2, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleNumber(values[index].ToString())});
+        } else if (oracle_scanner::OracleBind extra; ExtraBind(values[index], std::to_string(index + 1), extra)) {
+            binds.push_back(std::move(extra));
         } else {
             throw BinderException("%s parameter %llu has unsupported DuckDB type %s", function_name, index + 1,
                                   values[index].type().ToString());
@@ -486,6 +542,8 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
                                   {year, static_cast<uint8_t>(month), static_cast<uint8_t>(day),
                                    static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(second),
                                   static_cast<uint32_t>(microseconds) * 1000U}, false)});
+        } else if (oracle_scanner::OracleBind extra; ExtraBind(argument, name, extra)) {
+            binds.push_back(std::move(extra));
         } else if (argument.type().IsNumeric()) {
             binds.push_back(oracle_scanner::OracleBind {name, 2, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleNumber(argument.ToString())});
@@ -600,6 +658,7 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     if (result->columns.empty()) {
         throw BinderException("oracle_query received no described Oracle columns");
     }
+    ApplyUnconstrainedNumberSetting(context, result->columns);
     std::unordered_set<std::string> used_names;
     for (idx_t index = 0; index < result->columns.size(); index++) {
         names.push_back(Identifier(OutputName(result->columns[index], index, used_names)));

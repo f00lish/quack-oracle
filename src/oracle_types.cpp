@@ -132,6 +132,42 @@ LogicalType VectorType(const OracleColumn &column) {
     return LogicalType::ARRAY(element, dimensions);
 }
 
+// How a NUMBER column is held in DuckDB. A declared precision and scale give an
+// exact integer or decimal; anything else is text, which never loses a digit,
+// unless the user chose a lossy target for NUMBER with no declared precision
+// (oracle_unconstrained_number).
+NumberMapping MapNumber(const OracleColumn &column) {
+    NumberMapping result;
+    const int precision = column.precision;
+    const int scale = column.scale;
+    if (precision >= 1) {
+        if (scale == 0 && precision <= 18) {
+            result.kind = NumberMapping::BIGINT;
+        } else if (scale < 0 && scale > -128 && precision - scale <= 18) {
+            // NUMBER(10,-2) holds whole numbers rounded to hundreds.
+            result.kind = NumberMapping::BIGINT;
+        } else if (precision <= 38 && scale >= 1 && scale <= precision) {
+            result.kind = NumberMapping::DECIMAL;
+            result.width = static_cast<uint8_t>(precision);
+            result.scale = static_cast<uint8_t>(scale);
+        } else if (scale > precision && scale <= 38) {
+            // NUMBER(2,4) holds 0.0012: four digits after the point, none before.
+            result.kind = NumberMapping::DECIMAL;
+            result.width = static_cast<uint8_t>(scale);
+            result.scale = static_cast<uint8_t>(scale);
+        }
+        return result;
+    }
+    if (column.unconstrained_number == OracleColumn::UNCONSTRAINED_DOUBLE) {
+        result.kind = NumberMapping::DOUBLE;
+    } else if (column.unconstrained_number == OracleColumn::UNCONSTRAINED_DECIMAL) {
+        result.kind = NumberMapping::DECIMAL;
+        result.width = column.unconstrained_precision;
+        result.scale = column.unconstrained_scale;
+    }
+    return result;
+}
+
 LogicalType MappedType(const OracleColumn &column) {
     switch (column.oracle_type) {
     case 119: // JSON
@@ -142,13 +178,16 @@ LogicalType MappedType(const OracleColumn &column) {
         // Only integral NUMBER values with a representable declared precision
         // are widened. Unconstrained and fractional NUMBER stay textual so no
         // Oracle value is rounded or silently narrowed.
-        if (column.scale == 0 && column.precision >= 1 && column.precision <= 18) {
+        switch (const auto mapping = MapNumber(column); mapping.kind) {
+        case NumberMapping::BIGINT:
             return LogicalType::BIGINT;
+        case NumberMapping::DECIMAL:
+            return LogicalType::DECIMAL(mapping.width, mapping.scale);
+        case NumberMapping::DOUBLE:
+            return LogicalType::DOUBLE;
+        default:
+            return LogicalType::VARCHAR;
         }
-        if (column.precision >= 1 && column.precision <= 38 && column.scale >= 1 && column.scale <= column.precision) {
-            return LogicalType::DECIMAL(static_cast<uint8_t>(column.precision), static_cast<uint8_t>(column.scale));
-        }
-        return LogicalType::VARCHAR;
     case 23:  // RAW
     case 24:  // LONG RAW
     case 113: // BLOB
@@ -346,7 +385,8 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
     }
     switch (column.oracle_type) {
     case 2: {
-        if (column.scale == 0 && column.precision >= 1 && column.precision <= 18) {
+        const auto mapping = MapNumber(column);
+        if (mapping.kind == NumberMapping::BIGINT) {
             try {
                 return Value::BIGINT(std::stoll(oracle_scanner::DecodeOracleNumber(*wire)));
             } catch (const std::exception &) {
@@ -354,9 +394,15 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
             }
         }
         const auto number = oracle_scanner::DecodeOracleNumber(*wire);
-        if (column.precision >= 1 && column.precision <= 38 && column.scale >= 1 && column.scale <= column.precision) {
-            return Value(number).DefaultCastAs(
-                LogicalType::DECIMAL(static_cast<uint8_t>(column.precision), static_cast<uint8_t>(column.scale)), true);
+        if (mapping.kind == NumberMapping::DECIMAL) {
+            return Value(number).DefaultCastAs(LogicalType::DECIMAL(mapping.width, mapping.scale), true);
+        }
+        if (mapping.kind == NumberMapping::DOUBLE) {
+            try {
+                return Value::DOUBLE(std::stod(number));
+            } catch (const std::exception &) {
+                throw InvalidInputException("Oracle NUMBER value does not fit a DOUBLE");
+            }
         }
         return Value(number);
     }
@@ -554,9 +600,9 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
         FlatVector::GetDataMutable<string_t>(vector)[row] = StringVector::AddStringOrBlob(vector, data, size);
     };
     switch (column.oracle_type) {
-    case 2:
-        if (type.id() == LogicalTypeId::BIGINT && column.scale == 0 && column.precision >= 1 &&
-            column.precision <= 18) {
+    case 2: {
+        const auto mapping = MapNumber(column);
+        if (type.id() == LogicalTypeId::BIGINT && mapping.kind == NumberMapping::BIGINT) {
             // Most values are whole numbers that fit, and need no text at all.
             if (const auto integer = oracle_scanner::TryDecodeOracleInteger(*wire)) {
                 FlatVector::SetNull(vector, row, false);
@@ -574,10 +620,8 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
             FlatVector::GetDataMutable<int64_t>(vector)[row] = value;
             return;
         }
-        if (type.id() == LogicalTypeId::DECIMAL && column.precision >= 1 && column.precision <= 38 &&
-            column.scale >= 1 && column.scale <= column.precision &&
-            DecimalType::GetWidth(type) == static_cast<uint8_t>(column.precision) &&
-            DecimalType::GetScale(type) == static_cast<uint8_t>(column.scale)) {
+        if (type.id() == LogicalTypeId::DECIMAL && mapping.kind == NumberMapping::DECIMAL &&
+            DecimalType::GetWidth(type) == mapping.width && DecimalType::GetScale(type) == mapping.scale) {
             // The cast DuckDB's VARCHAR-to-DECIMAL conversion runs, called
             // directly; it writes the slot only when it succeeds.
             const auto number = oracle_scanner::DecodeOracleNumber(*wire);
@@ -624,6 +668,7 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
             return;
         }
         break;
+    }
     case 12:
     case 180:
         // A timestamp Value holds no heap data, so building one costs little,

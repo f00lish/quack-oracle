@@ -704,7 +704,8 @@ struct OracleAttachedState {
     // Describes the table from the dictionary and leaves the Oracle statement
     // for init, which is the first point that knows which columns the plan
     // actually reads.
-    unique_ptr<OracleQueryBindData> PrepareScan(const std::string &object_name) const {
+    unique_ptr<OracleQueryBindData> PrepareScan(const std::string &object_name,
+                                                const std::vector<OracleColumn> &entry_columns) const {
         auto result = make_uniq<OracleQueryBindData>();
         result->deferred_scan = true;
         result->config = config;
@@ -712,7 +713,9 @@ struct OracleAttachedState {
         result->object_name = object_name;
         result->schema_name = owner;
         result->secret_name = secret_name;
-        result->columns = TryDescribe(object_name);
+        // The table entry's own columns: they carry the number mapping chosen when
+        // the entry was made, which is the one its DuckDB types were built from.
+        result->columns = entry_columns;
         if (result->columns.empty()) {
             // The catalog entry exists, so the object did when it was created.
             throw IOException("Oracle ATTACH table '%s' no longer has column metadata", object_name);
@@ -750,11 +753,13 @@ public:
         return columns;
     }
 
-    static unique_ptr<OracleAttachedTableEntry> Create(Catalog &catalog, SchemaCatalogEntry &schema,
+    static unique_ptr<OracleAttachedTableEntry> Create(ClientContext &context, Catalog &catalog,
+                                                        SchemaCatalogEntry &schema,
                                                         shared_ptr<OracleAttachedState> state,
                                                         const std::string &requested_name) {
         const auto object_name = state->ResolveObjectName(requested_name);
-        const auto oracle_columns = object_name.empty() ? std::vector<OracleColumn>() : state->TryDescribe(object_name);
+        auto oracle_columns = object_name.empty() ? std::vector<OracleColumn>() : state->TryDescribe(object_name);
+        ApplyUnconstrainedNumberSetting(context, oracle_columns);
         if (oracle_columns.empty()) {
             // Not an object in the attached schema. Returning nothing lets
             // DuckDB carry on resolving the name, which is what its own catalog
@@ -794,7 +799,7 @@ public:
     }
 
     TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
-        auto scan_bind = state->PrepareScan(object_name);
+        auto scan_bind = state->PrepareScan(object_name, oracle_columns);
         scan_bind->table_entry = this;
         scan_bind->catalog_name = static_cast<const std::string &>(catalog.GetAttached().GetName());
         bind_data = std::move(scan_bind);
@@ -892,8 +897,9 @@ public:
     // GetDefaultEntries above enumerates the schema; this answers the different
     // question of whether one particular name is ours, and a null answer means
     // it is not.
-    unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &, const Identifier &entry_name) override {
-        return OracleAttachedTableEntry::Create(catalog, schema, state, static_cast<const std::string &>(entry_name));
+    unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &context, const Identifier &entry_name) override {
+        return OracleAttachedTableEntry::Create(context, catalog, schema, state,
+                                                static_cast<const std::string &>(entry_name));
     }
 
 private:
@@ -1183,6 +1189,9 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         columns[index].precision = dictionary_column.precision;
         columns[index].scale = dictionary_column.scale;
         columns[index].nullable = dictionary_column.nullable;
+        columns[index].unconstrained_number = dictionary_column.unconstrained_number;
+        columns[index].unconstrained_precision = dictionary_column.unconstrained_precision;
+        columns[index].unconstrained_scale = dictionary_column.unconstrained_scale;
         if (dictionary_column.oracle_type == 127) {
             // The table was declared with the dictionary's shape, so that is
             // the shape this scan fills.
@@ -1194,18 +1203,69 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
     }
 }
 
+void ApplyUnconstrainedNumberSetting(ClientContext &context, std::vector<OracleColumn> &columns) {
+	Value setting;
+	if (!context.TryGetCurrentSetting("oracle_unconstrained_number", setting) || setting.IsNull()) {
+		return;
+	}
+	std::string text;
+	for (const auto character : setting.ToString()) {
+		if (character != ' ') {
+			text.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+		}
+	}
+	uint8_t mode = OracleColumn::UNCONSTRAINED_TEXT;
+	uint8_t precision = 0;
+	uint8_t scale = 0;
+	if (text == "varchar" || text == "text" || text.empty()) {
+		return;
+	} else if (text == "double") {
+		mode = OracleColumn::UNCONSTRAINED_DOUBLE;
+	} else if (text.rfind("decimal(", 0) == 0 && text.back() == ')') {
+		const auto comma = text.find(',');
+		try {
+			const auto p = std::stoi(text.substr(8, comma == std::string::npos ? std::string::npos : comma - 8));
+			const auto s = comma == std::string::npos ? 0 : std::stoi(text.substr(comma + 1, text.size() - comma - 2));
+			if (p < 1 || p > 38 || s < 0 || s > p) {
+				throw std::out_of_range("range");
+			}
+			precision = static_cast<uint8_t>(p);
+			scale = static_cast<uint8_t>(s);
+			mode = OracleColumn::UNCONSTRAINED_DECIMAL;
+		} catch (const std::exception &) {
+			throw BinderException("oracle_unconstrained_number: DECIMAL needs 1 <= precision <= 38 and 0 <= scale <= precision");
+		}
+	} else {
+		throw BinderException("oracle_unconstrained_number must be 'varchar', 'double' or 'decimal(precision, scale)', "
+		                      "not '%s'",
+		                      setting.ToString());
+	}
+	for (auto &column : columns) {
+		if (column.oracle_type == 2 && column.precision == 0) {
+			column.unconstrained_number = mode;
+			column.unconstrained_precision = precision;
+			column.unconstrained_scale = scale;
+		}
+	}
+}
+
 void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
-    // Off by default. Once a filter is handed to a scan DuckDB removes it from
-    // the plan, so the scan must apply it exactly; this translator refuses
-    // anything it cannot prove, and refusing would turn working queries into
-    // errors. Opting in is therefore the user's choice, which is also how
-    // DuckDB's own Postgres extension ships its filter pushdown.
+    // On by default. Once a filter is handed to a scan DuckDB removes it from
+    // the plan, so the scan must apply it exactly: the filters this translator
+    // can prove go to Oracle, and the scan applies the rest itself to the rows
+    // Oracle returns.
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_filter_pushdown",
                             "Send WHERE predicates on an attached Oracle table to Oracle. Only filters whose Oracle "
                             "meaning is provably identical are translated; the rest are applied by the scan to the "
                             "rows Oracle returns.",
                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+    DBConfig::GetConfig(loader.GetDatabaseInstance())
+        .AddExtensionOption("oracle_unconstrained_number",
+                            "What a NUMBER with no declared precision (plain NUMBER, SUM(x), count(*)) becomes: "
+                            "'varchar' (the default, exact), 'double', or 'decimal(precision, scale)'. Read when a "
+                            "query is bound or a table is first used; the lossy choices round what does not fit.",
+                            LogicalType::VARCHAR, Value("varchar"));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_transaction_pool_size",
                             "How many idle Oracle sessions an attached catalog keeps between its transactions, so a "

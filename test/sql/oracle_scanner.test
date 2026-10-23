@@ -227,12 +227,12 @@ statement ok
 ROLLBACK;
 
 # Parameter validation happens before a network connection. A STRUCT uses its
-# field names as Oracle bind names; typed NULL is supported, but a NULL BOOLEAN
+# field names as Oracle bind names; typed NULL is supported, but a NULL UUID
 # still has no Oracle wire type on this surface.
 statement error
-SELECT * FROM oracle_query('oracle_test', 'SELECT :n FROM dual', {n: CAST(NULL AS BOOLEAN)});
+SELECT * FROM oracle_query('oracle_test', 'SELECT :n FROM dual', {n: CAST(NULL AS UUID)});
 ----
-Binder Error: oracle_query cannot infer an Oracle type for NULL argument n of type BOOLEAN
+Binder Error: oracle_query cannot infer an Oracle type for NULL argument n of type UUID
 
 # Descriptor validation is local: a malformed direction must fail before any
 # Oracle connection is attempted.

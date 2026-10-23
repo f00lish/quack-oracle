@@ -59,6 +59,13 @@ struct OracleColumn {
     // write binds a CLOB inside XMLTYPE(:n), so the column is only ever text on
     // this side. Never set on a describe.
     bool xml = false;
+    // What a NUMBER with no declared precision becomes in DuckDB, chosen by the
+    // oracle_unconstrained_number setting when the columns are described: text
+    // (the default, which loses nothing), DOUBLE, or a fixed DECIMAL.
+    enum : uint8_t { UNCONSTRAINED_TEXT = 0, UNCONSTRAINED_DOUBLE = 1, UNCONSTRAINED_DECIMAL = 2 };
+    uint8_t unconstrained_number = UNCONSTRAINED_TEXT;
+    uint8_t unconstrained_precision = 0;
+    uint8_t unconstrained_scale = 0;
 };
 
 struct OracleBatch {

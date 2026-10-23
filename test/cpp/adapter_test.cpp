@@ -953,6 +953,99 @@ void TestQueryParametersReachTheSessionAsBinds() {
     CHECK(script->query_binds[1][0].value->empty());
 }
 
+// Parameters of the types an attached INSERT can write reach oracle_query and
+// oracle_execute too, through the same encoder, and a NULL of each says what it is.
+void TestParametersOfEveryWritableType() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const auto binds_of = [&](const std::string &list) {
+        const auto before = script->query_binds.size();
+        auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items WHERE a = :1', " +
+                                     list + ")");
+        CHECK(!result->HasError());
+        CHECK(script->query_binds.size() == before + 1);
+        return script->query_binds.back();
+    };
+    CHECK(binds_of("[true]")[0].oracle_type == 252 &&
+          binds_of("[true]")[0].value == std::vector<uint8_t>({1, 1}));
+    CHECK(binds_of("[INTERVAL 3 DAY]")[0].oracle_type == 183);
+    CHECK(binds_of("[INTERVAL 14 MONTH]")[0].oracle_type == 182);
+    // An instant is bound as the TIMESTAMP of its UTC wall time.
+    const auto instant = binds_of("[TIMESTAMPTZ '2026-01-01 10:00:00+02']")[0];
+    CHECK(instant.oracle_type == 180 && instant.value &&
+          oracle_scanner::DecodeOracleTimestamp(*instant.value).hour == 8);
+    CHECK(binds_of("[TIMESTAMP_NS '2026-01-01 10:00:00.123456789']")[0].oracle_type == 180);
+    CHECK(binds_of("[TIMESTAMP_MS '2026-01-01 10:00:00.5']")[0].oracle_type == 180);
+    CHECK(oracle_scanner::DecodeOracleNumber(*binds_of("[170141183460469231731687303715884105727::HUGEINT]")[0].value) ==
+          "170141183460469231731687303715884105727");
+    CHECK(binds_of("[NULL::HUGEINT]")[0].oracle_type == 2 && !binds_of("[NULL::HUGEINT]")[0].value);
+    CHECK(binds_of("[NULL::BOOLEAN]")[0].oracle_type == 252);
+    CHECK(binds_of("[NULL::INTERVAL]")[0].oracle_type == 183);
+    // Named, as well as positional.
+    auto named = database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items WHERE a = :flag', "
+                                "{flag: false})");
+    CHECK(!named->HasError() && script->query_binds.back()[0].oracle_type == 252);
+    // A month beside days has no single Oracle interval type.
+    auto mixed = database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items WHERE a = :1', "
+                                "[INTERVAL '1 month 2 days'])");
+    CHECK(mixed->HasError() && mixed->GetError().find("cannot hold months") != std::string::npos);
+    auto executed = database.Query("SELECT * FROM oracle_execute('ora', 'UPDATE app.items SET a = :1', [true])");
+    CHECK(!executed->HasError() && script->counted_execute_binds.back()[0].oracle_type == 252);
+    std::cout << "parameters cover BOOLEAN, INTERVAL, TIMESTAMPTZ, TIMESTAMP_NS and HUGEINT" << std::endl;
+}
+
+// How NUMBER is held, by declared precision and scale, and what the
+// oracle_unconstrained_number setting does for the ones with none.
+void TestNumberMappings() {
+    const auto number = [](int16_t precision, int16_t scale) {
+        auto column = Column("N", 2, precision, scale);
+        return duckdb::MappedType(column);
+    };
+    CHECK(number(10, 0) == duckdb::LogicalType::BIGINT && number(18, 0) == duckdb::LogicalType::BIGINT);
+    CHECK(number(19, 0) == duckdb::LogicalType::VARCHAR);
+    // Rounded to hundreds: whole numbers, so an integer.
+    CHECK(number(10, -2) == duckdb::LogicalType::BIGINT && number(16, -2) == duckdb::LogicalType::BIGINT);
+    CHECK(number(17, -2) == duckdb::LogicalType::VARCHAR);
+    CHECK(number(5, 2) == duckdb::LogicalType::DECIMAL(5, 2));
+    // More digits after the point than the precision: 0.0012 is NUMBER(2,4).
+    CHECK(number(2, 4) == duckdb::LogicalType::DECIMAL(4, 4));
+    CHECK(number(1, 38) == duckdb::LogicalType::DECIMAL(38, 38) && number(1, 39) == duckdb::LogicalType::VARCHAR);
+    CHECK(number(0, 0) == duckdb::LogicalType::VARCHAR && number(126, -127) == duckdb::LogicalType::VARCHAR);
+
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("total", 2, 0, 0), Column("price", 2, 8, 2)};
+    script->rows = {{Number("1.5"), Number("3.14")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const auto types = [&] {
+        auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT total, price FROM t')");
+        CHECK(!result->HasError());
+        return std::vector<duckdb::LogicalType> {result->GetTypes()[0], result->GetTypes()[1]};
+    };
+    CHECK(types()[0] == duckdb::LogicalType::VARCHAR);
+    database.Run("SET oracle_unconstrained_number = 'double';");
+    CHECK(types()[0] == duckdb::LogicalType::DOUBLE && types()[1] == duckdb::LogicalType::DECIMAL(8, 2));
+    auto doubled = database.Query("SELECT total FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(!doubled->HasError() && doubled->GetValue(0, 0).GetValue<double>() == 1.5);
+    database.Run("SET oracle_unconstrained_number = 'Decimal(38, 9)';");
+    CHECK(types()[0] == duckdb::LogicalType::DECIMAL(38, 9));
+    auto decimal = database.Query("SELECT total FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(!decimal->HasError() && decimal->GetValue(0, 0).ToString() == "1.500000000");
+    database.Run("SET oracle_unconstrained_number = 'varchar';");
+    CHECK(types()[0] == duckdb::LogicalType::VARCHAR);
+    database.Run("SET oracle_unconstrained_number = 'decimal(40,2)';");
+    auto bad = database.Query("SELECT * FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(bad->HasError() && bad->GetError().find("precision <= 38") != std::string::npos);
+    database.Run("SET oracle_unconstrained_number = 'real';");
+    auto unknown = database.Query("SELECT * FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(unknown->HasError() && unknown->GetError().find("must be 'varchar', 'double'") != std::string::npos);
+    std::cout << "NUMBER maps by precision and scale, and the unconstrained setting picks a type" << std::endl;
+}
+
 // oracle_execute promises Oracle's own SQL%ROWCOUNT, which is the operation the
 // adapter must call — not the plain Execute whose count comes from the DML
 // response.
@@ -4074,6 +4167,8 @@ int main() {
     TestCursorHandlesAreConsumedOnce();
     TestQueryParametersReachTheSessionAsBinds();
     TestExecuteUsesTheCountedOperation();
+    TestParametersOfEveryWritableType();
+    TestNumberMappings();
     TestExecuteRefusesAnExplicitTransaction();
     TestValidationRunsBeforeAnySession();
     TestUnknownSecretIsRejected();

@@ -284,6 +284,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         result->shard_sql.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + key + " IS NULL");
     }
 
+    ApplyUnconstrainedNumberSetting(context, result->columns);
     std::unordered_set<std::string> used_names;
     for (idx_t index = 0; index < result->columns.size(); index++) {
         names.push_back(Identifier(OutputName(result->columns[index], index, used_names)));

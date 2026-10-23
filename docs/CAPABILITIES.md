@@ -269,8 +269,11 @@ homogeneous, so `[1, 'one', DATE '2026-01-02']` cannot even be constructed. A
 | Oracle type | Reads as | Notes |
 | --- | --- | --- |
 | `NUMBER(p,0)`, p ≤ 18 | `BIGINT` | |
+| `NUMBER(p,s)`, s < 0, p − s ≤ 18 | `BIGINT` | Whole numbers rounded to a power of ten, `NUMBER(10,-2)` |
 | `NUMBER(p,s)`, p ≤ 38, 1 ≤ s ≤ p | `DECIMAL(p,s)` | |
-| `NUMBER` otherwise | `VARCHAR` | Unconstrained NUMBER is exact only as text |
+| `NUMBER(p,s)`, s > p, s ≤ 38 | `DECIMAL(s,s)` | Fractions with leading zeros, `NUMBER(2,4)` holds 0.0012 |
+| `NUMBER` with no precision | `VARCHAR`, or what `oracle_unconstrained_number` says | Exact only as text; the setting trades that for `DOUBLE` or a fixed `DECIMAL` |
+| `NUMBER` otherwise | `VARCHAR` | |
 | `VARCHAR2`, `CHAR` | `VARCHAR` | Arrives as UTF-8 whatever the database character set is |
 | `DATE` | `TIMESTAMP` | An Oracle `DATE` carries a time; it is not a DuckDB `DATE` |
 | `TIMESTAMP(n)` | `TIMESTAMP`, or `TIMESTAMP_NS` when n > 6 | |
@@ -650,6 +653,7 @@ their own shard, so nothing is dropped.
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
 | `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
 | `oracle_filter_pushdown` | `true` | See §5. |
+| `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision (plain `NUMBER`, `SUM(x)`, `count(*)`) becomes: `'varchar'` (exact), `'double'`, or `'decimal(p,s)'` such as `'decimal(38,9)'`. Read when a query is bound or a table is first used; the lossy choices round what does not fit, and a DECIMAL that cannot hold a value's integer digits raises. A `DOUBLE` column then accepts `DOUBLE` on write |
 
 Pooling matters more than it looks: opening a session costs a full TNS handshake
 and authentication. Callables through a secret always open their own session;

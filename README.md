@@ -872,6 +872,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
+| `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS
 handshake and an authentication round trip: against a cloud endpoint that was
@@ -884,8 +885,8 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | Oracle | Comes back as | Note |
 | --- | --- | --- |
 | `NUMBER(p,0)`, p ≤ 18 | `BIGINT` | |
-| `NUMBER(p,s)` | `DECIMAL(p,s)` | up to p = 38 |
-| `NUMBER` (unconstrained) | `VARCHAR` | exact only as text |
+| `NUMBER(p,s)` | `DECIMAL(p,s)` | up to p = 38; `NUMBER(p,-s)` is a `BIGINT`, `NUMBER(2,4)` a `DECIMAL(4,4)` |
+| `NUMBER` (unconstrained) | `VARCHAR` | exact only as text; see `oracle_unconstrained_number` below |
 | `VARCHAR2`, `CHAR` | `VARCHAR` | UTF-8, whatever the database character set is |
 | `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE` |
 | `TIMESTAMP(0–6)` | `TIMESTAMP` | |
@@ -939,6 +940,19 @@ errors rather than rounds if a value does not fit. And if the table is yours,
 declaring the column as `NUMBER(p)` or `NUMBER(p,s)` in Oracle is better than
 casting on every read: the extension then maps it to `BIGINT` or `DECIMAL`
 directly, and every client that touches the table gets a real numeric type.
+
+When the table is not yours, or the column is a `SUM(x)` or `count(*)`, say what
+you want once instead of casting in every query:
+
+```sql
+SET oracle_unconstrained_number = 'decimal(38,9)';   -- or 'double'; the default is 'varchar'
+```
+
+It applies to every `NUMBER` that has no declared precision, in `oracle_query`,
+`oracle_scan_parallel` and attached tables, read when the query is bound or the
+table is first used. `'double'` and a `DECIMAL` round what does not fit — digits
+past the scale, or past 15 or 17 significant digits — which is the trade;
+a `DECIMAL` that cannot hold a value's integer digits raises instead.
 
 ⚠️ **LOB columns are expensive.** A `CLOB`/`BLOB` value is not in the row; the
 row carries only a pointer, and fetching the content costs extra round trips per

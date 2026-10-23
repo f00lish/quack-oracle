@@ -10,7 +10,16 @@ namespace {
 
 constexpr size_t CONNECT_FIXED_PAYLOAD_SIZE = 66;
 constexpr size_t CONNECT_HEADER_TOTAL_SIZE = TNS_PACKET_HEADER_SIZE + CONNECT_FIXED_PAYLOAD_SIZE;
-constexpr size_t MAX_INLINE_CONNECT_DATA = 230;
+// Every official Oracle client puts the whole connect descriptor inside the
+// CONNECT packet: ojdbc8 sends 202 bytes inline for a short service name,
+// and sends a longer descriptor inline as well. 230 was a guess at that
+// limit, and it was wrong in the direction that breaks. Past it the
+// descriptor moves to a DATA continuation -- and an 11.2 listener never
+// reads the descriptor from there: it accepts the session and then stops
+// answering, while the very same request sent inline gets a reply. 2048 is
+// the practical inline ceiling; a descriptor past that still uses the
+// continuation, and that case is not supported against 11.2.
+constexpr size_t MAX_INLINE_CONNECT_DATA = 2048;
 
 void StoreUInt16(std::vector<uint8_t> &target, size_t offset, uint16_t value) {
     target[offset] = static_cast<uint8_t>(value >> 8U);

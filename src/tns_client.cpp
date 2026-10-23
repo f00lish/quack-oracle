@@ -685,7 +685,16 @@ std::unique_ptr<TnsClientConnection> TnsClientConnection::Connect(const Connecti
         effective_config.connection_id = Base64Encode(SecureRandomBytes(16));
     }
     if (effective_config.client_program.empty()) {
-        effective_config.client_program = CurrentExecutablePath();
+        // A short product name, the way every official Oracle client names
+        // itself in the connect descriptor (ojdbc sends "JdbcSpy", go-ora
+        // sends "OracleClientGo"). The host executable's path is not that:
+        // loaded inside a JVM it is the JVM's java.exe, a 46-character
+        // absolute path, and the descriptor it produces overflows the inline
+        // connect-data limit in tns_connect.cpp. Past that limit the
+        // descriptor moves to a DATA continuation, and an 11.2 listener never
+        // reads it from there -- it accepts the session and then goes silent,
+        // which is exactly what the 11.2 capture shows.
+        effective_config.client_program = "oracle_scanner";
     }
     ConnectRun run(effective_config, tls);
     auto accepted = run.Run();

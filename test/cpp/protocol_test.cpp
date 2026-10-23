@@ -2101,6 +2101,50 @@ static void TestConnectDescriptor() {
     ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { BuildConnectDescriptor(config); });
 }
 
+static void TestConnectDescriptorStaysInline() {
+    // An 11.2 listener reads the connect descriptor from the CONNECT packet
+    // itself. A descriptor that overflows the inline limit moves to a DATA
+    // continuation, and that listener never looks there: it accepts the
+    // session and then stops answering, while the very same request sent
+    // inline gets a reply. The 11.2 capture is the evidence.
+    ConnectionConfig config;
+    config.host = "127.0.0.1";
+    config.port = 1521;
+    config.service_name = "helowin";
+    config.user = "scott";
+    config.client_program = "oracle_scanner";
+    const auto descriptor = BuildConnectDescriptor(config);
+    const auto packets = BuildTnsConnectPackets(descriptor);
+    // One packet: the descriptor travels inside the CONNECT.
+    CHECK(packets.size() == 1);
+    CHECK(packets[0].type == TnsPacketType::CONNECT);
+    // The payload ends with the whole descriptor.
+    CHECK(packets[0].payload.size() > descriptor.size());
+    const auto tail = packets[0].payload.end() - static_cast<std::ptrdiff_t>(descriptor.size());
+    CHECK(std::string(tail, packets[0].payload.end()) == descriptor);
+    // The header's descriptor length agrees with what is carried.
+    const auto declared = static_cast<size_t>(packets[0].payload[16]) << 8U | static_cast<size_t>(packets[0].payload[17]);
+    CHECK(declared == descriptor.size());
+    // And the packet's own length field agrees with the bytes on the wire.
+    const auto wire = EncodeTnsPacket(packets[0].type, packets[0].flags, packets[0].payload, false);
+    CHECK(wire.size() == 8 + packets[0].payload.size());
+    CHECK((static_cast<size_t>(wire[0]) << 8U | static_cast<size_t>(wire[1])) == wire.size());
+    // The program name is a product name, not the host executable's path: a
+    // 46-character java.exe path is what pushed the descriptor over the old
+    // 230-byte limit in the first place.
+    CHECK(descriptor.find("(PROGRAM=oracle_scanner)") != std::string::npos);
+    // A long host executable path still travels inline -- that is what the
+    // limit is for.
+    config.client_program = "D:\\Program Files\\jdks\\jdk1.8.0_261\\bin\\java.exe";
+    const auto jvm_descriptor = BuildConnectDescriptor(config);
+    CHECK(BuildTnsConnectPackets(jvm_descriptor).size() == 1);
+    // A long service name too, up to the practical inline ceiling.
+    config.service_name = std::string(300, 'S');
+    const auto long_descriptor = BuildConnectDescriptor(config);
+    CHECK(long_descriptor.size() <= 2048);
+    CHECK(BuildTnsConnectPackets(long_descriptor).size() == 1);
+}
+
 static void TestDescriptorParser() {
     auto parsed = ParseConnectDescriptor(
         "(DESCRIPTION=(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCPS)(HOST=db-one.example)(PORT=1522))"
@@ -6876,6 +6920,7 @@ int main() {
     TestTtcNegotiation();
     TestO5LogonFlow();
     TestConnectDescriptor();
+    TestConnectDescriptorStaysInline();
     TestDescriptorParser();
     TestValueCodecs();
     TestAuthCrypto();

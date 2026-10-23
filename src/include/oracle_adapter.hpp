@@ -191,6 +191,18 @@ struct OracleTransactionStatus {
 
 OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const std::string &catalog_name);
 
+//! The heavy columns of a scan whose filter DuckDB applies itself: they are not
+//! fetched with the rows, only for the rows that pass, by ROWID and at the same
+//! change number. `light_vectors[k]` is the output vector of the k-th fetched
+//! column (the ROWID comes after them); `heavy_vectors[h]` that of heavy column h.
+struct OracleDeferredColumns {
+    std::vector<idx_t> light_vectors;
+    std::vector<idx_t> heavy_vectors;
+    std::vector<OracleColumn> heavy_columns;
+    std::string heavy_select; // "ROWIDTOCHAR(ROWID), <heavy columns>"
+    std::string source;       // "<table> AS OF SCN n"
+};
+
 //! One sort key of a Top-N pushed into a scan: a column of the table.
 struct OracleTopNKey {
     column_t column;
@@ -240,6 +252,9 @@ struct OracleQueryBindData final : TableFunctionData {
     //! attached tables that Oracle computes. `columns` and `types` are its result
     //! columns as the plan expects them, declared rather than described.
     bool statement_scan = false;
+    //! A change number every statement of this scan reads at, or empty. Set when the
+    //! scan reads in two steps (see OracleDeferredColumns).
+    std::string flashback_scn;
     std::string statement_sql;
     ConnectionConfig config;
     std::string password;
@@ -271,6 +286,7 @@ struct OracleScanMetrics {
     std::atomic<uint64_t> convert_nanoseconds {0};
     std::atomic<uint64_t> sessions {0};
     std::atomic<uint64_t> chunks_read {0};
+    std::atomic<uint64_t> deferred_rows {0};
     void Add(const OracleIoStats &io) {
         bytes_sent += io.bytes_sent;
         bytes_received += io.bytes_received;
@@ -310,6 +326,8 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     std::string local_filter_text;
     //! The connection's counters when this scan last looked, for the serial scan.
     OracleIoStats last_io;
+    //! Set when heavy columns are fetched for the rows that pass the local filter only.
+    std::unique_ptr<OracleDeferredColumns> deferred;
 
     //! A table read in chunks through several sessions: each thread takes the next
     //! statement and reads it on a session of its own. The session and cursor above
@@ -502,6 +520,11 @@ void RegisterOracleOptimizer(DatabaseInstance &db);
 std::string OracleTopNClause(const OracleQueryBindData &bind);
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input);
+
+void OverlayDictionaryColumn(OracleColumn &described, const OracleColumn &dictionary);
+//! The change number to read a heap table at, or empty when it cannot be pinned
+//! (a view, an index-organized, clustered or temporary table, or no flashback).
+std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryBindData &bind);
 
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,

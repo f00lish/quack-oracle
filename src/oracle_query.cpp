@@ -1,10 +1,15 @@
 #include "oracle_io_deadline.hpp"
+#include <algorithm>
 #include <chrono>
+#include <set>
+#include <unordered_map>
 #include <condition_variable>
 #include <thread>
 #include "oracle_adapter.hpp"
 
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 
 #include "oracle_scanner/auth_crypto.hpp"
@@ -2680,6 +2685,8 @@ std::string OracleSampleClause(optional_ptr<SampleOptions> options, const std::o
 	return clause;
 }
 
+static bool DeferrableColumn(const OracleColumn &column);
+
 // Runs the statement an AGGREGATE was replaced with. The result columns are
 // the plan's contract (declared when the optimizer rewrote it); Oracle's describe
 // supplies the wire representation and has to map to the same types.
@@ -2874,16 +2881,80 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         return std::move(state);
     }
     OracleScanOpening opened;
-    OpenProjectedScan(context, bind, selected, session, cursor, columns, false, &opened);
-    const auto io_after_open = session ? session->IoStats() : OracleIoStats();
+    unique_ptr<OracleDeferredColumns> deferred;
     std::vector<LogicalType> types;
-    types.reserve(columns.size());
-    for (const auto &column : columns) {
-        types.push_back(TypeFor(column));
+    Value defer_setting;
+    // The columns DuckDB's own filter never looks at, and that are heavy, are read
+    // for the rows that pass it and not for every row.
+    if (local_filter && bind.sample_clause.empty() && bind.order_clause.empty() &&
+        (!context.TryGetCurrentSetting("oracle_deferred_columns", defer_setting) || defer_setting.IsNull() ||
+         BooleanValue::Get(defer_setting))) {
+        std::set<idx_t> used;
+        auto probe = local_filter->Copy();
+        ExpressionIterator::EnumerateExpression(probe, [&](unique_ptr<Expression> &node) {
+            if (node->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+                used.insert(node->Cast<BoundReferenceExpression>().Index());
+            }
+        });
+        std::vector<idx_t> heavy;
+        for (idx_t position = 0; position < selected.size(); position++) {
+            if (selected[position] < bind.columns.size() && DeferrableColumn(bind.columns[selected[position]]) &&
+                !used.count(position)) {
+                heavy.push_back(position);
+            }
+        }
+        const auto scn = (heavy.empty() || heavy.size() == selected.size()) ? std::string()
+                                                                              : OracleSnapshotOfHeapTable(context, bind);
+        if (!scn.empty()) {
+            std::vector<column_t> light_selected;
+            auto plan = make_uniq<OracleDeferredColumns>();
+            std::string heavy_list;
+            for (idx_t position = 0; position < selected.size(); position++) {
+                if (std::find(heavy.begin(), heavy.end(), position) == heavy.end()) {
+                    light_selected.push_back(selected[position]);
+                    plan->light_vectors.push_back(position);
+                } else {
+                    plan->heavy_vectors.push_back(position);
+                    plan->heavy_columns.push_back(bind.columns[selected[position]]);
+                    heavy_list += ", " + OracleSelectExpression(bind.columns[selected[position]]);
+                }
+            }
+            light_selected.push_back(COLUMN_IDENTIFIER_ROW_ID);
+            plan->heavy_select = std::string(ORACLE_ROWID_EXPRESSION) + heavy_list;
+            plan->source = OracleObjectReference(bind.schema_name, bind.object_name) + " AS OF SCN " + scn;
+            bind.flashback_scn = scn;
+            try {
+                OpenProjectedScan(context, bind, light_selected, session, cursor, columns, false, &opened);
+                for (idx_t position = 0; position < selected.size(); position++) {
+                    const auto light = std::find(plan->light_vectors.begin(), plan->light_vectors.end(), position);
+                    types.push_back(light == plan->light_vectors.end()
+                                        ? MappedType(bind.columns[selected[position]])
+                                        : TypeFor(columns[light - plan->light_vectors.begin()]));
+                }
+                deferred = std::move(plan);
+            } catch (const std::exception &) {
+                // No flashback on the table, or the snapshot is gone: read it whole.
+                bind.flashback_scn.clear();
+                cursor.reset();
+                session = OracleSessionHandle();
+                columns.clear();
+                opened = OracleScanOpening();
+                types.clear();
+            }
+        }
     }
+    if (!deferred) {
+        OpenProjectedScan(context, bind, selected, session, cursor, columns, false, &opened);
+        types.reserve(columns.size());
+        for (const auto &column : columns) {
+            types.push_back(TypeFor(column));
+        }
+    }
+    const auto io_after_open = session ? session->IoStats() : OracleIoStats();
     auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
                                                    std::move(types), std::move(input.column_ids), chunk_columns);
     state->local_filter = std::move(local_filter);
+    state->deferred = std::move(deferred);
     state->sent_sql = opened.sql;
     state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
     state->metrics.Add(opened.io);
@@ -2926,6 +2997,11 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 	                                           " sent, " + std::to_string(counters.round_trips.load()) + " round trips");
 	metrics.AddExtraInfo("Oracle fetch time", seconds(counters.fetch_nanoseconds.load()));
 	metrics.AddExtraInfo("Value conversion time", seconds(counters.convert_nanoseconds.load()));
+	if (state->deferred) {
+		metrics.AddExtraInfo("Columns read after the filter", std::to_string(state->deferred->heavy_columns.size()) +
+		                                                         ", for " + std::to_string(counters.deferred_rows.load()) +
+		                                                         " rows");
+	}
 	if (!state->local_filter_text.empty()) {
 		metrics.AddExtraInfo("Filters applied after fetching", state->local_filter_text);
 	}
@@ -2935,6 +3011,101 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &, TableFunctionInitInput &,
                                                          GlobalTableFunctionState *) {
     return make_uniq<OracleQueryLocalState>();
+}
+
+static bool DeferrableColumn(const OracleColumn &column) {
+    switch (column.oracle_type) {
+    case 112: // CLOB
+    case 113: // BLOB
+    case 119: // JSON
+    case 127: // VECTOR
+        return true;
+    default:
+        return column.xml;
+    }
+}
+
+std::string RowIdText(const std::optional<std::vector<uint8_t>> &wire) {
+    return wire ? std::string(wire->begin(), wire->end()) : std::string();
+}
+
+// Reads the heavy columns of the rows that passed the filter, by ROWID and at
+// the change number the rows were read at, and writes them into the chunk at the
+// rows' own positions. The rows that did not pass get NULL there; the caller
+// slices them away.
+void FillDeferredColumns(OracleQueryGlobalState &state, DataChunk &output, const oracle_scanner::OracleBatch &batch,
+                         const SelectionVector &selection, idx_t kept) {
+    auto &plan = *state.deferred;
+    const auto rowid_position = plan.light_vectors.size();
+    std::vector<bool> wanted(batch.rows.size(), false);
+    std::unordered_map<std::string, idx_t> row_of;
+    for (idx_t index = 0; index < kept; index++) {
+        const auto row = selection.get_index(index);
+        wanted[row] = true;
+        row_of.emplace(RowIdText(batch.rows[row][rowid_position]), row);
+    }
+    for (idx_t row = 0; row < batch.rows.size(); row++) {
+        if (!wanted[row]) {
+            for (idx_t heavy = 0; heavy < plan.heavy_vectors.size(); heavy++) {
+                WriteOracleValue(output.data[plan.heavy_vectors[heavy]], row, plan.heavy_columns[heavy], std::nullopt);
+            }
+        }
+    }
+    std::vector<std::string> rowids;
+    for (const auto &entry : row_of) {
+        rowids.push_back(entry.first);
+    }
+    size_t found = 0;
+    constexpr size_t ROWIDS_PER_STATEMENT = 500;
+    for (size_t first = 0; first < rowids.size(); first += ROWIDS_PER_STATEMENT) {
+        std::string list;
+        const auto last = MinValue<size_t>(rowids.size(), first + ROWIDS_PER_STATEMENT);
+        for (size_t index = first; index < last; index++) {
+            list += (list.empty() ? "" : ", ") + std::string("CHARTOROWID('") + rowids[index] + "')";
+        }
+        const auto sql = "SELECT " + plan.heavy_select + " FROM " + plan.source + " WHERE ROWID IN (" + list + ")";
+        try {
+            auto cursor = state.session->Query(sql, {});
+            auto described = cursor->Columns();
+            if (described.size() != plan.heavy_columns.size() + 1) {
+                throw IOException("Oracle described %llu columns for a deferred read of %llu",
+                                  static_cast<uint64_t>(described.size()),
+                                  static_cast<uint64_t>(plan.heavy_columns.size() + 1));
+            }
+            for (size_t heavy = 0; heavy < plan.heavy_columns.size(); heavy++) {
+                OverlayDictionaryColumn(described[heavy + 1], plan.heavy_columns[heavy]);
+            }
+            for (;;) {
+                const auto fetched = TranslatingOracleErrors("oracle_query could not fetch from Oracle",
+                                                             [&] { return cursor->Fetch(STANDARD_VECTOR_SIZE); });
+                for (const auto &row : fetched.rows) {
+                    const auto at = row_of.find(RowIdText(row[0]));
+                    if (at == row_of.end()) {
+                        throw IOException("Oracle returned a row that was not asked for in a deferred read");
+                    }
+                    for (size_t heavy = 0; heavy < plan.heavy_columns.size(); heavy++) {
+                        TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
+                            WriteOracleValue(output.data[plan.heavy_vectors[heavy]], at->second, described[heavy + 1],
+                                             row[heavy + 1]);
+                            return true;
+                        });
+                    }
+                    found++;
+                }
+                if (fetched.exhausted) {
+                    break;
+                }
+            }
+        } catch (...) {
+            state.session.Poison();
+            throw;
+        }
+    }
+    if (found != rowids.size()) {
+        throw IOException("Oracle did not return %llu of the %llu rows asked for in a deferred read",
+                          static_cast<uint64_t>(rowids.size() - found), static_cast<uint64_t>(rowids.size()));
+    }
+    state.metrics.deferred_rows += found;
 }
 
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -3029,10 +3200,13 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             if (row.size() != state.columns.size()) {
                 throw InternalException("oracle_query row has a different column count from its describe metadata");
             }
-            for (idx_t vector_index = 0; vector_index < state.chunk_columns; vector_index++) {
+            // A deferred scan fetches only the light columns, then the ROWID.
+            const auto written = state.deferred ? state.deferred->light_vectors.size() : state.chunk_columns;
+            for (idx_t column_index = 0; column_index < written; column_index++) {
+                const auto vector_index = state.deferred ? state.deferred->light_vectors[column_index] : column_index;
                 TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
-                    WriteOracleValue(output.data[vector_index], row_index, state.columns[vector_index],
-                                     row[vector_index]);
+                    WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
+                                     row[column_index]);
                     return true;
                 });
             }
@@ -3056,6 +3230,14 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             ExpressionExecutor executor(context, *state.local_filter);
             SelectionVector selection(STANDARD_VECTOR_SIZE);
             const auto kept = executor.SelectExpression(output, selection);
+            if (state.deferred) {
+                const auto deferred_started = clock_now();
+                FillDeferredColumns(state, output, batch, selection, kept);
+                state.metrics.fetch_nanoseconds += elapsed(deferred_started);
+                const auto io_now = state.session->IoStats();
+                state.metrics.Add(io_now - state.last_io);
+                state.last_io = io_now;
+            }
             if (kept != batch.rows.size()) {
                 output.Slice(selection, kept);
             }

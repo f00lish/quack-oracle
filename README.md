@@ -480,6 +480,17 @@ lists joined by `OR`, up to 16384 values (more than that is read unfiltered, as 
 composite key is filtered column by column, never as a tuple, since DuckDB hands the scan one
 filter per column.
 
+**Heavy columns after the filter.** When a filter has to be applied by DuckDB (one Oracle was not
+sent, such as an ordered comparison of text) and the query also reads CLOB, BLOB, JSON, VECTOR or
+XMLTYPE columns the filter never looks at, the scan reads the other columns plus each row's
+ROWID first, applies the filter, and then fetches the heavy columns only for the rows that passed,
+`WHERE ROWID IN (…)` in groups of 500. Both steps read `AS OF SCN` at one change number, so the second
+sees the rows the first did; a table that cannot be pinned that way (a view, an index-organized,
+clustered or temporary table, no flashback privilege, or a transaction that has written) is read
+the ordinary way. On a 5,000-row table with 8 KB of LOB per row, a filter keeping 900 rows moved
+12.5 MiB instead of 68.9 MiB, with identical results on 19c and 23ai. `EXPLAIN ANALYZE` shows
+*Columns read after the filter*. `SET oracle_deferred_columns = false` turns it off.
+
 **Top-N.** `SELECT … FROM o.SALES WHERE … ORDER BY amount DESC LIMIT 100` is ranked by
 Oracle (`ORDER BY "AMOUNT" DESC NULLS LAST FETCH FIRST 100 ROWS ONLY`), so 100 rows
 travel, not the table; the `TOP_N` stays in DuckDB's plan and sorts what came back, so
@@ -1028,6 +1039,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
+| `oracle_deferred_columns` | `true` | Read LOB/JSON/VECTOR/XML columns only for the rows that pass a filter DuckDB applies itself, by ROWID at one change number |
 | `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (inner join on number, date or timestamp columns) |
 | `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`/`sum`/`min`/`max` with `GROUP BY` over number, date and timestamp keys |
 | `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key; see [section 4](#pushing-filters-down-to-oracle) |

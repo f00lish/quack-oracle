@@ -2356,6 +2356,66 @@ void TestUntranslatableFiltersRunLocally() {
     std::cout << "filters Oracle is not sent are applied locally" << std::endl;
 }
 
+// A CLOB the local filter never looks at is read for the rows that pass the filter,
+// by ROWID and at the change number the rows were read at.
+void TestHeavyColumnsAreReadAfterTheFilter() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("100")}}}});
+    script->routes.push_back({"iot_type", {text_columns({"IOT_TYPE", "TEMPORARY", "CLUSTER_NAME"}), {{WireValue(), Text("N"), WireValue()}}}});
+    script->routes.push_back({"WHERE ROWID IN", {{Column("rowid", 1), Column("BODY", 112)}, {{Text("AAAROW1"), Text("second body")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("DOCS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("DOCS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("DOCS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")},
+           {Text("DOCS"), Text("BODY"), Text("CLOB"), Number("4000"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["DOCS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1), Column("BODY", 112)},
+                              {{Number("1"), Text("first"), Text("first body")},
+                               {Number("2"), Text("second"), Text("second body")},
+                               {Number("3"), Text("third"), Text("third body")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    // LIKE is a filter Oracle is not sent, so DuckDB applies it, and BODY is not part of it.
+    auto result = database.Query("SELECT ID, BODY FROM ora.main.DOCS WHERE LABEL LIKE 'sec%';");
+    CHECK(!result->HasError() && result->RowCount() == 1);
+    CHECK(result->GetValue(0, 0).ToString() == "2" && result->GetValue(1, 0).ToString() == "second body");
+    bool light = false;
+    bool heavy = false;
+    for (const auto &query : script->queries) {
+        light = light || (query.find("AS OF SCN 100") != std::string::npos && query.find("ROWIDTOCHAR(ROWID)") != std::string::npos &&
+                          query.find("\"BODY\"") == std::string::npos);
+        heavy = heavy || query.find("WHERE ROWID IN (CHARTOROWID('AAAROW1'))") != std::string::npos;
+    }
+    CHECK(light && heavy);
+    // A filter that reads the column is applied to the whole row, which is read at once.
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE LABEL LIKE 'sec%' AND BODY LIKE 'x%';")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("WHERE ROWID IN") == std::string::npos);
+    }
+    // And the setting turns it off.
+    database.Run("SET oracle_deferred_columns = false;");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID, BODY FROM ora.main.DOCS WHERE LABEL LIKE 'sec%';")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("WHERE ROWID IN") == std::string::npos && query.find("AS OF SCN") == std::string::npos);
+    }
+    std::cout << "heavy columns are read after the filter" << std::endl;
+}
+
 // ATTACH ... (SCHEMA 'x') lists another user's tables through the ALL_ views,
 // qualifies every statement with the owner, and settles the name against
 // ALL_USERS. The connected user's own schema, named or not, stays on USER_.
@@ -4439,6 +4499,7 @@ int main() {
     TestJsonAndVectorColumnsThroughSql();
     TestXmlTypeColumnsAreText();
     TestJoinKeysReachOracle();
+    TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestCallableArgumentsOfTheNewTypes();
     TestVectorSearchArguments();

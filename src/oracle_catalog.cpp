@@ -1370,6 +1370,30 @@ std::vector<std::vector<std::string>> TextRows(OracleSession &session, const std
 
 } // namespace
 
+std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryBindData &bind) {
+    if (TryTransactionSession(context, bind.catalog_name)) {
+        return std::string();
+    }
+    try {
+        auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
+        const auto scn_rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+        if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
+            return std::string();
+        }
+        const bool own = bind.schema_name.empty();
+        const auto kind = TextRows(session.Get(), std::string("SELECT iot_type, temporary, cluster_name FROM ") +
+                                                 (own ? "user_tables" : "all_tables") +
+                                                 " WHERE table_name = " + TextLiteral(bind.object_name) +
+                                                 (own ? std::string() : " AND owner = " + TextLiteral(bind.schema_name)));
+        if (kind.size() != 1 || !kind[0][0].empty() || kind[0][1] != "N" || !kind[0][2].empty()) {
+            return std::string();
+        }
+        return scn_rows[0][0];
+    } catch (const std::exception &) {
+        return std::string();
+    }
+}
+
 std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
                                                   const std::vector<column_t> &selected, idx_t sessions) {
     // Only a plain read of a table as it is now: a sample would be taken once per
@@ -1472,11 +1496,37 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
     }
 }
 
+// The describe supplies the wire representation and the character set form;
+// the dictionary supplies declared NUMBER precision and scale and nullability,
+// so scan values match the table schema. A dictionary type of zero means the
+// mapping did not name it, and the describe's own type stands so the refusal
+// can name it.
+void OverlayDictionaryColumn(OracleColumn &described, const OracleColumn &dictionary) {
+        if (dictionary.oracle_type != 0) {
+            described.oracle_type = dictionary.oracle_type;
+        }
+        described.byte_width = dictionary.byte_width;
+        described.precision = dictionary.precision;
+        described.scale = dictionary.scale;
+        described.nullable = dictionary.nullable;
+        described.unconstrained_number = dictionary.unconstrained_number;
+        described.unconstrained_precision = dictionary.unconstrained_precision;
+        described.unconstrained_scale = dictionary.unconstrained_scale;
+        if (dictionary.oracle_type == 127) {
+            described.vector_dimensions = dictionary.vector_dimensions;
+            described.vector_format = dictionary.vector_format;
+            described.vector_flags = dictionary.vector_flags;
+        }
+}
+
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
                        std::vector<OracleColumn> &columns, bool schema_only, OracleScanOpening *opening) {
     const auto select_list = ProjectedSelectList(bind, selected);
     auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
+    if (!bind.flashback_scn.empty()) {
+        sql += " AS OF SCN " + bind.flashback_scn;
+    }
     if (schema_only) {
         // Only the describe is wanted: the shape of the columns, with no row read.
         sql += " WHERE 1 = 0";
@@ -1519,28 +1569,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
             throw IOException("Oracle ATTACH table '%s' returned column '%s' where '%s' was selected",
                               bind.object_name, columns[index].name, dictionary_column.name);
         }
-        // The describe supplies the wire representation and the character
-        // set form; the dictionary supplies declared NUMBER precision and
-        // scale and nullability, so scan values match the table schema. A
-        // dictionary type of zero means the mapping did not name it, and
-        // the describe's own type stands so the refusal can name it.
-        if (dictionary_column.oracle_type != 0) {
-            columns[index].oracle_type = dictionary_column.oracle_type;
-        }
-        columns[index].byte_width = dictionary_column.byte_width;
-        columns[index].precision = dictionary_column.precision;
-        columns[index].scale = dictionary_column.scale;
-        columns[index].nullable = dictionary_column.nullable;
-        columns[index].unconstrained_number = dictionary_column.unconstrained_number;
-        columns[index].unconstrained_precision = dictionary_column.unconstrained_precision;
-        columns[index].unconstrained_scale = dictionary_column.unconstrained_scale;
-        if (dictionary_column.oracle_type == 127) {
-            // The table was declared with the dictionary's shape, so that is
-            // the shape this scan fills.
-            columns[index].vector_dimensions = dictionary_column.vector_dimensions;
-            columns[index].vector_format = dictionary_column.vector_format;
-            columns[index].vector_flags = dictionary_column.vector_flags;
-        }
+        OverlayDictionaryColumn(columns[index], dictionary_column);
         (void)TypeFor(columns[index]);
     }
 }
@@ -1602,6 +1631,11 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
                             "Send WHERE predicates on an attached Oracle table to Oracle. Only filters whose Oracle "
                             "meaning is provably identical are translated; the rest are applied by the scan to the "
                             "rows Oracle returns.",
+                            LogicalType::BOOLEAN, Value::BOOLEAN(true));
+    DBConfig::GetConfig(loader.GetDatabaseInstance())
+        .AddExtensionOption("oracle_deferred_columns",
+                            "Read CLOB, BLOB, JSON, VECTOR and XMLTYPE columns only for the rows that pass a filter "
+                            "DuckDB applies itself, by ROWID at the same change number as the rows.",
                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_parallel_scan",

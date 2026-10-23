@@ -308,12 +308,14 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
     const auto handle = statements.Open(OracleSqlKind::QUERY);
     if (ordered_binds.empty()) {
         TtcExecuteNoBindsRequest request;
+    request.legacy_session = connection->LegacySession();
         request.sequence = NextSequence();
         request.sql = sql;
         request.is_query = true;
         channel->ExecuteNoBinds(handle, request);
     } else {
         TtcExecuteBindsRequest request;
+    request.legacy_session = connection->LegacySession();
         request.sequence = NextSequence();
         request.sql = sql;
         request.binds = ordered_binds;
@@ -351,11 +353,13 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
     const auto handle = statements.Open(kind);
     if (ordered_binds.empty()) {
         TtcExecuteNoBindsRequest request;
+    request.legacy_session = connection->LegacySession();
         request.sequence = NextSequence();
         request.sql = sql;
         channel->ExecuteNoBinds(handle, request);
     } else {
         TtcExecuteBindsRequest request;
+    request.legacy_session = connection->LegacySession();
         request.sequence = NextSequence();
         request.sql = sql;
         request.binds = ordered_binds;
@@ -399,6 +403,7 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
 
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         TtcExecuteBindsRequest execute;
+    execute.legacy_session = connection->LegacySession();
         execute.sequence = NextSequence();
         execute.sql = block;
         execute.binds = ordered_binds;
@@ -447,6 +452,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
             auto ordered_first = OrderOracleStatementBinds(sql, rows[start], OracleBindUse::DML);
             const auto handle = statements.Open(OracleSqlKind::DML);
             TtcExecuteBindsRequest execute;
+    execute.legacy_session = connection->LegacySession();
             execute.sequence = NextSequence();
             execute.sql = sql;
             execute.binds = std::move(ordered_first);
@@ -493,6 +499,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
 
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         TtcExecuteBindsRequest execute;
+    execute.legacy_session = connection->LegacySession();
         execute.sequence = NextSequence();
         execute.sql = block;
         execute.binds = ordered_binds;
@@ -542,12 +549,14 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         if (binds.empty()) {
             TtcExecuteNoBindsRequest execute;
+    execute.legacy_session = connection->LegacySession();
             execute.sequence = NextSequence();
             execute.sql = sql;
             execute.is_plsql = true;
             channel->ExecuteNoBinds(handle, execute);
         } else {
             TtcExecuteBindsRequest execute;
+    execute.legacy_session = connection->LegacySession();
             execute.sequence = NextSequence();
             execute.sql = sql;
             execute.binds = binds;

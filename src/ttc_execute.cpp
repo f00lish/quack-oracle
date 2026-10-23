@@ -45,6 +45,15 @@ void Validate(const TtcExecuteNoBindsRequest &request) {
 // The 12.2 Thin OALL8 capture has five null SQL-signature/SQL-ID fields and,
 // for its field-version extension, two further null fields between the
 // registration tail and SQL text.  They are positional even when null.
+// The third byte of an execute request is the call sequence on a modern
+// session. A legacy (11.2) listener reads that position as part of the
+// request's own header instead, and go-ora -- which supports 11g and writes
+// zero there for every version -- is the reference for what it expects.
+template <typename Request>
+uint8_t ExecuteSequence(const Request &request) {
+    return request.legacy_session ? 0 : request.sequence;
+}
+
 void WriteThinOall8Extension(ByteWriter &writer, uint8_t field_version) {
     writer.WriteByte(0).WriteUB4(0).WriteByte(0).WriteUB4(0).WriteByte(0);
     if (field_version >= TTC_FIELD_VERSION_12_2_EXT1) {
@@ -189,7 +198,7 @@ void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds) {
 std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsRequest &request) {
     Validate(request);
     ByteWriter writer;
-    writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(request.sequence);
+    writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(ExecuteSequence(request));
     uint32_t core_options = OALL8_PARSE | OALL8_EXECUTE;
     if (request.is_query) {
         // A query parses and executes; the implicit result set is what makes
@@ -229,7 +238,7 @@ std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsReque
 std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &request) {
     Validate(request);
     ByteWriter writer;
-    writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(request.sequence);
+    writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(ExecuteSequence(request));
     uint32_t options = OALL8_PARSE | OALL8_EXECUTE | OALL8_BIND;
     if (request.is_query) {
         options |= OALL8_IMPLICIT_RESULTSETS;

@@ -1383,12 +1383,39 @@ struct OracleQuerySnapshotState final : ClientContextState {
     std::mutex lock;
     idx_t query = 0;
     std::map<std::string, std::string> scn_by_catalog;
+    //! A change number a snapshot build pinned for one catalog on this context, kept across statements.
+    std::string pinned_catalog;
+    std::string pinned_scn;
 };
 
 } // namespace
 
+void OraclePinSnapshot(ClientContext &context, const std::string &catalog_name, const std::string &scn) {
+    auto state = context.registered_state->GetOrCreate<OracleQuerySnapshotState>("oracle_scanner.query_snapshot");
+    std::lock_guard<std::mutex> guard(state->lock);
+    state->pinned_catalog = catalog_name;
+    state->pinned_scn = scn;
+}
+
+std::string OracleCurrentScn(ClientContext &context, const std::string &catalog_name) {
+    auto target = ResolveOracleWriteTarget(context, catalog_name);
+    auto session = AcquireOracleReadSession(context, std::string(), target.catalog_name, target.config, target.password);
+    const auto rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+    if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].empty()) {
+        throw IOException("Oracle returned no change number");
+    }
+    return rows[0][0];
+}
+
 std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindData &bind) {
     Value setting;
+    if (!bind.catalog_name.empty()) {
+        auto pinned = context.registered_state->GetOrCreate<OracleQuerySnapshotState>("oracle_scanner.query_snapshot");
+        std::lock_guard<std::mutex> guard(pinned->lock);
+        if (!pinned->pinned_scn.empty() && pinned->pinned_catalog == bind.catalog_name) {
+            return pinned->pinned_scn;
+        }
+    }
     if (!context.TryGetCurrentSetting("oracle_consistent_read", setting) || setting.IsNull() ||
         !BooleanValue::Get(setting) || bind.catalog_name.empty() || TryTransactionSession(context, bind.catalog_name)) {
         return std::string();

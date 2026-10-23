@@ -3526,6 +3526,42 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
             CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "n" &&
                   result.GetValue(1, 0).ToString() == "2");
         }};
+    const auto snapshot_setup = [](FakeScript &script) {
+        script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+        script.routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("4242")}}}});
+        script.routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("SALES")}}}});
+        script.routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+        script.routes.push_back(
+            {"FROM user_tab_columns",
+             {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+               Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+              {{Text("SALES"), Text("REGION"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")}}}});
+        script.routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+        script.tables["SALES"] = {{Column("REGION", 1)}, {{Text("EU")}, {Text("EU")}, {Text("US")}}};
+    };
+    const std::string snapshot_attach = "ATTACH 'demo' AS ora (TYPE oracle_scanner);";
+    const std::string snapshot_made =
+        "SELECT * FROM oracle_snapshot('ora', 'sales_snapshot', 'SELECT * FROM ora.main.SALES WHERE region = ''EU''');";
+    cases["oracle_snapshot"] = {snapshot_setup, {snapshot_attach},
+                                [](FakeScript &script, MaterializedQueryResult &result) {
+                                    CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "sales_snapshot" &&
+                                          result.GetValue(1, 0).ToString() == "3" && result.GetValue(2, 0).ToString() == "4242");
+                                    // The table was read at the change number the snapshot recorded.
+                                    bool pinned = false;
+                                    for (const auto &query : script.queries) {
+                                        pinned = pinned || query.find("FROM \"SALES\" AS OF SCN 4242") != std::string::npos;
+                                    }
+                                    CHECK(pinned);
+                                }};
+    cases["oracle_snapshot_refresh"] = {snapshot_setup, {snapshot_attach, snapshot_made},
+                                        [](FakeScript &, MaterializedQueryResult &result) {
+                                            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "sales_snapshot");
+                                        }};
+    cases["oracle_snapshots"] = {snapshot_setup, {snapshot_attach, snapshot_made},
+                                 [](FakeScript &, MaterializedQueryResult &result) {
+                                     CHECK(result.RowCount() == 1 && result.GetValue(1, 0).ToString() == "sales_snapshot" &&
+                                           result.GetValue(2, 0).ToString() == "ora" && result.GetValue(3, 0).ToString() == "4242");
+                                 }};
     cases["oracle_vector_search"] = {
         [](FakeScript &script) {
             script.columns = {Column("ID", 2, 6, 0), Column("DISTANCE", 101)};
@@ -3790,7 +3826,7 @@ void TestFunctionExamplesRun() {
     auto cases = FunctionExampleCases();
     // The same set on both sides: a function added without an executable
     // example, or a case left for a function that is gone, fails here.
-    CHECK(examples.size() == cases.size() && examples.size() == 32);
+    CHECK(examples.size() == cases.size() && examples.size() == 35);
     for (const auto &example : examples) {
         const auto found = cases.find(example.first);
         if (found == cases.end()) {
@@ -3876,7 +3912,10 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     }
     const auto parallel = duckdb::OracleParallelScanFunctionInfo();
     check(parallel, parallel.functions.name);
-    CHECK(names.size() == 32);
+    for (const auto &info : duckdb::OracleSnapshotFunctionInfos()) {
+        check(info, info.functions.name);
+    }
+    CHECK(names.size() == 35);
 
     // And what that mode means on a database that already has the functions:
     // an extra overload under an existing name is added to it, where

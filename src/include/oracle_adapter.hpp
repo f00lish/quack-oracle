@@ -171,6 +171,11 @@ CreateScalarFunctionInfo OracleScannerVersionFunctionInfo();
 CreateScalarFunctionInfo OracleIoDeadlineVersionFunctionInfo();
 vector<CreateTableFunctionInfo> OracleQueryFunctionInfos();
 CreateTableFunctionInfo OracleParallelScanFunctionInfo();
+vector<CreateTableFunctionInfo> OracleSnapshotFunctionInfos();
+//! The Oracle database's current change number, read through the catalog's own connection details.
+std::string OracleCurrentScn(ClientContext &context, const std::string &catalog_name);
+//! Makes every scan of `catalog_name` made on this context read AS OF `scn`.
+void OraclePinSnapshot(ClientContext &context, const std::string &catalog_name, const std::string &scn);
 
 //! A read session for this connection and secret, pooled when
 //! oracle_session_pool_size allows it.

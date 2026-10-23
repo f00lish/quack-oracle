@@ -371,6 +371,9 @@ oracle_query_transaction_typed	table	[catalog_name, sql, column_names, column_ty
 oracle_scan_parallel	table	[secret_name, table_name, key_column, shards]	[VARCHAR, VARCHAR, VARCHAR, BIGINT]	NULL
 oracle_scanner_io_deadline_version	scalar	[]	[]	NULL
 oracle_scanner_version	scalar	[]	[]	NULL
+oracle_snapshot	table	[catalog_name, table_name, source_sql]	[VARCHAR, VARCHAR, VARCHAR]	NULL
+oracle_snapshot_refresh	table	[table_name]	[VARCHAR]	NULL
+oracle_snapshots	table	[]	[]	NULL
 oracle_transaction_status	table	[catalog_name]	[VARCHAR]	NULL
 oracle_vector_search	table	[secret_name, table_name, column_name, query_vector, k, metric, approximate]	[VARCHAR, VARCHAR, VARCHAR, ANY, BIGINT, VARCHAR, BOOLEAN]	NULL
 
@@ -383,7 +386,7 @@ SELECT count(*) FILTER (WHERE function_type = 'scalar'), count(*) FILTER (WHERE 
 FROM duckdb_functions()
 WHERE starts_with(function_name, 'oracle_');
 ----
-2	30
+2	33
 
 query I
 SELECT count(*)

@@ -14,6 +14,7 @@ void RegisterOracleQuery(ExtensionLoader &loader);
 void RegisterOracleAttachedCatalog(ExtensionLoader &loader);
 void RegisterOracleSessionPool(ExtensionLoader &loader);
 void RegisterOracleParallelScan(ExtensionLoader &loader);
+void RegisterOracleSnapshot(ExtensionLoader &loader);
 
 // Supplied by CMake from EXTENSION_VERSION in extension_config.cmake, so this
 // answer cannot drift from the version the artifact is stamped with. The
@@ -76,6 +77,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterOracleAttachedCatalog(loader);
 	RegisterOracleSessionPool(loader);
 	RegisterOracleParallelScan(loader);
+	RegisterOracleSnapshot(loader);
 }
 
 void OracleScannerExtension::Load(ExtensionLoader &loader) {

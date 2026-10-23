@@ -70,6 +70,7 @@ set(EXTENSION_SOURCES
     src/oracle_connection.cpp
     src/oracle_filter.cpp
     src/oracle_optimizer.cpp
+    src/oracle_snapshot.cpp
     src/oracle_write.cpp
     src/oracle_callable.cpp
     src/oracle_pool.cpp

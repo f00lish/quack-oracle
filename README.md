@@ -480,6 +480,25 @@ lists joined by `OR`, up to 16384 values (more than that is read unfiltered, as 
 composite key is filtered column by column, never as a tuple, since DuckDB hands the scan one
 filter per column.
 
+**Local snapshots.** To keep a copy of Oracle data in DuckDB that you control, build it explicitly:
+
+```sql
+SELECT * FROM oracle_snapshot('o', 'sales_eu', 'SELECT * FROM o.main.SALES WHERE region = ''EU''');
+-- table_name | row_count | scn        | taken_at
+SELECT * FROM oracle_snapshots();                 -- every snapshot: catalog, SCN, when, rows, the query
+SELECT * FROM oracle_snapshot_refresh('sales_eu'); -- run the query again, at a new SCN
+```
+
+`oracle_snapshot(catalog, table, query)` takes one change number from the Oracle behind the attached catalog
+`catalog`, runs `query` (any DuckDB query: joins, aggregates and filters over its attached tables, which are
+pushed down as usual) with every table of that catalog read `AS OF` that number, and writes the result with
+`CREATE OR REPLACE TABLE`. What it came from (catalog, SCN, time, query) is kept in the table's own comment, so
+there is no hidden state: the result is an ordinary DuckDB table you can query, index, export or `DROP`, it lives
+in the database file if you use one, and `oracle_snapshots()` finds it again by that comment. Tables of other
+attached catalogs in the same query are read as they are now. It runs on a connection of its own, so it cannot
+be part of the transaction that asked for it; the Oracle user needs flashback on the tables. Fewer moving parts
+than a materialized view, and unlike one it never changes by itself.
+
 **JSON paths.** A test of a path in a native `JSON` column
 (`WHERE doc->>'$.customer.id' = 'c42'`, also `json_extract_string`, an `IN` list as `OR`, `IS NOT NULL`) is
 narrowed in Oracle with `JSON_VALUE(doc, '$.customer.id' RETURNING VARCHAR2(4000) NULL ON ERROR) = 'c42'`

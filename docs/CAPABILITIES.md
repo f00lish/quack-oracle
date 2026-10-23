@@ -384,7 +384,7 @@ in Oracle.
   which is not implemented.
 - **Memory.** A statement is built whole, so a batch of N rows holds N times its
   LOB values at once; insert large LOBs a few rows at a time.
-- **`INSERT … RETURNING` cannot cover a LOB, JSON or VECTOR column.** Oracle returns a locator
+- **`RETURNING` cannot cover a LOB, JSON or VECTOR column.** Oracle returns a locator
   there, and DuckDB's `RETURNING` spans every column of the table, so a table
   with a LOB column refuses it with a message that names the column.
 - A LOB column is not filtered remotely; a filter on one runs in DuckDB.
@@ -436,7 +436,7 @@ user is the same as naming nothing. Only what the connected user can see is list
 | `SELECT` | Works |
 | `INSERT`, `UPDATE`, `DELETE` | Works — see §6 |
 | `INSERT … RETURNING` | Works |
-| `UPDATE … RETURNING`, `DELETE … RETURNING` | **Refused** |
+| `UPDATE … RETURNING`, `DELETE … RETURNING` | Works, one statement per row, addressed by ROWID, with `SQL%ROWCOUNT` so a row already gone is left out |
 | `CREATE TABLE`, `CREATE TABLE AS` | Refused — this extension issues no DDL |
 | `DROP TABLE` | Refused |
 | `CREATE SCHEMA`, `DROP SCHEMA` | Refused — one schema, and it is Oracle's |
@@ -657,7 +657,7 @@ the attached catalog's transactions reuse sessions as §6 describes.
 Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
 LOB values past 16 MiB · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
 `LONG` and `ROWID` · object, collection, record and `XMLTYPE`
-types · `UPDATE`/`DELETE … RETURNING` · several schemas in one attachment ·
+types · several schemas in one attachment ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1
 verifier · SEPS · IAM · failover of an established session (TAF) ·
 Application Continuity · AQ ·

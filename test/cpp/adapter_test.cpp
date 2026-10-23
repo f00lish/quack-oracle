@@ -2393,6 +2393,33 @@ void TestAttachedWritesAgainstAFakeSession() {
     CHECK(!database.Query("INSERT INTO ora.main.ITEMS (ID) VALUES (6), (7) RETURNING ID;")->HasError());
     CHECK(script->returning_statements.size() == statements_before + 2);
 
+    // UPDATE and DELETE ... RETURNING: one statement per row, addressed by that
+    // row's ROWID, asking for every column and for the row count, because a row
+    // deleted since the scan read it returns nothing.
+    script->returning_values["r1"] = Number("1");
+    script->returning_values["r2"] = Text("renamed");
+    script->returning_values["rc"] = Number("1");
+    const auto before_update = script->returning_statements.size();
+    auto updated = database.Query("UPDATE ora.main.ITEMS SET LABEL = 'renamed' RETURNING ID, LABEL;");
+    CHECK(!updated->HasError() && updated->RowCount() == 2);
+    CHECK(updated->GetValue(1, 0).ToString() == "renamed");
+    CHECK(script->returning_statements.size() == before_update + 2);
+    CHECK(script->returning_statements.back() ==
+          "UPDATE \"ITEMS\" SET \"LABEL\" = :1, \"ID\" = :2 WHERE ROWID = CHARTOROWID(:3) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2; "
+          ":rc := SQL%ROWCOUNT");
+    const auto before_delete = script->returning_statements.size();
+    auto deleted = database.Query("DELETE FROM ora.main.ITEMS RETURNING ID, LABEL;");
+    CHECK(!deleted->HasError() && deleted->RowCount() == 2);
+    CHECK(script->returning_statements.size() == before_delete + 2);
+    CHECK(script->returning_statements.back() ==
+          "DELETE FROM \"ITEMS\" WHERE ROWID = CHARTOROWID(:1) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2; "
+          ":rc := SQL%ROWCOUNT");
+    // A row that is gone by the time its statement runs is not reported.
+    script->returning_values["rc"] = Number("0");
+    auto gone = database.Query("DELETE FROM ora.main.ITEMS RETURNING ID;");
+    CHECK(!gone->HasError() && gone->RowCount() == 0);
+    script->returning_values.erase("rc");
+
     // Inside a transaction a read of the same catalog goes on the session the
     // write pinned, because Oracle shows uncommitted rows to that session and
     // to no other. The count is the check: a read that opened its own session

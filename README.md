@@ -484,8 +484,20 @@ INSERT INTO o.ITEMS (label) VALUES ('eight') RETURNING id, label;
 
 Columns you do not name are left out of the statement, so Oracle's own
 `DEFAULT` still applies. `UPDATE` and `DELETE` find rows by Oracle's ROWID, so
-the table does not need a primary key. (`RETURNING` on `UPDATE`/`DELETE` is not
-supported yet.)
+the table does not need a primary key.
+
+`UPDATE ... RETURNING` gives the rows as Oracle stored them after the change, and
+`DELETE ... RETURNING` the rows as they were when it deleted them:
+
+```sql
+UPDATE o.ITEMS SET label = upper(label) WHERE id < 3 RETURNING id, label;
+DELETE FROM o.ITEMS WHERE id > 100 RETURNING *;
+```
+
+Like `INSERT`, each row is its own statement, so a large `RETURNING` costs a round
+trip a row. A row removed by someone else between the scan and the statement is
+left out of the result. A table with a LOB, JSON or VECTOR column cannot be
+returned from.
 
 `ATTACH 'ora' AS o (TYPE oracle_scanner, READ_ONLY)` prevents writes through
 both normal SQL and `oracle_execute_transaction`. Prepared raw DML rechecks the

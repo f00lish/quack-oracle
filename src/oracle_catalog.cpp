@@ -884,7 +884,7 @@ public:
     PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                  PhysicalOperator &plan) override {
         auto &table = op.table.Cast<OracleAttachedTableEntry>();
-        return PlanOracleDelete(context, planner, op, plan, table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
+        return PlanOracleDelete(context, planner, op, plan, table.OracleColumns(), table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
     }
 
     PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,

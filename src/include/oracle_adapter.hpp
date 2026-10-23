@@ -388,7 +388,8 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &context, PhysicalPlanGenerator
 
 //! Plans a ROWID-addressed DELETE from an attached Oracle table.
 PhysicalOperator &PlanOracleDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
-                                   PhysicalOperator &plan, OracleWriteTarget target);
+                                   PhysicalOperator &plan, const std::vector<OracleColumn> &columns,
+                                   OracleWriteTarget target);
 
 //! Opens an attached table's scan over exactly the requested columns, pushing
 //! the projection into Oracle's select list.

@@ -782,6 +782,75 @@ OracleColumn OracleRowIdColumn() {
 
 namespace {
 
+// The OUT binds that carry a RETURNING clause's values back, one per column.
+std::vector<OracleBind> ReturningOutputs(const std::vector<OracleColumn> &returned_columns) {
+    std::vector<OracleBind> outputs;
+    for (idx_t column_index = 0; column_index < returned_columns.size(); column_index++) {
+        OracleBind output;
+        output.name = "r" + std::to_string(column_index + 1);
+        output.oracle_type = returned_columns[column_index].oracle_type;
+        if (output.oracle_type == 96) {
+            // A CHAR OUT bind is blank-padded to the whole buffer (32767
+            // here), not to the column's width. Asked for as VARCHAR2 the
+            // value comes back as the column holds it, already padded to
+            // the declared width.
+            output.oracle_type = 1;
+        }
+        if ((returned_columns[column_index].oracle_type == 1 || returned_columns[column_index].oracle_type == 96) &&
+            returned_columns[column_index].character_set_form == 2) {
+            output.character_set_form = 2;
+        }
+        output.direction = BindDirection::BIND_OUT;
+        output.maximum_bytes = 32767;
+        outputs.push_back(std::move(output));
+    }
+    return outputs;
+}
+
+// The columns a RETURNING over the whole table covers, and the clause that asks
+// for them. DuckDB evaluates RETURNING over every column of the table, so a
+// column this client cannot hand back rules the clause out.
+struct ReturningPlan {
+    std::vector<OracleColumn> columns;
+    std::string clause;
+};
+
+ReturningPlan PlanReturning(const TableCatalogEntry &table, const std::vector<OracleColumn> &columns,
+                            const char *statement, const std::string &first_out_name_prefix = "r") {
+    ReturningPlan plan;
+    std::string returned_list;
+    std::string into_list;
+    for (auto &column : table.GetColumns().Physical()) {
+        const auto position = column.Physical().index;
+        if (position >= columns.size()) {
+            throw InternalException("Oracle RETURNING column %llu is outside the table's Oracle metadata",
+                                    static_cast<uint64_t>(position));
+        }
+        RequireReadableColumn(columns[position]);
+        if (columns[position].oracle_type == 112 || columns[position].oracle_type == 113 ||
+            columns[position].oracle_type == 119 || columns[position].oracle_type == 127) {
+            // Oracle hands a LOB in RETURNING back as a locator, not as
+            // content, and this client has no capture of that exchange.
+            throw NotImplementedException("Oracle %s ... RETURNING cannot return the LOB, JSON or VECTOR column \"%s\"; "
+                                          "run it without RETURNING and read the rows back",
+                                          statement, columns[position].name);
+        }
+        if (!returned_list.empty()) {
+            returned_list += ", ";
+            into_list += ", ";
+        }
+        returned_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
+        into_list += ":" + first_out_name_prefix + std::to_string(plan.columns.size() + 1);
+        plan.columns.push_back(columns[position]);
+    }
+    plan.clause = " RETURNING " + returned_list + " INTO " + into_list;
+    return plan;
+}
+
+} // namespace
+
+namespace {
+
 class OracleInsertGlobalState final : public GlobalSinkState {
 public:
     uint64_t inserted_rows = 0;
@@ -904,23 +973,7 @@ private:
                 binds.push_back(OracleBindForColumn(chunk.GetValue(source_indexes[column_index], row_index),
                                                     bound_columns[column_index], std::to_string(column_index + 1)));
             }
-            for (idx_t column_index = 0; column_index < returned_columns.size(); column_index++) {
-                OracleBind output;
-                output.name = "r" + std::to_string(column_index + 1);
-                output.oracle_type = returned_columns[column_index].oracle_type;
-                if (output.oracle_type == 96) {
-                    // A CHAR OUT bind is blank-padded to the whole buffer (32767
-                    // here), not to the column's width. Asked for as VARCHAR2 the
-                    // value comes back as the column holds it, already padded to
-                    // the declared width.
-                    output.oracle_type = 1;
-                }
-                if ((returned_columns[column_index].oracle_type == 1 || returned_columns[column_index].oracle_type == 96) &&
-                    returned_columns[column_index].character_set_form == 2) {
-                    output.character_set_form = 2;
-                }
-                output.direction = BindDirection::BIND_OUT;
-                output.maximum_bytes = 32767;
+            for (auto &output : ReturningOutputs(returned_columns)) {
                 binds.push_back(std::move(output));
             }
             std::vector<OracleBind> values;
@@ -974,9 +1027,10 @@ private:
 class OracleRowIdWriteOperator : public PhysicalOperator {
 public:
     OracleRowIdWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-                             OracleWriteTarget target_p, std::string sql_p)
+                             OracleWriteTarget target_p, std::string sql_p,
+                             std::vector<OracleColumn> returned_columns_p = {})
         : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-          target(std::move(target_p)), sql(std::move(sql_p)) {
+          target(std::move(target_p)), sql(std::move(sql_p)), returned_columns(std::move(returned_columns_p)) {
     }
 
     bool IsSink() const override {
@@ -987,8 +1041,12 @@ public:
         return true;
     }
 
-    unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
-        return make_uniq<OracleInsertGlobalState>();
+    unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+        auto state = make_uniq<OracleInsertGlobalState>();
+        if (!returned_columns.empty()) {
+            state->returned = make_uniq<ColumnDataCollection>(context, types);
+        }
+        return std::move(state);
     }
 
     unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
@@ -1001,6 +1059,9 @@ public:
             return SinkResultType::NEED_MORE_INPUT;
         }
         chunk.Flatten();
+        if (!returned_columns.empty()) {
+            return SinkReturning(context, chunk, global_state);
+        }
         // PhysicalUpdate and PhysicalDelete both put the row identity last, and
         // reading it from the chunk keeps this independent of how wide the
         // projection above happened to be.
@@ -1031,23 +1092,92 @@ public:
 
     SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
         auto &source_state = input.global_state.Cast<OracleInsertSourceState>();
+        auto &global_state = sink_state->Cast<OracleInsertGlobalState>();
+        if (global_state.returned) {
+            if (!source_state.scan_started) {
+                global_state.returned->InitializeScan(source_state.scan);
+                source_state.scan_started = true;
+            }
+            global_state.returned->Scan(source_state.scan, chunk);
+            return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+        }
         if (source_state.emitted) {
             return SourceResultType::FINISHED;
         }
         source_state.emitted = true;
-        auto &global_state = sink_state->Cast<OracleInsertGlobalState>();
         chunk.SetChildCardinality(1);
         chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
         return SourceResultType::FINISHED;
     }
 
 protected:
+    // With RETURNING, one statement per row: it names the row by ROWID, so it
+    // changes one row or none. The statement also reports SQL%ROWCOUNT, because
+    // a row deleted since the scan read it returns nothing, and the OUT binds
+    // would then read as a row of NULLs.
+    SinkResultType SinkReturning(ExecutionContext &context, DataChunk &chunk, OracleInsertGlobalState &global_state) const {
+        const auto rowid_index = chunk.ColumnCount() - 1;
+        DataChunk row_chunk;
+        row_chunk.Initialize(Allocator::DefaultAllocator(), types);
+        for (idx_t row_index = 0; row_index < chunk.size(); row_index++) {
+            auto binds = LeadingBinds(chunk, row_index);
+            const auto rowid = chunk.GetValue(rowid_index, row_index);
+            if (rowid.IsNull()) {
+                throw InternalException("Oracle row identity is missing for a row of \"%s\"", target.object_name);
+            }
+            binds.push_back(OracleBindForColumn(rowid, OracleRowIdColumn(), std::to_string(binds.size() + 1)));
+            for (auto &output : ReturningOutputs(returned_columns)) {
+                binds.push_back(std::move(output));
+            }
+            OracleBind count;
+            count.name = "rc";
+            count.oracle_type = 2;
+            count.direction = BindDirection::BIND_OUT;
+            count.maximum_bytes = 22;
+            binds.push_back(std::move(count));
+            std::vector<OracleBind> values;
+            try {
+                auto &session = TransactionSession(context.client, target);
+                values = TranslatingOracleErrors(FailureMessage(), [&] { return session.ExecuteReturning(sql, binds); });
+            } catch (...) {
+                PoisonTransactionSession(context.client, target.catalog_name);
+                throw;
+            }
+            if (values.size() != returned_columns.size() + 1 || !values.back().value) {
+                throw InternalException("Oracle RETURNING produced %llu values for %llu columns and a row count",
+                                        static_cast<uint64_t>(values.size()), static_cast<uint64_t>(returned_columns.size()));
+            }
+            if (oracle_scanner::DecodeOracleNumber(*values.back().value) == "0") {
+                continue;
+            }
+            const auto row = row_chunk.size();
+            for (idx_t column_index = 0; column_index < returned_columns.size(); column_index++) {
+                row_chunk.data[column_index].SetValue(row,
+                                   TranslatingOracleErrors("Oracle could not convert a RETURNING value", [&] {
+                                       return ValueFor(returned_columns[column_index], values[column_index].value);
+                                   }));
+            }
+            row_chunk.SetChildCardinality(row + 1);
+            global_state.inserted_rows++;
+            if (row_chunk.size() == STANDARD_VECTOR_SIZE) {
+                global_state.returned->Append(row_chunk);
+                row_chunk.Reset();
+            }
+        }
+        if (row_chunk.size() != 0) {
+            global_state.returned->Append(row_chunk);
+        }
+        return SinkResultType::NEED_MORE_INPUT;
+    }
+
     //! The binds that come before the row identity, empty for a DELETE.
     virtual std::vector<OracleBind> LeadingBinds(DataChunk &chunk, idx_t row_index) const = 0;
     virtual const char *FailureMessage() const = 0;
 
     OracleWriteTarget target;
     std::string sql;
+    //! The table's columns, in order, when the statement has RETURNING.
+    std::vector<OracleColumn> returned_columns;
 };
 
 class OracleDeleteOperator final : public OracleRowIdWriteOperator {
@@ -1072,9 +1202,9 @@ class OracleUpdateOperator final : public OracleRowIdWriteOperator {
 public:
     OracleUpdateOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
                          OracleWriteTarget target_p, std::string sql_p, std::vector<idx_t> source_indexes_p,
-                         std::vector<OracleColumn> set_columns_p)
+                         std::vector<OracleColumn> set_columns_p, std::vector<OracleColumn> returned_columns_p = {})
         : OracleRowIdWriteOperator(physical_plan, std::move(types), estimated_cardinality, std::move(target_p),
-                                   std::move(sql_p)),
+                                   std::move(sql_p), std::move(returned_columns_p)),
           source_indexes(std::move(source_indexes_p)), set_columns(std::move(set_columns_p)) {
     }
 
@@ -1203,34 +1333,9 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
     // column left to its DEFAULT, a sequence, a trigger.
     std::vector<OracleColumn> returned_columns;
     if (op.return_chunk) {
-        std::string returned_list;
-        std::string into_list;
-        for (auto &column : op.table.GetColumns().Physical()) {
-            const auto position = column.Physical().index;
-            if (position >= columns.size()) {
-                throw InternalException("Oracle RETURNING column %llu is outside the table's Oracle metadata",
-                                        static_cast<uint64_t>(position));
-            }
-            RequireReadableColumn(columns[position]);
-            if (columns[position].oracle_type == 112 || columns[position].oracle_type == 113 ||
-                columns[position].oracle_type == 119 || columns[position].oracle_type == 127) {
-                // Oracle hands a LOB in RETURNING back as a locator, not as
-                // content, and this client has no capture of that exchange.
-                // DuckDB evaluates RETURNING over every column of the table,
-                // so one LOB column rules the clause out.
-                throw NotImplementedException("Oracle INSERT ... RETURNING cannot return the LOB, JSON or VECTOR column \"%s\"; "
-                                              "insert without RETURNING and read the row back",
-                                              columns[position].name);
-            }
-            if (!returned_list.empty()) {
-                returned_list += ", ";
-                into_list += ", ";
-            }
-            returned_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
-            into_list += ":r" + std::to_string(returned_columns.size() + 1);
-            returned_columns.push_back(columns[position]);
-        }
-        sql += " RETURNING " + returned_list + " INTO " + into_list;
+        auto returning = PlanReturning(op.table, columns, "INSERT");
+        sql += returning.clause;
+        returned_columns = std::move(returning.columns);
     }
     auto &insert = planner.Make<OracleInsertOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
                                                       std::move(source_indexes), std::move(bound_columns),
@@ -1240,13 +1345,19 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
 }
 
 PhysicalOperator &PlanOracleDelete(ClientContext &, PhysicalPlanGenerator &planner, LogicalDelete &op,
-                                   PhysicalOperator &plan, OracleWriteTarget target) {
+                                   PhysicalOperator &plan, const std::vector<OracleColumn> &columns,
+                                   OracleWriteTarget target) {
+    auto sql = "DELETE FROM " + OracleObjectReference(target.schema_name, target.object_name) + " WHERE ROWID = " +
+               "CHARTOROWID(:1)";
+    std::vector<OracleColumn> returned_columns;
     if (op.return_chunk) {
-        throw NotImplementedException("Oracle DELETE does not support RETURNING yet");
+        // The rows as they were just before Oracle deleted them.
+        auto returning = PlanReturning(op.table, columns, "DELETE");
+        sql += returning.clause + "; :rc := SQL%ROWCOUNT";
+        returned_columns = std::move(returning.columns);
     }
-    const auto sql = "DELETE FROM " + OracleObjectReference(target.schema_name, target.object_name) + " WHERE ROWID = " +
-                     "CHARTOROWID(:1)";
-    auto &deletion = planner.Make<OracleDeleteOperator>(op.types, op.estimated_cardinality, std::move(target), sql);
+    auto &deletion = planner.Make<OracleDeleteOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
+                                                        std::move(returned_columns));
     deletion.children.push_back(plan);
     return deletion;
 }
@@ -1254,9 +1365,6 @@ PhysicalOperator &PlanOracleDelete(ClientContext &, PhysicalPlanGenerator &plann
 PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                    PhysicalOperator &plan, const std::vector<OracleColumn> &columns,
                                    OracleWriteTarget target) {
-    if (op.return_chunk) {
-        throw NotImplementedException("Oracle UPDATE does not support RETURNING yet");
-    }
     if (op.columns.size() != op.expressions.size()) {
         throw InternalException("Oracle UPDATE received %llu columns for %llu expressions",
                                static_cast<uint64_t>(op.columns.size()),
@@ -1292,10 +1400,18 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
     if (assignments.empty()) {
         throw NotImplementedException("Oracle UPDATE needs at least one column to set");
     }
-    const auto sql = "UPDATE " + OracleObjectReference(target.schema_name, target.object_name) + " SET " + assignments +
-                     " WHERE ROWID = CHARTOROWID(:" + std::to_string(set_columns.size() + 1) + ")";
+    auto sql = "UPDATE " + OracleObjectReference(target.schema_name, target.object_name) + " SET " + assignments +
+               " WHERE ROWID = CHARTOROWID(:" + std::to_string(set_columns.size() + 1) + ")";
+    std::vector<OracleColumn> returned_columns;
+    if (op.return_chunk) {
+        // The rows as Oracle stored them, which a trigger or DEFAULT may have changed.
+        auto returning = PlanReturning(op.table, columns, "UPDATE");
+        sql += returning.clause + "; :rc := SQL%ROWCOUNT";
+        returned_columns = std::move(returning.columns);
+    }
     auto &update = planner.Make<OracleUpdateOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
-                                                      std::move(source_indexes), std::move(set_columns));
+                                                      std::move(source_indexes), std::move(set_columns),
+                                                      std::move(returned_columns));
     update.children.push_back(plan);
     return update;
 }

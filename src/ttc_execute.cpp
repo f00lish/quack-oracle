@@ -61,6 +61,51 @@ void WriteThinOall8Extension(ByteWriter &writer, uint8_t field_version) {
     }
 }
 
+// Writes the fixed part that closes an execute request, from the bind block
+// up to but not including the SQL text.
+//
+// The two dialects differ in length, and the difference is not cosmetic: the
+// SQL text and the al8i4 array that follow sit at different offsets, so a
+// legacy listener reads them from the wrong place and answers with an
+// internal conversion error instead of the statement's result.
+//
+// A legacy (11.2) listener speaks the TTC version 6 dialect, and go-ora --
+// which supports 11g -- closes the request with the bind block, the five
+// auxiliary bytes, the define block and the two version-gated blocks: seven
+// bytes short of seventeen, and the only non-zero byte among them is the one
+// that ends the version-4 block. The official JDBC driver writes the same
+// seventeen bytes for the same server, and its statement succeeds there.
+//
+// The modern form is what the 12.2 capture this extension was built from
+// carries, and it is kept byte for byte.
+void WriteExecuteTail(ByteWriter &writer, bool legacy_session, bool has_binds, uint32_t bind_count,
+                      uint8_t field_version) {
+    if (legacy_session) {
+        if (has_binds) {
+            writer.WriteByte(1).WriteUB4(bind_count);
+        } else {
+            writer.WriteByte(0).WriteByte(0);
+        }
+        writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0);
+        writer.WriteByte(0).WriteUB4(0);                                // define block
+        writer.WriteByte(0).WriteByte(0).WriteByte(1);                  // TTC version 4
+        writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0); // TTC version 5
+        return;
+    }
+    if (has_binds) {
+        writer.WriteByte(1).WriteUB4(bind_count);
+    } else {
+        writer.WriteByte(0).WriteByte(0);
+    }
+    writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0);
+    writer.WriteByte(0);         // al8doac pointer
+    writer.WriteUB4(0);          // define count
+    writer.WriteUB4(0);          // registration id LSB
+    writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteUB4(0).WriteByte(0).WriteUB4(0).WriteUB4(0);
+    writer.WriteByte(0).WriteUB4(0).WriteByte(0);
+    WriteThinOall8Extension(writer, field_version);
+}
+
 uint32_t BindBufferSize(const OracleBind &bind) {
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
         return 4;
@@ -216,16 +261,13 @@ std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsReque
     writer.WriteByte(1); // al8i4 vector is present
     writer.WriteUB4(13); // number of al8i4 words
     writer.WriteByte(0).WriteByte(0); // al8o4 and al8o4l pointers
-    writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(request.prefetch_rows);
-    writer.WriteUB4(request.maximum_long_bytes).WriteByte(0); // no bind descriptors
-    writer.WriteUB4(0);                                       // bind count
-    writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0); // transaction/vector auxiliaries
-    writer.WriteByte(0); // al8doac pointer
-    writer.WriteUB4(0); // define count
-    writer.WriteUB4(0); // registration id LSB
-    writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteUB4(0).WriteByte(0).WriteUB4(0).WriteUB4(0);
-    writer.WriteByte(0).WriteUB4(0).WriteByte(0); // array-DML and registration tail
-    WriteThinOall8Extension(writer, request.ttc_field_version);
+    // A legacy listener is told how many rows to prefetch in the same place
+    // go-ora and the JDBC driver put it, and both use ten. The modern form
+    // keeps the caller's own value.
+    const auto prefetch_rows = request.legacy_session ? 10U : request.prefetch_rows;
+    writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(prefetch_rows);
+    writer.WriteUB4(request.maximum_long_bytes);
+    WriteExecuteTail(writer, request.legacy_session, false, 0, request.ttc_field_version);
     writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()));
     writer.WriteUB4(1); // al8i4[0]: SQL must be parsed on a fresh cursor
     writer.WriteUB4(request.is_query ? 0 : 1); // al8i4[1]: query prefetch vs one DML/PLSQL iteration
@@ -250,15 +292,10 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     }
     writer.WriteUB4(options).WriteUB4(0).WriteByte(1).WriteUB4(static_cast<uint32_t>(request.sql.size()));
     writer.WriteByte(1).WriteUB4(13).WriteByte(0).WriteByte(0);
-    writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(request.prefetch_rows).WriteUB4(request.maximum_long_bytes);
-    writer.WriteByte(1).WriteUB4(static_cast<uint32_t>(request.binds.size()));
-    writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0);
-    writer.WriteByte(0).WriteUB4(0).WriteUB4(0);
-    // Python Thin's bound OALL8 carries the second registration/vector
-    // pointer; it is positional even though its following payload is null.
-    writer.WriteByte(0).WriteByte(1).WriteByte(0).WriteUB4(0).WriteByte(0).WriteUB4(0).WriteUB4(0);
-    writer.WriteByte(0).WriteUB4(0).WriteByte(0);
-    WriteThinOall8Extension(writer, request.ttc_field_version);
+    const auto prefetch_rows = request.legacy_session ? 10U : request.prefetch_rows;
+    writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(prefetch_rows).WriteUB4(request.maximum_long_bytes);
+    WriteExecuteTail(writer, request.legacy_session, true, static_cast<uint32_t>(request.binds.size()),
+                      request.ttc_field_version);
     writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()));
     // al8i4[1] is the execution count: one DML iteration, or as many as the
     // batch carries. A query leaves it zero.

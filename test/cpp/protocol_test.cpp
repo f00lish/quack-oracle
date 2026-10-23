@@ -1416,6 +1416,61 @@ static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
     CHECK((dml_options & 0x40) == 0);
 }
 
+// A legacy (11.2) session speaks the TTC version 6 dialect, and the execute
+// request it expects is shorter than the modern one by ten bytes. The SQL text
+// and the al8i4 array sit at the end of the request, so a request that is ten
+// bytes too long makes the listener read both of them from the wrong place --
+// which is what it answers with an internal conversion error.
+//
+// The expected bytes are go-ora's, for the version go-ora writes to a server
+// it knows to be 11g, and the same seventeen bytes the JDBC driver writes for
+// the same server.
+static void TestLegacyExecuteRequestLayout() {
+    const std::string sql = "SELECT USER FROM DUAL";
+    TtcExecuteNoBindsRequest request;
+    request.sql = sql;
+    request.is_query = true;
+    request.legacy_session = true;
+    const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
+
+    // go-ora's execute request for the same statement, byte for byte.
+    const std::vector<uint8_t> expected = {
+        0x03, 0x5e, 0x00,                                     // function, execute, sequence
+        0x02, 0x80, 0x21,                                     // options: parse, execute, not PL/SQL
+        0x00,                                                 // cursor id
+        0x01,                                                 // cursor id is zero
+        0x01, 0x15,                                           // SQL length, 21
+        0x01,                                                 // parse
+        0x01, 0x0d,                                           // thirteen al8i4 words
+        0x00, 0x00,                                           // two empty pointers
+        0x00, 0x01, 0x0a,                                     // fetch marker, ten rows to prefetch
+        0x04, 0x7f, 0xff, 0xff, 0xff,                         // maximum long
+        0x00, 0x00,                                           // no binds
+        0x00, 0x00, 0x00, 0x00, 0x00,                         // five auxiliary bytes
+        0x00, 0x00,                                           // define block
+        0x00, 0x00, 0x01,                                     // TTC version 4 block
+        0x00, 0x00, 0x00, 0x00, 0x00};                        // TTC version 5 block
+    CHECK(encoded.size() > expected.size());
+    CHECK(std::equal(expected.begin(), expected.end(), encoded.begin()));
+    // The SQL text follows immediately, and the al8i4 array closes the request.
+    const auto text_at = std::search(encoded.begin(), encoded.end(), sql.begin(), sql.end());
+    CHECK(text_at != encoded.end());
+    CHECK(static_cast<size_t>(text_at - encoded.begin()) == expected.size());
+    // The al8i4 array the JDBC driver writes for the same statement, which is
+    // the one that succeeds against this server.
+    const std::vector<uint8_t> al8i4 = {0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x01, 0x01, 0x00, 0x02, 0x80, 0x00, 0x00, 0x00, 0x00};
+    const auto tail = std::vector<uint8_t>(encoded.end() - al8i4.size(), encoded.end());
+    CHECK(tail == al8i4);
+
+    // The modern form is a different length, and the two must not be confused
+    // for one another.
+    TtcExecuteNoBindsRequest modern = request;
+    modern.legacy_session = false;
+    const auto modern_encoded = EncodeTtcExecuteNoBindsRequest(modern);
+    CHECK(modern_encoded.size() == encoded.size() + 10);
+}
+
 static void TestTtcRowDataCodec() {
     ByteWriter writer;
     writer.WriteByte(TTC_MESSAGE_ROW_DATA)
@@ -7243,6 +7298,7 @@ int main() {
     TestTtcCallResponse();
     TestTtcExecuteNoBindsCodec();
     TestTtcExecuteQueryLeavesTheFetchOnlyBitClear();
+    TestLegacyExecuteRequestLayout();
     TestTtcExecuteNoBindsShape();
     TestTtcExecuteRefCursorBindShape();
 #if !defined(_WIN32)

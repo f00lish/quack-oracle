@@ -8,6 +8,7 @@
 #include "oracle_adapter.hpp"
 
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -2685,6 +2686,10 @@ std::string OracleSampleClause(optional_ptr<SampleOptions> options, const std::o
 	return clause;
 }
 
+// Below this many rows (NUM_ROWS) an automatic parallel scan is not tried: the
+// plan costs a few dictionary queries and a connection of its own.
+constexpr uint64_t AUTOMATIC_PARALLEL_MINIMUM_ROWS = 500000;
+
 static bool DeferrableColumn(const OracleColumn &column);
 
 // Runs the statement an AGGREGATE was replaced with. The result columns are
@@ -2850,7 +2855,16 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     idx_t sessions = 0;
     if (!selected.empty() && context.TryGetCurrentSetting("oracle_parallel_scan", parallel_setting) &&
         !parallel_setting.IsNull()) {
-        sessions = static_cast<idx_t>(MaxValue<int64_t>(0, MinValue<int64_t>(64, parallel_setting.GetValue<int64_t>())));
+        const auto requested = parallel_setting.GetValue<int64_t>();
+        if (requested >= 0) {
+            sessions = static_cast<idx_t>(MinValue<int64_t>(64, requested));
+        } else if (bind.estimated_rows && *bind.estimated_rows >= AUTOMATIC_PARALLEL_MINIMUM_ROWS) {
+            // Automatic: a table Oracle's statistics say is big gets as many
+            // sessions as DuckDB has threads, up to eight. The planner still reads
+            // one stream when the extents, the change number or a flashback read
+            // are not to be had.
+            sessions = MinValue<idx_t>(8, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+        }
     }
     auto chunks = PlanParallelAttachedScan(context, bind, selected, sessions);
     if (!chunks.empty()) {

@@ -1640,10 +1640,12 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_parallel_scan",
                             "How many Oracle sessions one scan of an attached table may read through at the same SCN, "
-                            "each taking ROWID ranges cut at extent boundaries. 0 or 1 reads with one session. A table "
+                            "each taking ROWID ranges cut at extent boundaries. -1 (the default) chooses: as many as "
+                            "DuckDB has threads, up to 8, for a table whose statistics say 500,000 rows or more, else one. "
+                            "0 or 1 reads with one session. A table "
                             "under 2,048 blocks, a sample, a transaction that has written, and a database that will not "
                             "give out an SCN are read with one.",
-                            LogicalType::BIGINT, Value::BIGINT(0));
+                            LogicalType::BIGINT, Value::BIGINT(-1));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_unconstrained_number",
                             "What a NUMBER with no declared precision (plain NUMBER, SUM(x), count(*)) becomes: "

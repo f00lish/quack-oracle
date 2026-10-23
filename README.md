@@ -982,8 +982,10 @@ the `k` from a subset.
 
 ## 7. Read a big table faster
 
-Without choosing a key column or calling anything, an attached table can be read through
-several sessions:
+Without choosing a key column or calling anything, an attached table is read through
+several sessions when Oracle's statistics say it has 500,000 rows or more (`oracle_parallel_scan`
+is `-1`, automatic: as many sessions as DuckDB has threads, up to eight). To choose the number
+yourself, or to turn it off with `0`:
 
 ```sql
 SET oracle_parallel_scan = 8;
@@ -1043,7 +1045,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (inner join on number, date or timestamp columns) |
 | `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`/`sum`/`min`/`max` with `GROUP BY` over number, date and timestamp keys |
 | `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key; see [section 4](#pushing-filters-down-to-oracle) |
-| `oracle_parallel_scan` | `0` | How many sessions one scan of an attached table may read through at once; see [section 7](#7-read-a-big-table-faster) |
+| `oracle_parallel_scan` | `-1` | How many sessions one scan of an attached table may read through at once; see [section 7](#7-read-a-big-table-faster) |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS

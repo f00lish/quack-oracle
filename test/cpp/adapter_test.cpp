@@ -2725,7 +2725,7 @@ void TestAttachedScanReadsInRowidRanges() {
     TestDatabase database;
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
 
-    // Off by default: one statement, no ranges.
+    // Automatic, and this table has no row-count statistics: one statement, no ranges.
     CHECK(!database.Query("SELECT count(*) FROM o.main.FACTS;")->HasError());
     for (const auto &query : script->queries) {
         CHECK(query.find("CHARTOROWID") == std::string::npos);

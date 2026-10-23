@@ -548,6 +548,17 @@ std::string TranslateExpression(const Expression &expression, const OracleColumn
 constexpr size_t MAX_KEY_INTERVALS = 2048;
 constexpr size_t MAX_RANGE_QUESTIONS = 16384;
 
+// The middle of two int64 values without computing their sum or difference, which for
+// the ends of the BIGINT domain overflows: signed overflow is undefined, and it made the
+// search below loop forever under GCC while Clang happened to wrap.
+int64_t FloorMidpoint(int64_t a, int64_t b) {
+    return (a & b) + ((a ^ b) >> 1);
+}
+
+int64_t CeilMidpoint(int64_t a, int64_t b) {
+    return FloorMidpoint(a, b) + ((a ^ b) & 1);
+}
+
 std::optional<std::string> PrefixRangeSql(const BoundFunctionExpression &function, const OracleColumn &column,
                                           const std::string &quoted_name) {
     if (function.Function().GetName() != PrefixRangeScalarFun::NAME || !function.BindInfo() ||
@@ -597,7 +608,7 @@ std::optional<std::string> PrefixRangeSql(const BoundFunctionExpression &functio
         int64_t lo = domain_low;
         int64_t hi = domain_high;
         while (lo < hi) {
-            const int64_t mid = lo + (hi - lo) / 2 + ((hi - lo) % 2);
+            const int64_t mid = CeilMidpoint(lo, hi);
             if (may_hold(mid, domain_high)) {
                 lo = mid;
             } else {
@@ -610,7 +621,7 @@ std::optional<std::string> PrefixRangeSql(const BoundFunctionExpression &functio
         int64_t lo = domain_low;
         int64_t hi = domain_high;
         while (lo < hi) {
-            const int64_t mid = lo + (hi - lo) / 2;
+            const int64_t mid = FloorMidpoint(lo, hi);
             if (may_hold(domain_low, mid)) {
                 hi = mid;
             } else {
@@ -633,7 +644,7 @@ std::optional<std::string> PrefixRangeSql(const BoundFunctionExpression &functio
                 continue;
             }
             split_any = true;
-            const int64_t mid = interval.first + (interval.second - interval.first) / 2;
+            const int64_t mid = FloorMidpoint(interval.first, interval.second);
             if (questions + 2 > MAX_RANGE_QUESTIONS) {
                 over_budget = true;
                 break;

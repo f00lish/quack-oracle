@@ -212,6 +212,8 @@ struct OracleQueryBindData final : TableFunctionData {
     //! NUM_ROWS from Oracle's statistics when the dictionary has it; the optimizer's
     //! only idea of how large the table is.
     std::optional<uint64_t> estimated_rows;
+    //! NUM_DISTINCT per column of the table, in column order, where the statistics have one.
+    std::vector<std::optional<uint64_t>> distinct_counts;
     // Predicates translated from the pushed-down filter set, empty when nothing
     // was pushed. Built at init, where the filters and the read columns are
     // both known.

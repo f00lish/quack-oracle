@@ -480,7 +480,9 @@ as `IN` lists of single keys and `BETWEEN` ranges, up to 2,048 intervals, and as
 a superset when there are more — and a bloom filter, which has no SQL form, is
 dropped. All of them are hints, so dropping or widening one never changes an
 answer. The choice of plan depends on the row count the catalog passes DuckDB,
-`USER_TABLES.NUM_ROWS`; a table without statistics has none.
+`USER_TABLES.NUM_ROWS`, and on each column's `NUM_DISTINCT` (the distinct count only,
+never a minimum, maximum or null count, which a stale statistic could make wrong in a
+way that drops rows); a table without statistics has neither.
 
 ---
 

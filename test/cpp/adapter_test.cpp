@@ -2482,6 +2482,9 @@ void TestJoinKeysReachOracle() {
     auto script = std::make_shared<FakeScript>();
     script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
     // The statistics query comes before the object listing, which matches the same view.
+    script->routes.push_back({"num_distinct IS NOT NULL",
+                              {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("NUM_DISTINCT", 2)},
+                               {{Text("FACTS"), Text("ID"), Number("4000000")}}}});
     script->routes.push_back({"num_rows IS NOT NULL", {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)},
                                                        {{Text("FACTS"), Number("5000000")}}}});
     script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
@@ -2498,6 +2501,21 @@ void TestJoinKeysReachOracle() {
     TestDatabase database;
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
 
+    // The row count and the column's distinct count reach the optimizer, which sizes the grouping from them.
+    auto estimated = database.Query("EXPLAIN SELECT ID, count(*) FROM o.main.FACTS GROUP BY ID;");
+    CHECK(!estimated->HasError());
+    std::string plan;
+    for (duckdb::idx_t row = 0; row < estimated->RowCount(); row++) {
+        plan += estimated->GetValue(1, row).ToString();
+    }
+    // The scan is 5,000,000 rows, and the grouping is sized below that because
+    // the column is known to hold fewer distinct values.
+    size_t at_scan_size = 0;
+    for (auto position = plan.find("~5,000,000 rows"); position != std::string::npos;
+         position = plan.find("~5,000,000 rows", position + 1)) {
+        at_scan_size++;
+    }
+    CHECK(at_scan_size == 2 && plan.find("~") != std::string::npos);
     // Five keys: an IN list.
     auto few = database.Query("SELECT count(*) FROM o.main.FACTS f JOIN (SELECT unnest([1000, 1100, 1200, 9999]) k) v "
                               "ON f.ID = v.k;");

@@ -158,6 +158,8 @@ struct OracleAttachedState {
     // NUM_ROWS from the optimizer statistics, for the tables that have any.
     mutable bool row_estimates_loaded = false;
     mutable std::unordered_map<std::string, uint64_t> row_estimates;
+    // NUM_DISTINCT per table and column, from the same statistics.
+    mutable std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> distinct_estimates;
 
     void ConnectAndDiscoverSchema() {
         OracleMetadataLease session(transaction_pool, config, password);
@@ -660,9 +662,40 @@ struct OracleAttachedState {
                     }
                 }
                 cursor->Close();
+                // How many different values each column holds, which is what the
+                // optimizer needs to size a join or a GROUP BY. Only the count: a
+                // statistic can be stale, and a stale minimum, maximum or null count
+                // would let DuckDB skip rows, where a stale count only misjudges a plan.
+                auto distinct = TranslatingOracleErrors("Oracle ATTACH could not read column statistics", [&] {
+                    return session->Query("SELECT table_name, column_name, num_distinct FROM " +
+                                              View("tab_col_statistics") + " WHERE num_distinct IS NOT NULL" +
+                                              OwnerCondition("owner", "AND"),
+                                          {});
+                });
+                for (;;) {
+                    const auto batch = TranslatingOracleErrors("Oracle ATTACH could not read column statistics",
+                                                               [&] { return distinct->Fetch(STANDARD_VECTOR_SIZE); });
+                    for (const auto &row : batch.rows) {
+                        if (row.size() < 3 || !row[0] || !row[1] || !row[2]) {
+                            continue;
+                        }
+                        try {
+                            distinct_estimates[std::string(row[0]->begin(), row[0]->end())]
+                                              [std::string(row[1]->begin(), row[1]->end())] =
+                                std::stoull(oracle_scanner::DecodeOracleNumber(*row[2]));
+                        } catch (const std::exception &) {
+                            continue;
+                        }
+                    }
+                    if (batch.exhausted) {
+                        break;
+                    }
+                }
+                distinct->Close();
                 session.Finish();
             } catch (const std::exception &) {
                 row_estimates.clear();
+                distinct_estimates.clear();
             }
         }
         const auto found = row_estimates.find(object_name);
@@ -670,6 +703,26 @@ struct OracleAttachedState {
             return std::nullopt;
         }
         return found->second;
+    }
+
+    // The distinct-value count of each of the table's columns, in order, where the
+    // statistics have one.
+    std::vector<std::optional<uint64_t>> DistinctCounts(const std::string &object_name,
+                                                        const std::vector<OracleColumn> &columns) const {
+        (void)RowEstimate(object_name); // loads the statistics
+        std::lock_guard<std::mutex> lock(metadata_lock);
+        std::vector<std::optional<uint64_t>> result(columns.size());
+        const auto table = distinct_estimates.find(object_name);
+        if (table == distinct_estimates.end()) {
+            return result;
+        }
+        for (size_t index = 0; index < columns.size(); index++) {
+            const auto found = table->second.find(columns[index].name);
+            if (found != table->second.end()) {
+                result[index] = found->second;
+            }
+        }
+        return result;
     }
 
     std::vector<std::string> PrimaryKeyColumns(const std::string &object_name) const {
@@ -764,6 +817,7 @@ struct OracleAttachedState {
         result->password = password;
         result->object_name = object_name;
         result->estimated_rows = RowEstimate(object_name);
+        result->distinct_counts = DistinctCounts(object_name, entry_columns);
         result->schema_name = owner;
         result->secret_name = secret_name;
         // The table entry's own columns: they carry the number mapping chosen when
@@ -802,6 +856,27 @@ unique_ptr<NodeStatistics> OracleAttachedScanCardinality(ClientContext &, const 
 		return nullptr;
 	}
 	return make_uniq<NodeStatistics>(static_cast<idx_t>(*bind.estimated_rows));
+}
+
+// What the optimizer is told about one column: how many different values it
+// holds, and nothing else.
+unique_ptr<BaseStatistics> OracleAttachedScanStatistics(ClientContext &, const FunctionData *bind_data,
+                                                        column_t column_index) {
+	if (!bind_data) {
+		return nullptr;
+	}
+	const auto &bind = bind_data->Cast<OracleQueryBindData>();
+	if (column_index >= bind.distinct_counts.size() || column_index >= bind.types.size() ||
+	    !bind.distinct_counts[column_index]) {
+		return nullptr;
+	}
+	auto statistics = BaseStatistics::CreateUnknown(bind.types[column_index]);
+	auto distinct = static_cast<idx_t>(*bind.distinct_counts[column_index]);
+	if (bind.estimated_rows) {
+		distinct = MinValue<idx_t>(distinct, static_cast<idx_t>(*bind.estimated_rows));
+	}
+	statistics.SetDistinctCount(distinct);
+	return statistics.ToUnique();
 }
 
 class OracleAttachedTableEntry final : public TableCatalogEntry {
@@ -876,6 +951,7 @@ public:
             context.TryGetCurrentSetting("oracle_filter_pushdown", pushdown) && BooleanValue::Get(pushdown);
         function.projection_pushdown = true;
         function.cardinality = OracleAttachedScanCardinality;
+        function.statistics = OracleAttachedScanStatistics;
         return function;
     }
 

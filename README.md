@@ -475,7 +475,10 @@ It reads the table's row count from Oracle's optimizer statistics
 (`USER_TABLES.NUM_ROWS`), so a table that has never had statistics gathered looks
 tiny to it and may be built into the hash table instead of probed. Gather them
 (`BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'SALES'); END;` through
-`oracle_plsql`) for the tables you join.
+`oracle_plsql`) for the tables you join. The same statistics give each column's
+distinct-value count (`NUM_DISTINCT`), which sizes `GROUP BY`s and joins on it.
+Only counts are passed on: a statistic can be stale, and a stale minimum, maximum
+or null count could make DuckDB skip rows, where a stale count only misjudges a plan.
 
 ---
 

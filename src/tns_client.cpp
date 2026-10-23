@@ -852,9 +852,14 @@ void TnsClientConnection::RequestDbVersion() {
     const auto response = Ttc().Receive();
     // The answer carries the server's banner and its packed version. Both are
     // informational here: the point of the exchange is that the server has
-    // seen it, so a failure to parse it must not fail the connection.
-    (void)DecodeTtcDbVersionResponse(response,
-                                     legacy_session ? TtcChunkEncoding::RawByte : TtcChunkEncoding::UniversalInteger);
+    // seen the request, so a response this client cannot parse must not fail
+    // the connection. It is also not fatal to the exchange -- the request has
+    // been sent and answered either way.
+    try {
+        (void)DecodeTtcDbVersionResponse(response,
+                                         legacy_session ? TtcChunkEncoding::RawByte : TtcChunkEncoding::UniversalInteger);
+    } catch (const ProtocolError &) {
+    }
 }
 
 void TnsClientConnection::Close() {

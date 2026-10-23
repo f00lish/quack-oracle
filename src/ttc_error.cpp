@@ -259,12 +259,17 @@ TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message) {
         reader.Skip(1);   // call number
         reader.ReadUB2(); // padding
         reader.ReadUB4(); // successful iterations
-        // Four length-prefixed blobs close the fixed part. A blob with a
-        // non-zero length carries that many bytes.
+        // Four blobs close the fixed part. A blob states its own length and
+        // then carries that many bytes -- the length is not a prefix of
+        // another length, so it must not be read as a length-prefixed value.
         for (int index = 0; index < 4; index++) {
             const auto length = reader.ReadUB4();
             if (length != 0) {
-                (void)reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES);
+                if (length > MAX_TTC_ERROR_TEXT_BYTES) {
+                    throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                        "TTC ERROR blob exceeds supported bounds");
+                }
+                (void)reader.ReadRaw(length);
             }
         }
         std::string error_message;

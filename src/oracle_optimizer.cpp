@@ -276,7 +276,7 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 	if (result.columns.empty()) {
 		return false;
 	}
-	result.sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
+	result.sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name) + " /*SCN*/";
 	if (!where.empty()) {
 		result.sql += " WHERE " + where;
 	}
@@ -431,7 +431,8 @@ std::string SideView(const JoinSide &side) {
 	for (const auto column : side.selected) {
 		list += (list.empty() ? "" : ", ") + Quoted(side.bind->columns[column]);
 	}
-	auto sql = "(SELECT " + list + " FROM " + OracleObjectReference(side.bind->schema_name, side.bind->object_name);
+	auto sql = "(SELECT " + list + " FROM " + OracleObjectReference(side.bind->schema_name, side.bind->object_name) +
+	           " /*SCN*/";
 	if (!side.where.empty()) {
 		sql += " WHERE " + side.where;
 	}

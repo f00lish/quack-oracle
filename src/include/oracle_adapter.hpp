@@ -524,6 +524,8 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
 void OverlayDictionaryColumn(OracleColumn &described, const OracleColumn &dictionary);
 //! The change number to read a heap table at, or empty when it cannot be pinned
 //! (a view, an index-organized, clustered or temporary table, or no flashback).
+//! The change number every scan of this statement reads at when oracle_consistent_read is on, else empty.
+std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindData &bind);
 std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryBindData &bind);
 
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,

@@ -2703,8 +2703,17 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         const auto before = session->IoStats();
-        cursor = session->Query(bind.statement_sql, {});
-        opened.sql = bind.statement_sql;
+        // The marker the optimizer left after each table name becomes the statement's snapshot.
+        auto sql = bind.statement_sql;
+        const auto scn = OracleQuerySnapshot(context, bind);
+        const std::string marker = " /*SCN*/";
+        for (auto at = sql.find(marker); at != std::string::npos; at = sql.find(marker, at)) {
+            const auto replacement = scn.empty() ? std::string() : " AS OF SCN " + scn;
+            sql.replace(at, marker.size(), replacement);
+            at += replacement.size();
+        }
+        cursor = session->Query(sql, {});
+        opened.sql = sql;
         opened.io = session->IoStats() - before;
     } catch (const std::exception &error) {
         session.Poison();
@@ -2843,7 +2852,11 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             }
         }
     }
+    // A statement's scans read one moment when the user asked for that; set anew on
+    // every run, since a prepared statement keeps its bind data.
+    const auto query_scn = OracleQuerySnapshot(context, bind);
     bind.sample_clause = OracleSampleClause(input.sample_options.get(), bind.estimated_rows);
+    bind.flashback_scn = bind.sample_clause.empty() ? query_scn : std::string();
     // A Top-N the optimizer found over this scan is applied by Oracle only when
     // every filter went to Oracle too: a filter DuckDB applies afterwards would
     // see the first n rows instead of the first n that pass it.
@@ -2948,7 +2961,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                 deferred = std::move(plan);
             } catch (const std::exception &) {
                 // No flashback on the table, or the snapshot is gone: read it whole.
-                bind.flashback_scn.clear();
+                bind.flashback_scn = query_scn;
                 cursor.reset();
                 session = OracleSessionHandle();
                 columns.clear();

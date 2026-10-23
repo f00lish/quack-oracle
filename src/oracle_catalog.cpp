@@ -5,6 +5,8 @@
 
 #include "oracle_adapter.hpp"
 
+#include "duckdb/transaction/meta_transaction.hpp"
+
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -32,6 +34,7 @@
 #include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/session_factory.hpp"
 
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -1370,15 +1373,64 @@ std::vector<std::vector<std::string>> TextRows(OracleSession &session, const std
 
 } // namespace
 
+namespace {
+
+// The change number a query reads every attached table at, per catalog, taken
+// when its first scan starts. It belongs to the statement: the next one takes
+// its own.
+struct OracleQuerySnapshotState final : ClientContextState {
+    std::mutex lock;
+    idx_t query = 0;
+    std::map<std::string, std::string> scn_by_catalog;
+};
+
+} // namespace
+
+std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindData &bind) {
+    Value setting;
+    if (!context.TryGetCurrentSetting("oracle_consistent_read", setting) || setting.IsNull() ||
+        !BooleanValue::Get(setting) || bind.catalog_name.empty() || TryTransactionSession(context, bind.catalog_name)) {
+        return std::string();
+    }
+    auto state = context.registered_state->GetOrCreate<OracleQuerySnapshotState>("oracle_scanner.query_snapshot");
+    const auto query = MetaTransaction::Get(context).GetActiveQuery();
+    std::lock_guard<std::mutex> guard(state->lock);
+    if (state->query != query) {
+        state->query = query;
+        state->scn_by_catalog.clear();
+    }
+    const auto known = state->scn_by_catalog.find(bind.catalog_name);
+    if (known != state->scn_by_catalog.end()) {
+        return known->second;
+    }
+    // The setting asks for one snapshot; a database that will not give out a
+    // change number cannot honor it, and saying so beats reading several moments.
+    try {
+        auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
+        const auto rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+        if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].empty()) {
+            throw IOException("Oracle returned no change number");
+        }
+        state->scn_by_catalog[bind.catalog_name] = rows[0][0];
+        return rows[0][0];
+    } catch (const std::exception &error) {
+        throw IOException("oracle_consistent_read could not take a change number: %s", error.what());
+    }
+}
+
 std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryBindData &bind) {
     if (TryTransactionSession(context, bind.catalog_name)) {
         return std::string();
     }
     try {
         auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
-        const auto scn_rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
-        if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
-            return std::string();
+        auto scn = OracleQuerySnapshot(context, bind);
+        if (scn.empty()) {
+            const auto scn_rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+            if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
+                return std::string();
+            }
+            scn = scn_rows[0][0];
         }
         const bool own = bind.schema_name.empty();
         const auto kind = TextRows(session.Get(), std::string("SELECT iot_type, temporary, cluster_name FROM ") +
@@ -1388,7 +1440,7 @@ std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryB
         if (kind.size() != 1 || !kind[0][0].empty() || kind[0][1] != "N" || !kind[0][2].empty()) {
             return std::string();
         }
-        return scn_rows[0][0];
+        return scn;
     } catch (const std::exception &) {
         return std::string();
     }
@@ -1409,11 +1461,14 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         // One snapshot for every chunk, taken before any of them reads. Without
         // a change number the chunks would be several moments, so no change
         // number means one stream.
-        const auto scn_rows = TextRows(*session, "SELECT dbms_flashback.get_system_change_number FROM dual");
-        if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
-            return {};
+        std::string scn = OracleQuerySnapshot(context, bind);
+        if (scn.empty()) {
+            const auto scn_rows = TextRows(*session, "SELECT dbms_flashback.get_system_change_number FROM dual");
+            if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
+                return {};
+            }
+            scn = scn_rows[0][0];
         }
-        const auto &scn = scn_rows[0][0];
         const bool own = bind.schema_name.empty();
         const auto name = TextLiteral(bind.object_name);
         const auto owner = TextLiteral(bind.schema_name);
@@ -1632,6 +1687,12 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
                             "meaning is provably identical are translated; the rest are applied by the scan to the "
                             "rows Oracle returns.",
                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+    DBConfig::GetConfig(loader.GetDatabaseInstance())
+        .AddExtensionOption("oracle_consistent_read",
+                            "Read every attached table of one statement at one Oracle change number (AS OF SCN), "
+                            "taken when its first scan starts, so a join or a union of scans sees one moment. Needs "
+                            "flashback on the tables; a transaction that has written reads its own session instead.",
+                            LogicalType::BOOLEAN, Value::BOOLEAN(false));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_deferred_columns",
                             "Read CLOB, BLOB, JSON, VECTOR and XMLTYPE columns only for the rows that pass a filter "

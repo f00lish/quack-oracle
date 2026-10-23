@@ -2413,6 +2413,16 @@ void TestHeavyColumnsAreReadAfterTheFilter() {
     for (const auto &query : script->queries) {
         CHECK(query.find("WHERE ROWID IN") == std::string::npos && query.find("AS OF SCN") == std::string::npos);
     }
+    // With oracle_consistent_read a statement's scans all read at one change number.
+    database.Run("SET oracle_consistent_read = true;");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT a.ID FROM ora.main.DOCS a JOIN ora.main.DOCS b ON a.LABEL = b.LABEL;")->HasError());
+    size_t pinned = 0;
+    for (const auto &query : script->queries) {
+        pinned += query.find("FROM \"DOCS\" AS OF SCN 100") != std::string::npos ? 1 : 0;
+    }
+    CHECK(pinned == 2);
+    database.Run("SET oracle_consistent_read = false;");
     std::cout << "heavy columns are read after the filter" << std::endl;
 }
 

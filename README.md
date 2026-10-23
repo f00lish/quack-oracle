@@ -480,6 +480,14 @@ lists joined by `OR`, up to 16384 values (more than that is read unfiltered, as 
 composite key is filtered column by column, never as a tuple, since DuckDB hands the scan one
 filter per column.
 
+**One moment for a whole statement.** A statement that reads several attached tables (a join DuckDB
+does itself, a union, a subquery) normally reads each at the moment its scan starts. `SET
+oracle_consistent_read = true` takes one change number when the statement's first scan starts and reads
+every attached table of it `AS OF SCN` that number, including the pushed-down joins and aggregates
+and each ROWID range of a parallel scan. It needs flashback on the tables and undo that reaches back
+that far; a database that gives out no change number fails the statement rather than reading several
+moments, and a transaction that has written reads through its own session as before. Off by default.
+
 **Heavy columns after the filter.** When a filter has to be applied by DuckDB (one Oracle was not
 sent, such as an ordered comparison of text) and the query also reads CLOB, BLOB, JSON, VECTOR or
 XMLTYPE columns the filter never looks at, the scan reads the other columns plus each row's
@@ -1041,6 +1049,7 @@ You also need `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table.
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle. See [section 4](#pushing-filters-down-to-oracle). |
+| `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF SCN` one change number |
 | `oracle_deferred_columns` | `true` | Read LOB/JSON/VECTOR/XML columns only for the rows that pass a filter DuckDB applies itself, by ROWID at one change number |
 | `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (inner join on number, date or timestamp columns) |
 | `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`/`sum`/`min`/`max` with `GROUP BY` over number, date and timestamp keys |

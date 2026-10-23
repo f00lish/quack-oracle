@@ -1392,13 +1392,6 @@ static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
     const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
     // The options word is the fourth field: three bytes of function header
     // (message type, function code, sequence) and then the options themselves.
-    {
-        std::cout << "[exec-head]";
-        for (size_t index = 0; index < encoded.size() && index < 16; index++) {
-            std::cout << " " << std::hex << static_cast<int>(encoded[index]) << std::dec;
-        }
-        std::cout << std::endl;
-    }
     ByteReader reader(encoded);
     CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION);
     CHECK(reader.ReadByte() == TTC_FUNCTION_EXECUTE);
@@ -7219,687 +7212,147 @@ static void TestLobOperationObeysTheDeadlineMidResponse() {
 
 int main() {
 
-    std::cout << "[run] TestUniversalIntegers" << std::endl;
-    try { TestUniversalIntegers(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestUniversalIntegers: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestWalletArchive" << std::endl;
-    try { TestWalletArchive(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestWalletArchive: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLengthPrefixedValues" << std::endl;
-    try { TestLengthPrefixedValues(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLengthPrefixedValues: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestEmptyValuesAreNull" << std::endl;
-    try { TestEmptyValuesAreNull(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestEmptyValuesAreNull: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcDescribeInfoVersionGates" << std::endl;
-    try { TestTtcDescribeInfoVersionGates(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcDescribeInfoVersionGates: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcReturnParameterPrefix" << std::endl;
-    try { TestTtcReturnParameterPrefix(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcReturnParameterPrefix: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcFetchTruncatedEndOfCallIsTruncated" << std::endl;
-    try { TestTtcFetchTruncatedEndOfCallIsTruncated(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcFetchTruncatedEndOfCallIsTruncated: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestPacketFraming" << std::endl;
-    try { TestPacketFraming(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestPacketFraming: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestPacketStream" << std::endl;
-    try { TestPacketStream(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestPacketStream: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestConnectPackets" << std::endl;
-    try { TestConnectPackets(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestConnectPackets: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestConnectHandshake" << std::endl;
-    try { TestConnectHandshake(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestConnectHandshake: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcChannel" << std::endl;
-    try { TestTtcChannel(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcChannel: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcChannelShortPacketBoundary" << std::endl;
-    try { TestTtcChannelShortPacketBoundary(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcChannelShortPacketBoundary: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestStatementChannelJoinsFragmentedResponse" << std::endl;
-    try { TestStatementChannelJoinsFragmentedResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestStatementChannelJoinsFragmentedResponse: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestStatementChannelJoinsFragmentedExecuteResponse" << std::endl;
-    try { TestStatementChannelJoinsFragmentedExecuteResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestStatementChannelJoinsFragmentedExecuteResponse: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcCancellation" << std::endl;
-    try { TestTtcCancellation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcCancellation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcErrorDiagnostics" << std::endl;
-    try { TestTtcErrorDiagnostics(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcErrorDiagnostics: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLegacyTtcErrorBody" << std::endl;
-    try { TestLegacyTtcErrorBody(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLegacyTtcErrorBody: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcParameters" << std::endl;
-    try { TestTtcParameters(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcParameters: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcAuthEncoding" << std::endl;
-    try { TestTtcAuthEncoding(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcAuthEncoding: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcFetchCodec" << std::endl;
-    try { TestTtcFetchCodec(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcFetchCodec: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcFetchResponse" << std::endl;
-    try { TestTtcFetchResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcFetchResponse: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestFetchResponseDecoderResumes" << std::endl;
-    try { TestFetchResponseDecoderResumes(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestFetchResponseDecoderResumes: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestOracleIntegerMatchesDecimalText" << std::endl;
-    try { TestOracleIntegerMatchesDecimalText(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestOracleIntegerMatchesDecimalText: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcIoVector" << std::endl;
-    try { TestTtcIoVector(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcIoVector: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcRefCursorDescriptor" << std::endl;
-    try { TestTtcRefCursorDescriptor(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcRefCursorDescriptor: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcImplicitResultSet" << std::endl;
-    try { TestTtcImplicitResultSet(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcImplicitResultSet: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcOutBindsRow" << std::endl;
-    try { TestTtcOutBindsRow(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcOutBindsRow: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcCallResponse" << std::endl;
-    try { TestTtcCallResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcCallResponse: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcExecuteNoBindsCodec" << std::endl;
-    try { TestTtcExecuteNoBindsCodec(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcExecuteNoBindsCodec: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcExecuteQueryLeavesTheFetchOnlyBitClear" << std::endl;
-    try { TestTtcExecuteQueryLeavesTheFetchOnlyBitClear(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcExecuteQueryLeavesTheFetchOnlyBitClear: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcExecuteNoBindsShape" << std::endl;
-    try { TestTtcExecuteNoBindsShape(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcExecuteNoBindsShape: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcExecuteRefCursorBindShape" << std::endl;
-    try { TestTtcExecuteRefCursorBindShape(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcExecuteRefCursorBindShape: " << failure.what() << std::endl;
-        throw;
-    }
+    TestUniversalIntegers();
+    TestWalletArchive();
+    TestLengthPrefixedValues();
+    TestEmptyValuesAreNull();
+    TestTtcDescribeInfoVersionGates();
+    TestTtcReturnParameterPrefix();
+    TestTtcFetchTruncatedEndOfCallIsTruncated();
+    TestPacketFraming();
+    TestPacketStream();
+    TestConnectPackets();
+    TestConnectHandshake();
+    TestTtcChannel();
+    TestTtcChannelShortPacketBoundary();
+    TestStatementChannelJoinsFragmentedResponse();
+    TestStatementChannelJoinsFragmentedExecuteResponse();
+    TestTtcCancellation();
+    TestTtcErrorDiagnostics();
+    TestLegacyTtcErrorBody();
+    TestTtcParameters();
+    TestTtcAuthEncoding();
+    TestTtcFetchCodec();
+    TestTtcFetchResponse();
+    TestFetchResponseDecoderResumes();
+    TestOracleIntegerMatchesDecimalText();
+    TestTtcIoVector();
+    TestTtcRefCursorDescriptor();
+    TestTtcImplicitResultSet();
+    TestTtcOutBindsRow();
+    TestTtcCallResponse();
+    TestTtcExecuteNoBindsCodec();
+    TestTtcExecuteQueryLeavesTheFetchOnlyBitClear();
+    TestTtcExecuteNoBindsShape();
+    TestTtcExecuteRefCursorBindShape();
 #if !defined(_WIN32)
-    std::cout << "[run] TestLocalTlsCertificateVerification" << std::endl;
-    try { TestLocalTlsCertificateVerification(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLocalTlsCertificateVerification: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTlsReadFailureDoesNotKillTheProcess" << std::endl;
-    try { TestTlsReadFailureDoesNotKillTheProcess(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTlsReadFailureDoesNotKillTheProcess: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTlsReadIgnoresUnrelatedErrorQueue" << std::endl;
-    try { TestTlsReadIgnoresUnrelatedErrorQueue(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTlsReadIgnoresUnrelatedErrorQueue: " << failure.what() << std::endl;
-        throw;
-    }
+    TestLocalTlsCertificateVerification();
+    TestTlsReadFailureDoesNotKillTheProcess();
+    TestTlsReadIgnoresUnrelatedErrorQueue();
 #endif
-    std::cout << "[run] TestDescriptorSecuritySection" << std::endl;
-    try { TestDescriptorSecuritySection(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestDescriptorSecuritySection: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestServerDnComparison" << std::endl;
-    try { TestServerDnComparison(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestServerDnComparison: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcExecuteArrayDml" << std::endl;
-    try { TestTtcExecuteArrayDml(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcExecuteArrayDml: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcErrorNamesTheFailingIteration" << std::endl;
-    try { TestTtcErrorNamesTheFailingIteration(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcErrorNamesTheFailingIteration: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcErrorCarriesADmlRowId" << std::endl;
-    try { TestTtcErrorCarriesADmlRowId(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcErrorCarriesADmlRowId: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcRowDataCodec" << std::endl;
-    try { TestTtcRowDataCodec(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcRowDataCodec: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLegacyAnoNegotiation" << std::endl;
-    try { TestLegacyAnoNegotiation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLegacyAnoNegotiation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcNegotiation" << std::endl;
-    try { TestTtcNegotiation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcNegotiation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestO5LogonFlow" << std::endl;
-    try { TestO5LogonFlow(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestO5LogonFlow: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestO5Logon11GVerifier" << std::endl;
-    try { TestO5Logon11GVerifier(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestO5Logon11GVerifier: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestO5Logon11GRejectsTheWrongVerifier" << std::endl;
-    try { TestO5Logon11GRejectsTheWrongVerifier(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestO5Logon11GRejectsTheWrongVerifier: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestO5Logon11GRejectsMalformedChallenges" << std::endl;
-    try { TestO5Logon11GRejectsMalformedChallenges(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestO5Logon11GRejectsMalformedChallenges: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestO5LogonVerifierAcceptance" << std::endl;
-    try { TestO5LogonVerifierAcceptance(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestO5LogonVerifierAcceptance: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLegacyChunkEncoding" << std::endl;
-    try { TestLegacyChunkEncoding(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLegacyChunkEncoding: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLegacy11GChallengeParameters" << std::endl;
-    try { TestLegacy11GChallengeParameters(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLegacy11GChallengeParameters: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestO5Logon11GPhaseTwoParameters" << std::endl;
-    try { TestO5Logon11GPhaseTwoParameters(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestO5Logon11GPhaseTwoParameters: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestConnectDescriptor" << std::endl;
-    try { TestConnectDescriptor(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestConnectDescriptor: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestConnectDescriptorStaysInline" << std::endl;
-    try { TestConnectDescriptorStaysInline(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestConnectDescriptorStaysInline: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestDescriptorParser" << std::endl;
-    try { TestDescriptorParser(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestDescriptorParser: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestValueCodecs" << std::endl;
-    try { TestValueCodecs(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestValueCodecs: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestAuthCrypto" << std::endl;
-    try { TestAuthCrypto(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestAuthCrypto: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestCallRegistry" << std::endl;
-    try { TestCallRegistry(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestCallRegistry: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestProcedureCallBuilder" << std::endl;
-    try { TestProcedureCallBuilder(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestProcedureCallBuilder: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestDmlCompositeBlock" << std::endl;
-    try { TestDmlCompositeBlock(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestDmlCompositeBlock: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestBindValidation" << std::endl;
-    try { TestBindValidation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestBindValidation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSqlBindExtraction" << std::endl;
-    try { TestSqlBindExtraction(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSqlBindExtraction: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSqlStatementValidation" << std::endl;
-    try { TestSqlStatementValidation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSqlStatementValidation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTransactions" << std::endl;
-    try { TestTransactions(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTransactions: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestValidatedSession" << std::endl;
-    try { TestValidatedSession(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestValidatedSession: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestStatementRegistry" << std::endl;
-    try { TestStatementRegistry(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestStatementRegistry: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcStatementChannel" << std::endl;
-    try { TestTtcStatementChannel(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcStatementChannel: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcCursorClosePiggyback" << std::endl;
-    try { TestTtcCursorClosePiggyback(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcCursorClosePiggyback: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcTransactionCodec" << std::endl;
-    try { TestTtcTransactionCodec(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcTransactionCodec: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcExecuteStatementChannel" << std::endl;
-    try { TestTtcExecuteStatementChannel(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcExecuteStatementChannel: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLiveTnsNegotiation" << std::endl;
-    try { TestLiveTnsNegotiation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLiveTnsNegotiation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestZeroWidthColumnsCarryNoRowBytes" << std::endl;
-    try { TestZeroWidthColumnsCarryNoRowBytes(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestZeroWidthColumnsCarryNoRowBytes: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobRowDataCarriesALocator" << std::endl;
-    try { TestLobRowDataCarriesALocator(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobRowDataCarriesALocator: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobLocatorsSurviveARowContinuation" << std::endl;
-    try { TestLobLocatorsSurviveARowContinuation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobLocatorsSurviveARowContinuation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobGetLengthResponse" << std::endl;
-    try { TestLobGetLengthResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobGetLengthResponse: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobReadResponseIsUtf16ForAClob" << std::endl;
-    try { TestLobReadResponseIsUtf16ForAClob(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobReadResponseIsUtf16ForAClob: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobReadResponseIsRawForABlob" << std::endl;
-    try { TestLobReadResponseIsRawForABlob(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobReadResponseIsRawForABlob: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestPartialLobResponseReadsAsTruncated" << std::endl;
-    try { TestPartialLobResponseReadsAsTruncated(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestPartialLobResponseReadsAsTruncated: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobRequestLayout" << std::endl;
-    try { TestLobRequestLayout(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobRequestLayout: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestUtf16BeConversion" << std::endl;
-    try { TestUtf16BeConversion(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestUtf16BeConversion: " << failure.what() << std::endl;
-        throw;
-    }
+    TestDescriptorSecuritySection();
+    TestServerDnComparison();
+    TestTtcExecuteArrayDml();
+    TestTtcErrorNamesTheFailingIteration();
+    TestTtcErrorCarriesADmlRowId();
+    TestTtcRowDataCodec();
+    TestLegacyAnoNegotiation();
+    TestTtcNegotiation();
+    TestO5LogonFlow();
+    TestO5Logon11GVerifier();
+    TestO5Logon11GRejectsTheWrongVerifier();
+    TestO5Logon11GRejectsMalformedChallenges();
+    TestO5LogonVerifierAcceptance();
+    TestLegacyChunkEncoding();
+    TestLegacy11GChallengeParameters();
+    TestO5Logon11GPhaseTwoParameters();
+    TestConnectDescriptor();
+    TestConnectDescriptorStaysInline();
+    TestDescriptorParser();
+    TestValueCodecs();
+    TestAuthCrypto();
+    TestCallRegistry();
+    TestProcedureCallBuilder();
+    TestDmlCompositeBlock();
+    TestBindValidation();
+    TestSqlBindExtraction();
+    TestSqlStatementValidation();
+    TestTransactions();
+    TestValidatedSession();
+    TestStatementRegistry();
+    TestTtcStatementChannel();
+    TestTtcCursorClosePiggyback();
+    TestTtcTransactionCodec();
+    TestTtcExecuteStatementChannel();
+    TestLiveTnsNegotiation();
+    TestZeroWidthColumnsCarryNoRowBytes();
+    TestLobRowDataCarriesALocator();
+    TestLobLocatorsSurviveARowContinuation();
+    TestLobGetLengthResponse();
+    TestLobReadResponseIsUtf16ForAClob();
+    TestLobReadResponseIsRawForABlob();
+    TestPartialLobResponseReadsAsTruncated();
+    TestLobRequestLayout();
+    TestUtf16BeConversion();
 #if !defined(_WIN32)
-    std::cout << "[run] TestWriteToClosedPeerDoesNotKillTheProcess" << std::endl;
-    try { TestWriteToClosedPeerDoesNotKillTheProcess(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestWriteToClosedPeerDoesNotKillTheProcess: " << failure.what() << std::endl;
-        throw;
-    }
+    TestWriteToClosedPeerDoesNotKillTheProcess();
 #endif
-    std::cout << "[run] TestConnectRunsThroughTheTransportSeam" << std::endl;
-    try { TestConnectRunsThroughTheTransportSeam(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestConnectRunsThroughTheTransportSeam: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectDataSplitting" << std::endl;
-    try { TestRedirectDataSplitting(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectDataSplitting: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectPacketFraming" << std::endl;
-    try { TestRedirectPacketFraming(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectPacketFraming: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRefusalCarriesTheOracleCode" << std::endl;
-    try { TestRefusalCarriesTheOracleCode(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRefusalCarriesTheOracleCode: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestReconnectCarriesTheRedirectFlag" << std::endl;
-    try { TestReconnectCarriesTheRedirectFlag(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestReconnectCarriesTheRedirectFlag: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestDescriptorRoutingParameters" << std::endl;
-    try { TestDescriptorRoutingParameters(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestDescriptorRoutingParameters: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectAddressParsing" << std::endl;
-    try { TestRedirectAddressParsing(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectAddressParsing: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestConnectOrderPolicy" << std::endl;
-    try { TestConnectOrderPolicy(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestConnectOrderPolicy: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRoutedConfigValidationAndDescriptors" << std::endl;
-    try { TestRoutedConfigValidationAndDescriptors(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRoutedConfigValidationAndDescriptors: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestConnectFailsOverToTheNextAddress" << std::endl;
-    try { TestConnectFailsOverToTheNextAddress(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestConnectFailsOverToTheNextAddress: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRefusalFailsOverAndKeepsTheCode" << std::endl;
-    try { TestRefusalFailsOverAndKeepsTheCode(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRefusalFailsOverAndKeepsTheCode: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestEveryAddressUnreachableIsListed" << std::endl;
-    try { TestEveryAddressUnreachableIsListed(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestEveryAddressUnreachableIsListed: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestScanNameWithSeveralAddresses" << std::endl;
-    try { TestScanNameWithSeveralAddresses(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestScanNameWithSeveralAddresses: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestScanListenerRedirectsToANode" << std::endl;
-    try { TestScanListenerRedirectsToANode(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestScanListenerRedirectsToANode: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectWithoutReconnectDataIsRebuilt" << std::endl;
-    try { TestRedirectWithoutReconnectDataIsRebuilt(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectWithoutReconnectDataIsRebuilt: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestUnreachableRedirectTargetFallsBack" << std::endl;
-    try { TestUnreachableRedirectTargetFallsBack(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestUnreachableRedirectTargetFallsBack: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectCyclesAndLimits" << std::endl;
-    try { TestRedirectCyclesAndLimits(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectCyclesAndLimits: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectCannotChangeTheProtocol" << std::endl;
-    try { TestRedirectCannotChangeTheProtocol(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectCannotChangeTheProtocol: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestMalformedListenerAnswersAreNotFailedOver" << std::endl;
-    try { TestMalformedListenerAnswersAreNotFailedOver(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestMalformedListenerAnswersAreNotFailedOver: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestUnresolvableNameFailsOver" << std::endl;
-    try { TestUnresolvableNameFailsOver(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestUnresolvableNameFailsOver: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRetriesDelaysAndTheBudget" << std::endl;
-    try { TestRetriesDelaysAndTheBudget(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRetriesDelaysAndTheBudget: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestCancellationStopsTheConnect" << std::endl;
-    try { TestCancellationStopsTheConnect(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestCancellationStopsTheConnect: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLoadBalanceShufflesEachConnection" << std::endl;
-    try { TestLoadBalanceShufflesEachConnection(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLoadBalanceShufflesEachConnection: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectChainKeepsEachLevelsAlternatives" << std::endl;
-    try { TestRedirectChainKeepsEachLevelsAlternatives(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectChainKeepsEachLevelsAlternatives: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestListenerEchoOfTheClientsConnectData" << std::endl;
-    try { TestListenerEchoOfTheClientsConnectData(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestListenerEchoOfTheClientsConnectData: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestOobProbeAfterRedirectAcceptsTheRedirectFlag" << std::endl;
-    try { TestOobProbeAfterRedirectAcceptsTheRedirectFlag(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestOobProbeAfterRedirectAcceptsTheRedirectFlag: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestBudgetHoldsThroughTheListenerExchange" << std::endl;
-    try { TestBudgetHoldsThroughTheListenerExchange(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestBudgetHoldsThroughTheListenerExchange: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSlowNameResolutionIsCutOffByTheBudget" << std::endl;
-    try { TestSlowNameResolutionIsCutOffByTheBudget(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSlowNameResolutionIsCutOffByTheBudget: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestResolverWorkersAreBounded" << std::endl;
-    try { TestResolverWorkersAreBounded(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestResolverWorkersAreBounded: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestBudgetHoldsUntilAuthentication" << std::endl;
-    try { TestBudgetHoldsUntilAuthentication(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestBudgetHoldsUntilAuthentication: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRedirectTextStaysOutOfErrors" << std::endl;
-    try { TestRedirectTextStaysOutOfErrors(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRedirectTextStaysOutOfErrors: " << failure.what() << std::endl;
-        throw;
-    }
+    TestConnectRunsThroughTheTransportSeam();
+    TestRedirectDataSplitting();
+    TestRedirectPacketFraming();
+    TestRefusalCarriesTheOracleCode();
+    TestReconnectCarriesTheRedirectFlag();
+    TestDescriptorRoutingParameters();
+    TestRedirectAddressParsing();
+    TestConnectOrderPolicy();
+    TestRoutedConfigValidationAndDescriptors();
+    TestConnectFailsOverToTheNextAddress();
+    TestRefusalFailsOverAndKeepsTheCode();
+    TestEveryAddressUnreachableIsListed();
+    TestScanNameWithSeveralAddresses();
+    TestScanListenerRedirectsToANode();
+    TestRedirectWithoutReconnectDataIsRebuilt();
+    TestUnreachableRedirectTargetFallsBack();
+    TestRedirectCyclesAndLimits();
+    TestRedirectCannotChangeTheProtocol();
+    TestMalformedListenerAnswersAreNotFailedOver();
+    TestUnresolvableNameFailsOver();
+    TestRetriesDelaysAndTheBudget();
+    TestCancellationStopsTheConnect();
+    TestLoadBalanceShufflesEachConnection();
+    TestRedirectChainKeepsEachLevelsAlternatives();
+    TestListenerEchoOfTheClientsConnectData();
+    TestOobProbeAfterRedirectAcceptsTheRedirectFlag();
+    TestBudgetHoldsThroughTheListenerExchange();
+    TestSlowNameResolutionIsCutOffByTheBudget();
+    TestResolverWorkersAreBounded();
+    TestBudgetHoldsUntilAuthentication();
+    TestRedirectTextStaysOutOfErrors();
 #if !defined(_WIN32)
-    std::cout << "[run] TestLoopbackListenersFailoverAndRedirect" << std::endl;
-    try { TestLoopbackListenersFailoverAndRedirect(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLoopbackListenersFailoverAndRedirect: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSilentListenerIsBoundedByTheBudget" << std::endl;
-    try { TestSilentListenerIsBoundedByTheBudget(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSilentListenerIsBoundedByTheBudget: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSilentServerAfterAcceptIsBoundedByTheBudget" << std::endl;
-    try { TestSilentServerAfterAcceptIsBoundedByTheBudget(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSilentServerAfterAcceptIsBoundedByTheBudget: " << failure.what() << std::endl;
-        throw;
-    }
+    TestLoopbackListenersFailoverAndRedirect();
+    TestSilentListenerIsBoundedByTheBudget();
+    TestSilentServerAfterAcceptIsBoundedByTheBudget();
 #endif
-    std::cout << "[run] TestTransportWithoutOutOfBandRefusesTheOobProbe" << std::endl;
-    try { TestTransportWithoutOutOfBandRefusesTheOobProbe(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTransportWithoutOutOfBandRefusesTheOobProbe: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestRepeatedRowsCarryNoValues" << std::endl;
-    try { TestRepeatedRowsCarryNoValues(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestRepeatedRowsCarryNoValues: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTtcErrorTailEndsTheResponse" << std::endl;
-    try { TestTtcErrorTailEndsTheResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTtcErrorTailEndsTheResponse: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestNegotiatedTtcFieldVersion" << std::endl;
-    try { TestNegotiatedTtcFieldVersion(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestNegotiatedTtcFieldVersion: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestEndOfResponseNegotiation" << std::endl;
-    try { TestEndOfResponseNegotiation(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestEndOfResponseNegotiation: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSessionFactory" << std::endl;
-    try { TestSessionFactory(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSessionFactory: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSessionPool" << std::endl;
-    try { TestSessionPool(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSessionPool: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestSsoWallet" << std::endl;
-    try { TestSsoWallet(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestSsoWallet: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobPrefetchMaterializer" << std::endl;
-    try { TestLobPrefetchMaterializer(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobPrefetchMaterializer: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobPrefetchScalarBudget" << std::endl;
-    try { TestLobPrefetchScalarBudget(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobPrefetchScalarBudget: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobPrefetchDecoderResumes" << std::endl;
-    try { TestLobPrefetchDecoderResumes(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobPrefetchDecoderResumes: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTransactionPoolReusesAfterAConfirmedEnd" << std::endl;
-    try { TestTransactionPoolReusesAfterAConfirmedEnd(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTransactionPoolReusesAfterAConfirmedEnd: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTransactionPoolClosesWhatIsNotClean" << std::endl;
-    try { TestTransactionPoolClosesWhatIsNotClean(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTransactionPoolClosesWhatIsNotClean: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTransactionPoolReplacesASessionThatDiedIdle" << std::endl;
-    try { TestTransactionPoolReplacesASessionThatDiedIdle(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTransactionPoolReplacesASessionThatDiedIdle: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTransactionPoolIsBounded" << std::endl;
-    try { TestTransactionPoolIsBounded(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTransactionPoolIsBounded: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestTransactionPoolFollowsEachCallersDeadline" << std::endl;
-    try { TestTransactionPoolFollowsEachCallersDeadline(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestTransactionPoolFollowsEachCallersDeadline: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobCallIsCompleteOnlyWithItsEndOfCall" << std::endl;
-    try { TestLobCallIsCompleteOnlyWithItsEndOfCall(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobCallIsCompleteOnlyWithItsEndOfCall: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobCallRefusalsKeepTheirOracleError" << std::endl;
-    try { TestLobCallRefusalsKeepTheirOracleError(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobCallRefusalsKeepTheirOracleError: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobOperationReadsTheWholeResponse" << std::endl;
-    try { TestLobOperationReadsTheWholeResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobOperationReadsTheWholeResponse: " << failure.what() << std::endl;
-        throw;
-    }
-    std::cout << "[run] TestLobOperationObeysTheDeadlineMidResponse" << std::endl;
-    try { TestLobOperationObeysTheDeadlineMidResponse(); } catch (const std::exception &failure) {
-        std::cout << "[fail] TestLobOperationObeysTheDeadlineMidResponse: " << failure.what() << std::endl;
-        throw;
-    }
+    TestTransportWithoutOutOfBandRefusesTheOobProbe();
+    TestRepeatedRowsCarryNoValues();
+    TestTtcErrorTailEndsTheResponse();
+    TestNegotiatedTtcFieldVersion();
+    TestEndOfResponseNegotiation();
+    TestSessionFactory();
+    TestSessionPool();
+    TestSsoWallet();
+    TestLobPrefetchMaterializer();
+    TestLobPrefetchScalarBudget();
+    TestLobPrefetchDecoderResumes();
+    TestTransactionPoolReusesAfterAConfirmedEnd();
+    TestTransactionPoolClosesWhatIsNotClean();
+    TestTransactionPoolReplacesASessionThatDiedIdle();
+    TestTransactionPoolIsBounded();
+    TestTransactionPoolFollowsEachCallersDeadline();
+    TestLobCallIsCompleteOnlyWithItsEndOfCall();
+    TestLobCallRefusalsKeepTheirOracleError();
+    TestLobOperationReadsTheWholeResponse();
+    TestLobOperationObeysTheDeadlineMidResponse();
     std::cout << "oracle_scanner protocol tests passed\n";
     return 0;
 }

@@ -117,6 +117,30 @@ struct OracleAttachedState {
     // The name the ATTACH resolved, so scans of this catalog share one pool.
     std::string secret_name;
     std::string current_schema;
+    // ATTACH ... (SCHEMA 'X'): the schema whose objects this catalog lists, when
+    // it is not the connected user's. Empty reads the user's own through the
+    // USER_ views; set, it reads the ALL_ views for this owner.
+    std::string owner;
+
+    static std::string Literal(const std::string &text) {
+        std::string result = "'";
+        for (const auto character : text) {
+            result.push_back(character);
+            if (character == '\'') {
+                result.push_back('\'');
+            }
+        }
+        return result + "'";
+    }
+    // `user_tables` or `all_tables`, whichever this catalog reads.
+    std::string View(const char *name) const {
+        return std::string(owner.empty() ? "user_" : "all_") + name;
+    }
+    // A condition on the owner column, with the word that joins it to what
+    // comes before. Empty for the connected user's own schema.
+    std::string OwnerCondition(const char *column, const char *joiner) const {
+        return owner.empty() ? std::string() : std::string(" ") + joiner + " " + column + " = " + Literal(owner);
+    }
     mutable std::mutex metadata_lock;
     mutable bool objects_loaded = false;
     mutable std::vector<std::string> object_names;
@@ -146,6 +170,51 @@ struct OracleAttachedState {
         session.Finish();
         if (current_schema.empty()) {
             throw IOException("Oracle ATTACH received an empty current schema");
+        }
+        if (!owner.empty()) {
+            ResolveOwner();
+        }
+    }
+
+    // Settles the SCHEMA option against ALL_USERS: the name as written if it is
+    // a schema, else the one schema that matches ignoring case (names are
+    // upper case unless they were created quoted). The connected user's own
+    // schema needs no qualification and is read through the USER_ views.
+    void ResolveOwner() {
+        const auto lookup = [&](const std::string &condition) {
+            std::vector<std::string> found;
+            OracleMetadataLease session(transaction_pool, config, password);
+            auto cursor = TranslatingOracleErrors("Oracle ATTACH could not look up the SCHEMA option", [&] {
+                return session->Query("SELECT username FROM all_users WHERE " + condition, {});
+            });
+            for (;;) {
+                const auto batch = TranslatingOracleErrors("Oracle ATTACH could not look up the SCHEMA option",
+                                                           [&] { return cursor->Fetch(8); });
+                for (const auto &row : batch.rows) {
+                    if (!row.empty() && row[0]) {
+                        found.emplace_back(row[0]->begin(), row[0]->end());
+                    }
+                }
+                if (batch.exhausted) {
+                    break;
+                }
+            }
+            cursor->Close();
+            session.Finish();
+            return found;
+        };
+        auto found = lookup("username = " + Literal(owner));
+        if (found.empty()) {
+            found = lookup("UPPER(username) = UPPER(" + Literal(owner) + ")");
+        }
+        if (found.size() != 1) {
+            throw BinderException(found.empty() ? "Oracle ATTACH: there is no schema \"%s\" that this user can see"
+                                                : "Oracle ATTACH: schema \"%s\" matches several users by case; write it exactly",
+                                  owner);
+        }
+        owner = found[0];
+        if (owner == current_schema) {
+            owner.clear();
         }
     }
 
@@ -177,10 +246,11 @@ struct OracleAttachedState {
             cursor->Close();
             session.Finish();
         };
-        append_names("SELECT table_name FROM user_tables WHERE ROWNUM <= " + std::to_string(maximum_objects));
+        append_names("SELECT table_name FROM " + View("tables") + " WHERE ROWNUM <= " + std::to_string(maximum_objects) +
+                     OwnerCondition("owner", "AND"));
         if (object_names.size() < maximum_objects) {
-            append_names("SELECT view_name FROM user_views WHERE ROWNUM <= " +
-                         std::to_string(maximum_objects - object_names.size()));
+            append_names("SELECT view_name FROM " + View("views") + " WHERE ROWNUM <= " +
+                         std::to_string(maximum_objects - object_names.size()) + OwnerCondition("owner", "AND"));
         }
         objects_loaded = true;
         return object_names;
@@ -353,7 +423,8 @@ struct OracleAttachedState {
         if (!any) {
             return;
         }
-        std::string sql = "SELECT table_name, column_name, vector_info FROM user_tab_columns WHERE data_type = 'VECTOR'";
+        std::string sql = "SELECT table_name, column_name, vector_info FROM " + View("tab_columns") +
+                          " WHERE data_type = 'VECTOR'" + OwnerCondition("owner", "AND");
         if (!only_object.empty()) {
             std::string literal;
             for (const auto character : only_object) {
@@ -428,7 +499,8 @@ struct OracleAttachedState {
         OracleMetadataLease session(transaction_pool, config, password);
         auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read schema metadata", [&] {
             return session->Query("SELECT table_name, column_name, data_type, data_length, data_precision, "
-                                  "data_scale, nullable FROM user_tab_columns ORDER BY table_name, column_id",
+                                  "data_scale, nullable FROM " + View("tab_columns") + OwnerCondition("owner", "WHERE") +
+                                      " ORDER BY table_name, column_id",
                                   {});
         });
         size_t loaded_columns = 0;
@@ -476,8 +548,8 @@ struct OracleAttachedState {
         }
         OracleMetadataLease session(transaction_pool, config, password);
         const auto metadata_sql = "SELECT column_name, data_type, data_length, data_precision, data_scale, nullable "
-                                  "FROM user_tab_columns WHERE table_name = '" +
-                                  name_literal + "' ORDER BY column_id";
+                                  "FROM " + View("tab_columns") + " WHERE table_name = '" + name_literal + "'" +
+                                  OwnerCondition("owner", "AND") + " ORDER BY column_id";
         auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read column metadata",
                                               [&] { return session->Query(metadata_sql, {}); });
         std::vector<OracleColumn> columns;
@@ -508,9 +580,11 @@ struct OracleAttachedState {
         try {
             OracleMetadataLease session(transaction_pool, config, password);
             auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read primary keys", [&] {
-                return session->Query("SELECT c.table_name, k.column_name FROM user_constraints c JOIN "
-                                      "user_cons_columns k ON k.constraint_name = c.constraint_name AND "
-                                      "k.table_name = c.table_name WHERE c.constraint_type = 'P' AND "
+                return session->Query("SELECT c.table_name, k.column_name FROM " + View("constraints") + " c JOIN " +
+                                      View("cons_columns") + " k ON k.constraint_name = c.constraint_name AND "
+                                      "k.table_name = c.table_name" +
+                                      (owner.empty() ? std::string() : " AND k.owner = c.owner") +
+                                      " WHERE c.constraint_type = 'P'" + OwnerCondition("c.owner", "AND") + " AND "
                                       "c.status = 'ENABLED' AND c.validated = 'VALIDATED' ORDER BY c.table_name, "
                                       "k.position",
                                       {});
@@ -589,6 +663,7 @@ struct OracleAttachedState {
         result->config = config;
         result->password = password;
         result->object_name = object_name;
+        result->schema_name = owner;
         result->secret_name = secret_name;
         result->columns = TryDescribe(object_name);
         if (result->columns.empty()) {
@@ -738,6 +813,7 @@ public:
         OracleWriteTarget target;
         target.catalog_name = catalog_name;
         target.object_name = object_name;
+        target.schema_name = state->owner;
         target.config = state->config;
         target.password = state->password;
         target.pool = state->transaction_pool;
@@ -893,9 +969,9 @@ unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInf
         // wrapper; DuckLake forwards them when attaching its metadata catalog.
         if (!StringUtil::CIEquals(option.first, "type") && !StringUtil::CIEquals(option.first, "read_only") &&
             !StringUtil::CIEquals(option.first, "readonly") && !StringUtil::CIEquals(option.first, "read_write") &&
-            !StringUtil::CIEquals(option.first, "hidden")) {
+            !StringUtil::CIEquals(option.first, "hidden") && !StringUtil::CIEquals(option.first, "schema")) {
             throw BinderException(
-                "Oracle ATTACH does not accept option '%s' yet; use ATTACH 'secret_name' AS name (TYPE oracle_scanner)",
+                "Oracle ATTACH does not accept option '%s' yet; use ATTACH 'secret_name' AS name (TYPE oracle_scanner[, SCHEMA 'owner'])",
                 option.first);
         }
     }
@@ -904,6 +980,20 @@ unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInf
     state->config = ConnectionFromSecret(context, info.path, password);
     state->password = std::move(password);
     state->secret_name = info.path;
+    for (const auto &option : info.options) {
+        if (StringUtil::CIEquals(option.first, "schema")) {
+            if (option.second.IsNull() || option.second.type().id() != LogicalTypeId::VARCHAR ||
+                option.second.GetValue<std::string>().empty()) {
+                throw BinderException("Oracle ATTACH option SCHEMA takes a schema name as a string");
+            }
+            state->owner = option.second.GetValue<std::string>();
+        }
+    }
+    // The local storage DuckDB gives every attached database refuses options it
+    // does not know, so the one this catalog took is not passed on.
+    for (auto entry = options.options.begin(); entry != options.options.end();) {
+        entry = StringUtil::CIEquals(entry->first, "schema") ? options.options.erase(entry) : std::next(entry);
+    }
     state->transaction_pool = MakeOracleTransactionPool(context, state->config, state->password);
     // DuckDB's attached-database wrapper owns a local StorageManager even for
     // a custom catalog. Keep that storage in memory: the ATTACH path is a
@@ -972,6 +1062,11 @@ OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::st
     return catalog.Cast<OracleAttachedCatalog>().WriteTarget();
 }
 
+std::string OracleObjectReference(const std::string &schema_name, const std::string &object_name) {
+    const auto object = KeywordHelper::WriteQuotedAndEscaped(object_name, '"');
+    return schema_name.empty() ? object : KeywordHelper::WriteQuotedAndEscaped(schema_name, '"') + "." + object;
+}
+
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
                        OracleSessionHandle &session, std::unique_ptr<OracleCursor> &cursor,
                        std::vector<OracleColumn> &columns) {
@@ -986,7 +1081,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         }
         select_list += KeywordHelper::WriteQuotedAndEscaped(bind.columns[column_id].name, '"');
     }
-    auto sql = "SELECT " + select_list + " FROM " + KeywordHelper::WriteQuotedAndEscaped(bind.object_name, '"');
+    auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
     // The translated predicates, when filter pushdown is enabled and every
     // filter could be proven. An empty clause means nothing was pushed.
     if (!bind.where_clause.empty()) {

@@ -1196,7 +1196,7 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
     if (bound_columns.empty()) {
         throw NotImplementedException("Oracle INSERT needs at least one column");
     }
-    auto sql = "INSERT INTO " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " (" + column_list +
+    auto sql = "INSERT INTO " + OracleObjectReference(target.schema_name, target.object_name) + " (" + column_list +
               ") VALUES (" + value_list + ")";
     // RETURNING asks Oracle for the row it actually stored. Echoing back what
     // was sent would be wrong for exactly the cases the clause exists for: a
@@ -1244,7 +1244,7 @@ PhysicalOperator &PlanOracleDelete(ClientContext &, PhysicalPlanGenerator &plann
     if (op.return_chunk) {
         throw NotImplementedException("Oracle DELETE does not support RETURNING yet");
     }
-    const auto sql = "DELETE FROM " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " WHERE ROWID = " +
+    const auto sql = "DELETE FROM " + OracleObjectReference(target.schema_name, target.object_name) + " WHERE ROWID = " +
                      "CHARTOROWID(:1)";
     auto &deletion = planner.Make<OracleDeleteOperator>(op.types, op.estimated_cardinality, std::move(target), sql);
     deletion.children.push_back(plan);
@@ -1292,7 +1292,7 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
     if (assignments.empty()) {
         throw NotImplementedException("Oracle UPDATE needs at least one column to set");
     }
-    const auto sql = "UPDATE " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " SET " + assignments +
+    const auto sql = "UPDATE " + OracleObjectReference(target.schema_name, target.object_name) + " SET " + assignments +
                      " WHERE ROWID = CHARTOROWID(:" + std::to_string(set_columns.size() + 1) + ")";
     auto &update = planner.Make<OracleUpdateOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
                                                       std::move(source_indexes), std::move(set_columns));

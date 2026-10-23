@@ -214,9 +214,17 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
         return false;
     }
     auto object = sql.substr(from_at + 7);
-    const auto object_end = object.find('"');
+    auto object_end = object.find('"');
     if (object_end == std::string::npos) {
         return false;
+    }
+    if (object.compare(object_end, 3, "\".\"") == 0) {
+        // "OWNER"."TABLE": the table is the second name.
+        object = object.substr(object_end + 3);
+        object_end = object.find('"');
+        if (object_end == std::string::npos) {
+            return false;
+        }
     }
     object.erase(object_end);
     const auto table = script.tables.find(object);
@@ -2183,6 +2191,75 @@ void TestJsonAndVectorColumnsThroughSql() {
     std::cout << "JSON and VECTOR columns read, write and attach against a fake session" << std::endl;
 }
 
+// ATTACH ... (SCHEMA 'x') lists another user's tables through the ALL_ views,
+// qualifies every statement with the owner, and settles the name against
+// ALL_USERS. The connected user's own schema, named or not, stays on USER_.
+void TestAttachToAnotherSchema() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("READER")}}}});
+    script->routes.push_back({"username = 'hr'", {text_columns({"USERNAME"}), {}}});
+    script->routes.push_back({"UPPER(username) = UPPER('hr')", {text_columns({"USERNAME"}), {{Text("HR")}}}});
+    script->routes.push_back({"username = 'HR'", {text_columns({"USERNAME"}), {{Text("HR")}}}});
+    script->routes.push_back({"username = 'READER'", {text_columns({"USERNAME"}), {{Text("READER")}}}});
+    script->routes.push_back({"username = 'NOBODY'", {text_columns({"USERNAME"}), {}}});
+    script->routes.push_back({"UPPER(username) = UPPER('NOBODY')", {text_columns({"USERNAME"}), {}}});
+    script->routes.push_back({"FROM all_tables", {text_columns({"TABLE_NAME"}), {{Text("ITEMS")}}}});
+    script->routes.push_back({"FROM all_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("OWN_TABLE")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM all_tab_columns",
+         {dictionary, {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary, {{Text("OWN_TABLE"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back({"FROM all_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {{Text("ITEMS"), Text("ID")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    script->tables["OWN_TABLE"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+
+    // Written in lower case, resolved to the one user it matches.
+    database.Run("ATTACH 'ora' AS other (TYPE oracle_scanner, SCHEMA 'hr');");
+    auto listed = database.Query("SELECT table_name FROM duckdb_tables() WHERE database_name = 'other';");
+    CHECK(!listed->HasError() && listed->RowCount() == 1 && listed->GetValue(0, 0).ToString() == "ITEMS");
+    CHECK(!database.Query("SELECT * FROM other.main.ITEMS;")->HasError());
+    CHECK(script->queries.back().find("FROM \"HR\".\"ITEMS\"") != std::string::npos);
+    // The owner's key constraint came from ALL_CONSTRAINTS for this owner.
+    auto keys = database.Query("SELECT constraint_type FROM duckdb_constraints() WHERE table_name = 'ITEMS' "
+                               "AND constraint_type = 'PRIMARY KEY';");
+    CHECK(!keys->HasError() && keys->RowCount() == 1);
+    database.Run("INSERT INTO other.main.ITEMS VALUES (5);");
+    CHECK(script->counted_executes.back() == "INSERT INTO \"HR\".\"ITEMS\" (\"ID\") VALUES (:1)");
+    database.Run("UPDATE other.main.ITEMS SET ID = 6;");
+    CHECK(script->counted_executes.back().find("UPDATE \"HR\".\"ITEMS\" SET") == 0);
+    database.Run("DELETE FROM other.main.ITEMS;");
+    CHECK(script->counted_executes.back().find("DELETE FROM \"HR\".\"ITEMS\" WHERE ROWID") == 0);
+
+    // The connected user's own name reads the USER_ views, unqualified.
+    database.Run("ATTACH 'ora' AS own (TYPE oracle_scanner, SCHEMA 'READER');");
+    CHECK(!database.Query("SELECT * FROM own.main.OWN_TABLE;")->HasError());
+    CHECK(script->queries.back().find("FROM \"OWN_TABLE\"") != std::string::npos);
+
+    auto unknown = database.Query("ATTACH 'ora' AS nobody (TYPE oracle_scanner, SCHEMA 'NOBODY');");
+    CHECK(unknown->HasError() && unknown->GetError().find("no schema \"NOBODY\"") != std::string::npos);
+    auto not_text = database.Query("ATTACH 'ora' AS bad (TYPE oracle_scanner, SCHEMA 5);");
+    CHECK(not_text->HasError() && not_text->GetError().find("SCHEMA takes a schema name") != std::string::npos);
+    std::cout << "an attached catalog can read another user's schema" << std::endl;
+}
+
 void TestAttachedWritesAgainstAFakeSession() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -3762,6 +3839,7 @@ int main() {
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedWritesAgainstAFakeSession();
     TestAttachedCatalogNamesTheNewTypes();
+    TestAttachToAnotherSchema();
     TestJsonAndVectorColumnsThroughSql();
     TestParallelScanShardsOneSnapshot();
     TestParallelScanRangesDoNotOverflow();

@@ -424,7 +424,12 @@ SELECT * FROM o.ITEMS WHERE id > 100;
 
 The path is the **secret name**, not a connection string. One attachment exposes
 one schema: the connected user's own tables and views, resolved lazily from
-`USER_TABLES`, `USER_VIEWS`, and `USER_TAB_COLUMNS`.
+`USER_TABLES`, `USER_VIEWS`, and `USER_TAB_COLUMNS` — or, with `SCHEMA 'owner'`,
+another user's, from `ALL_TABLES`, `ALL_VIEWS`, `ALL_TAB_COLUMNS` and
+`ALL_CONSTRAINTS` filtered to that owner, with every statement qualified
+(`"OWNER"."TABLE"`). The name is checked against `ALL_USERS` at `ATTACH` (exact,
+else the single case-insensitive match; none is an error); naming the connected
+user is the same as naming nothing. Only what the connected user can see is listed.
 
 | Operation | Status |
 | --- | --- |
@@ -650,7 +655,7 @@ the attached catalog's transactions reuse sessions as §6 describes.
 Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
 LOB values past 16 MiB · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
 `LONG` and `ROWID` · object, collection, record and `XMLTYPE`
-types · `UPDATE`/`DELETE … RETURNING` · schemas other than the connected user's ·
+types · `UPDATE`/`DELETE … RETURNING` · several schemas in one attachment ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1
 verifier · SEPS · IAM · failover of an established session (TAF) ·
 Application Continuity · AQ ·

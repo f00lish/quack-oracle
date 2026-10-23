@@ -419,8 +419,15 @@ can stay in one SQL dialect:
 
 You can also `INSERT`, `UPDATE` and `DELETE` here — see the next section.
 
-**What `ATTACH` will not do:** create or drop tables, create schemas, or reach
-another user's schema. This extension issues no DDL at all. For those, use
+**Another user's schema.** Most people connect as a reader, not as the owner of the
+data. `ATTACH 'ora' AS hr (TYPE oracle_scanner, SCHEMA 'HR')` mounts that schema's
+tables and views instead — what `ALL_TABLES` and `ALL_VIEWS` show for that owner —
+and every statement names the table as `"HR"."EMPLOYEES"`. The name is resolved
+against `ALL_USERS`: as written, else the one user it matches ignoring case. Writes
+need the grants Oracle itself would ask for. One attachment is one schema; attach
+again, under another alias, for a second.
+
+**What `ATTACH` will not do:** create or drop tables, or create schemas. This extension issues no DDL at all. For those, use
 `oracle_query` with a fully qualified name, or see
 [the DDL note](#i-need-to-run-create-table-or-another-ddl-statement).
 

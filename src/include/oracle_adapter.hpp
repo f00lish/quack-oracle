@@ -203,6 +203,9 @@ struct OracleQueryBindData final : TableFunctionData {
     ConnectionConfig config;
     std::string password;
     std::string object_name;
+    //! The schema that owns the table when the catalog was attached to another
+    //! user's, empty for the connected user's own.
+    std::string schema_name;
     //! The secret this scan came from, which is half of the pool's key.
     std::string secret_name;
     //! The ATTACH alias this scan belongs to, empty for oracle_query. It is
@@ -315,12 +318,18 @@ const OracleCallableSignature &SelectOracleCallableOverload(const std::vector<Or
 struct OracleWriteTarget {
     std::string catalog_name;
     std::string object_name;
+    //! The owning schema when it is not the connected user's, else empty.
+    std::string schema_name;
     ConnectionConfig config;
     std::string password;
     // The attached catalog's pool of transaction sessions, or null when the
     // pool is disabled. Every session in it was opened from config and password.
     std::shared_ptr<oracle_scanner::OracleTransactionSessionPool> pool;
 };
+
+//! The name a statement uses for a table: quoted, and qualified by its owner when
+//! the catalog was attached to a schema other than the connected user's.
+std::string OracleObjectReference(const std::string &schema_name, const std::string &object_name);
 
 OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::string &catalog_name);
 void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name);

@@ -402,7 +402,9 @@ The thing in quotes is the **secret name**, not a connection string.
 You get the tables and views of the user you connected as — the same set
 `USER_TABLES` and `USER_VIEWS` would give you, resolved lazily as you name them
 rather than all at once. Names come back as Oracle stores them, which is upper
-case unless they were created quoted — so `o.ITEMS`, not `o.items`. `DESCRIBE`
+case unless they were created quoted. A name typed in another case finds the one
+object that matches ignoring case (`o.items` reads `ITEMS`); if a schema holds both
+`"items"` and `ITEMS`, write the exact spelling. `DESCRIBE`
 works, and `NOT NULL` columns and primary keys show up in
 `duckdb_constraints()`.
 

@@ -662,6 +662,45 @@ struct OracleAttachedState {
         return columns;
     }
 
+    // DuckDB looks a name up as the user typed it, and Oracle stores unquoted
+    // names in upper case, so `o.items` has to find ITEMS. An exact match wins;
+    // otherwise a match ignoring case is taken only when exactly one object has
+    // it, because a schema can hold both "items" and ITEMS and then the name
+    // does not say which was meant. Returns the name as Oracle stores it, or
+    // empty when there is no such object.
+    std::string ResolveObjectName(const std::string &requested) const {
+        {
+            std::lock_guard<std::mutex> lock(metadata_lock);
+            if (!metadata_loaded) {
+                LoadSchemaColumnsLocked();
+            }
+            if (column_cache.find(requested) != column_cache.end()) {
+                return requested;
+            }
+            std::string found;
+            size_t matches = 0;
+            for (const auto &entry : column_cache) {
+                if (StringUtil::CIEquals(entry.first, requested)) {
+                    found = entry.first;
+                    matches++;
+                }
+            }
+            if (matches == 1) {
+                return found;
+            }
+            if (matches > 1 || metadata_complete) {
+                return std::string();
+            }
+        }
+        // The bulk load was truncated and does not carry the name: ask for the
+        // spelling Oracle would have stored an unquoted one in.
+        const auto upper = StringUtil::Upper(requested);
+        if (upper != requested && !TryDescribe(upper).empty()) {
+            return upper;
+        }
+        return requested;
+    }
+
     // Describes the table from the dictionary and leaves the Oracle statement
     // for init, which is the first point that knows which columns the plan
     // actually reads.
@@ -713,8 +752,9 @@ public:
 
     static unique_ptr<OracleAttachedTableEntry> Create(Catalog &catalog, SchemaCatalogEntry &schema,
                                                         shared_ptr<OracleAttachedState> state,
-                                                        const std::string &object_name) {
-        const auto oracle_columns = state->TryDescribe(object_name);
+                                                        const std::string &requested_name) {
+        const auto object_name = state->ResolveObjectName(requested_name);
+        const auto oracle_columns = object_name.empty() ? std::vector<OracleColumn>() : state->TryDescribe(object_name);
         if (oracle_columns.empty()) {
             // Not an object in the attached schema. Returning nothing lets
             // DuckDB carry on resolving the name, which is what its own catalog

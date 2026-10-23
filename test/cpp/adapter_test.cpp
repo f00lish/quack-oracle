@@ -2358,6 +2358,11 @@ void TestXmlTypeColumnsAreText() {
     // The column is text on the DuckDB side, and the scan asks Oracle to serialize it.
     auto described = database.Query("SELECT data_type FROM duckdb_columns() WHERE column_name = 'BODY';");
     CHECK(!described->HasError() && described->GetValue(0, 0).ToString() == "VARCHAR");
+    // A name typed in lower case finds the one object that matches ignoring case,
+    // and the statement Oracle gets names it as Oracle stores it.
+    auto lower = database.Query("SELECT body FROM o.main.docs;");
+    CHECK(!lower->HasError() && lower->GetValue(0, 0).ToString() == "<a/>");
+    CHECK(script->queries.back().find("FROM \"DOCS\"") != std::string::npos);
     auto scanned = database.Query("SELECT BODY FROM o.main.DOCS;");
     CHECK(!scanned->HasError() && scanned->GetValue(0, 0).ToString() == "<a/>");
     CHECK(script->queries.back().find("XMLSERIALIZE(CONTENT \"BODY\" AS CLOB NO INDENT) \"BODY\"") != std::string::npos);

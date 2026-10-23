@@ -853,9 +853,12 @@ static void TestTtcParameters() {
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { O5LogonChallengeFromParameters(decoded); });
 
     // The verifier type is read before any 12C field is required, so an
-    // account on another verifier is reported as that, by type, rather than as
-    // a malformed or incomplete challenge. An 11G challenge need not carry the
-    // PBKDF2 fields at all.
+    // account on a verifier this client cannot answer is reported as that, by
+    // type, rather than as a malformed or incomplete challenge.
+    //
+    // 11G is answered now, so it is the 12C reader that refuses it: the 12C
+    // algorithm needs the PBKDF2 fields an 11G challenge does not carry. The
+    // 11G reader is the one that answers it (see TestO5Logon11GVerifier).
     const auto message_for = [](const std::vector<TtcParameter> &challenge) {
         try {
             (void)O5LogonChallengeFromParameters(challenge);
@@ -870,19 +873,18 @@ static void TestTtcParameters() {
         return std::vector<TtcParameter> {{"AUTH_VFR_DATA", "00112233445566778899AABBCCDDEEFF", type},
                                           {"AUTH_SESSKEY", std::string(96, 'A'), 0}};
     };
-    auto message = message_for(verifier_only(O5LOGON_VERIFIER_11G_1));
-    CHECK(message.find("11G password verifier (type 0xB152)") != std::string::npos);
-    CHECK(message.find("12C verifier (type 0x4815)") != std::string::npos);
-    CHECK(message_for(verifier_only(O5LOGON_VERIFIER_11G_2)).find("11G password verifier (type 0x1B25)") !=
-          std::string::npos);
     const auto ten_g = message_for(verifier_only(O5LOGON_VERIFIER_10G));
     CHECK(ten_g.find("10G password verifier (type 0x0939)") != std::string::npos);
     CHECK(ten_g.find("SEC_CASE_SENSITIVE_LOGON") != std::string::npos);
-    CHECK(message_for(verifier_only(0x1234)).find("unknown password verifier (type 0x1234)") != std::string::npos);
+    const auto unknown = message_for(verifier_only(0x1234));
+    CHECK(unknown.find("unknown password verifier (type 0x1234)") != std::string::npos);
     // A flag of zero is not taken to mean 12C any more.
     CHECK(message_for(verifier_only(0)).find("type 0x0000") != std::string::npos);
     // Nothing from the challenge's values reaches the message.
-    CHECK(message.find("00112233") == std::string::npos && message.find("AAAA") == std::string::npos);
+    CHECK(ten_g.find("00112233") == std::string::npos && ten_g.find("AAAA") == std::string::npos);
+    // The message now names both verifiers this client can answer.
+    CHECK(ten_g.find("12C verifier (type 0x4815)") != std::string::npos);
+    CHECK(ten_g.find("0x1B25") != std::string::npos);
 
     // A 12C challenge missing a field names the field, not its value.
     auto incomplete = parameters;

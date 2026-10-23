@@ -20,12 +20,6 @@ void Validate(const TtcFetchRequest &request) {
 std::vector<uint8_t> EncodeTtcFetchRequest(const TtcFetchRequest &request) {
     Validate(request);
     ByteWriter writer;
-    if (request.legacy_session) {
-        writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_FETCH).WriteByte(0);
-        writer.WriteUB2(static_cast<uint16_t>(request.cursor_id));
-        writer.WriteUB2(static_cast<uint16_t>(request.requested_rows));
-        return writer.Take();
-    }
     writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_FETCH).WriteByte(request.sequence);
     writer.WriteUB4(request.cursor_id).WriteUB4(request.requested_rows);
     return writer.Take();

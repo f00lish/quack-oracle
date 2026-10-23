@@ -253,7 +253,7 @@ void TtcStatementChannel::Fetch(OracleStatementHandle handle, uint8_t sequence, 
     const auto remote_cursor_id = statements.RemoteCursorId(handle);
     statements.BeginFetch(handle);
     try {
-        channel.Send(EncodeTtcFetchRequest({sequence, remote_cursor_id, requested_rows, channel.LegacySession()}));
+        channel.Send(EncodeTtcFetchRequest({sequence, remote_cursor_id, requested_rows}));
     } catch (...) {
         statements.Poison(handle);
         throw;

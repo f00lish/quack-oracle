@@ -14,11 +14,6 @@ struct TtcFetchRequest {
     uint8_t sequence = 0;
     uint32_t cursor_id = 0;
     uint32_t requested_rows = 0;
-    // Whether the server speaks the legacy (11.2) session dialect. There the
-    // cursor id and the row count are two bytes wide and the third byte of
-    // the request is zero, which is what go-ora writes for every version it
-    // supports.
-    bool legacy_session = false;
 };
 
 std::vector<uint8_t> EncodeTtcFetchRequest(const TtcFetchRequest &request);

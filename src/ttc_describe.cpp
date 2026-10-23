@@ -47,78 +47,31 @@ std::string ReadDeclaredText(ByteReader &reader) {
     return {value->begin(), value->end()};
 }
 
-// The types whose scale the legacy layout states in two bytes. A number and
-// the date and interval types carry one; the rest have a single scale byte.
-bool ColumnStatesScaleInTwoBytes(uint8_t oracle_type) {
-    switch (oracle_type) {
-    case 2:   // NUMBER
-    case 180: // TIMESTAMP
-    case 181: // TIMESTAMP WITH TIME ZONE
-    case 183: // INTERVAL DAY TO SECOND
-    case 187: // TIMESTAMP
-    case 188: // TIMESTAMP WITH TIME ZONE
-    case 190: // INTERVAL DAY TO SECOND
-    case 231: // TIMESTAMP WITH LOCAL TIME ZONE
-    case 232: // TIMESTAMP WITH LOCAL TIME ZONE
-        return true;
-    default:
-        return false;
-    }
-}
-
-OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version, bool legacy_session) {
+OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version) {
     OracleColumn column;
     column.oracle_type = reader.ReadByte();
     reader.ReadByte(); // flags
     column.precision = static_cast<int8_t>(reader.ReadByte());
-    if (legacy_session && ColumnStatesScaleInTwoBytes(column.oracle_type)) {
-        // The legacy layout states the scale of the types that carry one in
-        // two bytes rather than one. Reading it as one byte would take the
-        // high half of the next field as the scale and shift everything after
-        // it.
-        column.scale = static_cast<int8_t>(reader.ReadUB2());
-    } else {
-        column.scale = static_cast<int8_t>(reader.ReadByte());
-    }
+    column.scale = static_cast<int8_t>(reader.ReadByte());
     const auto maximum_size = reader.ReadUB4();
     reader.ReadUB4(); // maximum array elements
-    if (legacy_session) {
-        // The legacy layout states the continuation flag in four bytes. The
-        // modern one states it in eight.
-        reader.ReadUB4(); // continuation flags
-    } else {
-        reader.ReadUB8(); // continuation flags
-    }
+    reader.ReadUB8(); // continuation flags
     ReadDeclaredBytes(reader); // object id
     reader.ReadUB2(); // version
     reader.ReadUB2(); // character set id
     column.character_set_form = reader.ReadByte();
     const auto size = reader.ReadUB4();
-    if (!legacy_session) {
-        // TTIPRO's server version is not the version gate for OALL8 describe
-        // metadata. A live 19c response reports TTIPRO version 6 yet includes
-        // oaccolid followed by nullable. This is also the shape emitted after
-        // the OALL8 request used by python-oracledb, so retain it unconditionally
-        // for the supported modern TTC execution profile.
-        //
-        // The legacy layout has none of these three fields.
-        reader.ReadUB4(); // oaccolid
-        column.nullable = reader.ReadByte() != 0;
-        reader.ReadByte(); // V7 name length
-    }
+    // TTIPRO's server version is not the version gate for OALL8 describe
+    // metadata. A live 19c response reports TTIPRO version 6 yet includes
+    // oaccolid followed by nullable. This is also the shape emitted after the
+    // OALL8 request used by python-oracledb, so retain it unconditionally for
+    // the supported modern TTC execution profile.
+    reader.ReadUB4(); // oaccolid
+    column.nullable = reader.ReadByte() != 0;
+    reader.ReadByte(); // V7 name length
     column.name = ReadDeclaredText(reader);
     ReadDeclaredText(reader); // schema
     ReadDeclaredText(reader); // type name
-    if (legacy_session) {
-        // The legacy layout stops the column here. Its own trailer is read by
-        // the caller, and it differs from the modern one.
-        column.byte_width = column.oracle_type == 23 ? maximum_size : size;
-        column.omitted_from_row_data = maximum_size == 0 && column.oracle_type != 102;
-        if (column.oracle_type == 102) {
-            column.byte_width = 4;
-        }
-        return column;
-    }
     reader.ReadUB2(); // column position
     reader.ReadUB4(); // UDS flags
     if (field_version >= 17) {
@@ -150,8 +103,7 @@ OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version, bool legacy
 
 } // namespace
 
-TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
-                                            bool legacy_session) {
+TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
     ByteReader reader(message);
     if (reader.ReadByte() != TTC_MESSAGE_DESCRIBE_INFO) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC DESCRIBE_INFO message");
@@ -167,17 +119,13 @@ TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message,
     result.columns.reserve(column_count);
     for (uint32_t index = 0; index < column_count; ++index) {
         try {
-            result.columns.push_back(DecodeColumn(reader, ttc_field_version, legacy_session));
+            result.columns.push_back(DecodeColumn(reader, ttc_field_version));
         } catch (const ProtocolError &error) {
             throw ProtocolError(error.Kind(), "TTC describe column " + std::to_string(index) + " at offset " +
                                                    std::to_string(reader.Position()) + ": " + error.what());
         }
     }
     try {
-        // The trailer is the same in both dialects. A legacy listener on TTC
-        // version 6 -- which is what 11.2 reports -- sends every part of it:
-        // a length-prefixed block, four four-byte fields, and another
-        // length-prefixed block.
         ReadDeclaredBytes(reader); // current date
         reader.ReadUB4();
         reader.ReadUB4();

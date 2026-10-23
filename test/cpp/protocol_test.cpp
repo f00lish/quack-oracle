@@ -134,6 +134,10 @@ static void ExpectError(ProtocolErrorKind kind, FUNCTION function) {
         function();
         CHECK(false && "expected ProtocolError");
     } catch (const ProtocolError &error) {
+        if (error.Kind() != kind) {
+            std::cout << "[kind-mismatch] expected " << static_cast<int>(kind) << " got "
+                      << static_cast<int>(error.Kind()) << " : " << error.what() << std::endl;
+        }
         CHECK(error.Kind() == kind);
     }
 }

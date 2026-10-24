@@ -202,7 +202,8 @@ std::vector<uint32_t> IterationBufferSizes(const TtcExecuteBindsRequest &request
 }
 
 void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
-                      const std::vector<uint32_t> &buffer_sizes, uint8_t field_version) {
+                      const std::vector<uint32_t> &buffer_sizes, uint8_t field_version,
+                      bool legacy_session) {
     for (size_t index = 0; index < binds.size(); index++) {
         const auto &bind = binds[index];
         const auto character_type = IsCharacterType(bind.oracle_type);
@@ -218,7 +219,16 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
         // 12.2+ uses a separate OACCOLID after max-character-size even for
         // bind metadata. Its one-byte zero encoding keeps the following
         // ROW_DATA marker aligned with Oracle's bound OALL8 parser.
-        if (field_version >= TTC_FIELD_VERSION_12_2) {
+        //
+        // A legacy (11.2) listener has no OACCOLID in bind metadata: its
+        // describe response omits the field for the same reason (see
+        // ttc_describe.cpp). Sending it anyway costs one byte per bind, and
+        // the listener reads that byte as the next bind's DATA TYPE. A bind
+        // type of zero is not a type Oracle can represent, so the server
+        // answers the whole request with ORA-03115 -- "unsupported network
+        // datatype or representation" -- before it ever looks at the
+        // statement. go-ora's 11g client writes no OACCOLID either.
+        if (!legacy_session && field_version >= TTC_FIELD_VERSION_12_2) {
             writer.WriteUB4(0);
         }
     }
@@ -305,7 +315,8 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     for (size_t index = 2; index < 13; index++) {
         writer.WriteUB4(index == 7 && request.is_query ? 1 : (index == 9 ? OALL8_IMPLICIT_RESULTSETS : 0));
     }
-    WriteBindMetadata(writer, request.binds, IterationBufferSizes(request), request.ttc_field_version);
+    WriteBindMetadata(writer, request.binds, IterationBufferSizes(request), request.ttc_field_version,
+                      request.legacy_session);
     // One ROW_DATA message per iteration, in order. This is the whole of array
     // DML on the wire: the same parse, the same metadata, N rows of values.
     WriteBindValues(writer, request.binds);

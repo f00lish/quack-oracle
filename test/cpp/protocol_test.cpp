@@ -1557,6 +1557,69 @@ static void TestLegacyExecuteRequestLayout() {
     CHECK(modern_encoded.size() == encoded.size() + 10);
 }
 
+// A legacy (11.2) listener has no OACCOLID in bind metadata, and sending it
+// anyway costs exactly one byte per bind.
+//
+// The listener reads the bind metadata positionally, so that byte becomes the
+// NEXT bind's data type. A data type of zero is not a type Oracle can put on
+// the wire, and the server answers the whole request with ORA-03115 --
+// "unsupported network datatype or representation" -- before it ever looks at
+// the statement. This is what the extension's bound DML against 11.2 did.
+//
+// The bytes below are the metadata the official JDBC driver sent for the same
+// statement, captured from a live 11.2 listener, and the bind metadata
+// go-ora's 11g client writes: the same fields in the same order, with no
+// OACCOLID.
+static void TestLegacyBindMetadataHasNoOaccolid() {
+    TtcExecuteBindsRequest request;
+    request.sql = "BEGIN DELETE FROM \"k\" WHERE \"v\" = :v; END;";
+    request.binds = {{"v", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'F'}}};
+    request.is_plsql = true;
+    request.legacy_session = true;
+    const auto encoded = EncodeTtcExecuteBindsRequest(request);
+
+    // The metadata starts after the SQL text and the al8i4 array, and ends at
+    // the ROW_DATA marker that carries the bind's value.
+    const std::vector<uint8_t> sql_bytes(request.sql.begin(), request.sql.end());
+    const auto sql_at = std::search(encoded.begin(), encoded.end(), sql_bytes.begin(), sql_bytes.end());
+    CHECK(sql_at != encoded.end());
+    ByteReader al8i4(std::vector<uint8_t>(sql_at + static_cast<std::ptrdiff_t>(sql_bytes.size()), encoded.end()));
+    for (int index = 0; index < 13; index++) {
+        (void)al8i4.ReadUB4();
+    }
+    const auto metadata_at = static_cast<size_t>(al8i4.Position());
+
+    // One bind: type, flag, precision, scale, then the six fields that follow
+    // it. The last of them is the max character size; a 12.2 listener expects
+    // one more field after that.
+    const std::vector<uint8_t> expected = {
+        0x01,                         // type: VARCHAR
+        0x01,                         // flag
+        0x00,                         // precision
+        0x00,                         // scale
+        0x01, 0x01,                   // max length: one byte
+        0x00,                         // max number of array elements
+        0x00,                         // continuation flags
+        0x00,                         // object id
+        0x00,                         // version
+        0x02, 0x03, 0x69,             // charset: AL32UTF8
+        0x01,                         // charset form
+        0x00,                         // max character size
+    };
+    const std::vector<uint8_t> actual(encoded.begin() + static_cast<std::ptrdiff_t>(metadata_at),
+                                      encoded.begin() + static_cast<std::ptrdiff_t>(metadata_at + expected.size()));
+    CHECK(actual == expected);
+    // The ROW_DATA marker follows immediately: the metadata is exactly as long
+    // as the fields it carries.
+    CHECK(encoded[metadata_at + expected.size()] == TTC_MESSAGE_ROW_DATA);
+
+    // The modern form carries the OACCOLID, so it is one byte longer per bind.
+    TtcExecuteBindsRequest modern = request;
+    modern.legacy_session = false;
+    const auto modern_encoded = EncodeTtcExecuteBindsRequest(modern);
+    CHECK(modern_encoded.size() == encoded.size() + 1);
+}
+
 static void TestTtcRowDataCodec() {
     ByteWriter writer;
     writer.WriteByte(TTC_MESSAGE_ROW_DATA)
@@ -7386,6 +7449,7 @@ int main() {
     TestTtcExecuteNoBindsCodec();
     TestTtcExecuteQueryLeavesTheFetchOnlyBitClear();
     TestLegacyExecuteRequestLayout();
+    TestLegacyBindMetadataHasNoOaccolid();
     TestTtcExecuteNoBindsShape();
     TestTtcExecuteRefCursorBindShape();
 #if !defined(_WIN32)

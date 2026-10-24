@@ -1649,9 +1649,13 @@ static void TestLegacyLongValueUsesRawByteChunkLength() {
         0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e,
         0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e,
         0x4e, 0x4e, 0x4e, 0x4e,
+        0x01,                         // chunk length: one raw byte
+        0x4e,                         // the last byte of the value
         0x00,                         // end of the long value
     };
-    const std::vector<uint8_t> expected_value(64, 0x4e);
+    // The legacy dialect reads each chunk length as a raw byte: 0x40 bytes
+    // then 0x01 byte, so the value is 65 bytes.
+    const std::vector<uint8_t> expected_value(65, 0x4e);
 
     // The legacy dialect reads the chunk length as a raw byte.
     const auto legacy = DecodeTtcRowData(legacy_row, 1, 16U << 20U, TtcChunkEncoding::RawByte);

@@ -1583,11 +1583,14 @@ static void TestLegacyBindMetadataHasNoOaccolid() {
     const std::vector<uint8_t> sql_bytes(request.sql.begin(), request.sql.end());
     const auto sql_at = std::search(encoded.begin(), encoded.end(), sql_bytes.begin(), sql_bytes.end());
     CHECK(sql_at != encoded.end());
-    ByteReader al8i4(std::vector<uint8_t>(sql_at + static_cast<std::ptrdiff_t>(sql_bytes.size()), encoded.end()));
+    // The reader holds a reference, so the tail has to outlive it.
+    const std::vector<uint8_t> tail(sql_at + static_cast<std::ptrdiff_t>(sql_bytes.size()), encoded.end());
+    ByteReader al8i4(tail);
     for (int index = 0; index < 13; index++) {
         (void)al8i4.ReadUB4();
     }
-    const auto metadata_at = static_cast<size_t>(al8i4.Position());
+    const auto metadata_at = static_cast<size_t>(sql_at - encoded.begin()) + sql_bytes.size() +
+                              static_cast<size_t>(al8i4.Position());
 
     // One bind: type, flag, precision, scale, then the six fields that follow
     // it. The last of them is the max character size; a 12.2 listener expects
@@ -1613,11 +1616,13 @@ static void TestLegacyBindMetadataHasNoOaccolid() {
     // as the fields it carries.
     CHECK(encoded[metadata_at + expected.size()] == TTC_MESSAGE_ROW_DATA);
 
-    // The modern form carries the OACCOLID, so it is one byte longer per bind.
+    // The modern form carries the OACCOLID, so its bind metadata is one byte
+    // longer -- and its execute tail is ten bytes longer, so the whole request
+    // is eleven bytes longer.
     TtcExecuteBindsRequest modern = request;
     modern.legacy_session = false;
     const auto modern_encoded = EncodeTtcExecuteBindsRequest(modern);
-    CHECK(modern_encoded.size() == encoded.size() + 1);
+    CHECK(modern_encoded.size() == encoded.size() + 11);
 }
 
 static void TestTtcRowDataCodec() {

@@ -10,12 +10,12 @@ namespace oracle_scanner {
 constexpr size_t MAX_LOB_LOCATOR_BYTES = 4096;
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, const std::vector<bool> &is_lob,
-                                        size_t maximum_value_bytes) {
-    return DecodeTtcRowDataPrefix(message.data(), message.size(), is_lob, maximum_value_bytes);
+                                        size_t maximum_value_bytes, TtcChunkEncoding chunk_encoding) {
+    return DecodeTtcRowDataPrefix(message.data(), message.size(), is_lob, maximum_value_bytes, chunk_encoding);
 }
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const std::vector<bool> &is_lob,
-                                        size_t maximum_value_bytes) {
+                                        size_t maximum_value_bytes, TtcChunkEncoding chunk_encoding) {
     if (is_lob.empty() || is_lob.size() > 4096 || maximum_value_bytes == 0 || maximum_value_bytes > (16U << 20U)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC row-data decoder bounds are invalid");
     }
@@ -27,7 +27,7 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const 
     result.reserve(is_lob.size());
     for (size_t column = 0; column < is_lob.size(); column++) {
         if (!is_lob[column]) {
-            result.push_back(reader.ReadLengthPrefixed(maximum_value_bytes));
+            result.push_back(reader.ReadLengthPrefixed(maximum_value_bytes, chunk_encoding));
             continue;
         }
         const auto locator_size = reader.ReadUB4();
@@ -45,7 +45,7 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const 
         // many bytes as this does, which is why the wrong reading stays in
         // frame across every column and only shows up as ORA-22275 when the
         // locator is sent back one byte out of place.
-        auto locator = reader.ReadLengthPrefixed(MAX_LOB_LOCATOR_BYTES);
+        auto locator = reader.ReadLengthPrefixed(MAX_LOB_LOCATOR_BYTES, chunk_encoding);
         if (!locator || locator->size() != locator_size) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC LOB locator length disagrees with its prefix");
         }
@@ -55,7 +55,7 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const 
 }
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, size_t column_count,
-                                        size_t maximum_value_bytes) {
+                                        size_t maximum_value_bytes, TtcChunkEncoding chunk_encoding) {
     if (column_count == 0 || column_count > 4096 || maximum_value_bytes == 0 || maximum_value_bytes > (16U << 20U)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC row-data decoder bounds are invalid");
     }
@@ -66,13 +66,14 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, siz
     TtcRowData result;
     result.reserve(column_count);
     for (size_t column = 0; column < column_count; column++) {
-        result.push_back(reader.ReadLengthPrefixed(maximum_value_bytes));
+        result.push_back(reader.ReadLengthPrefixed(maximum_value_bytes, chunk_encoding));
     }
     return {std::move(result), reader.Position()};
 }
 
-TtcRowData DecodeTtcRowData(const std::vector<uint8_t> &message, size_t column_count, size_t maximum_value_bytes) {
-    auto result = DecodeTtcRowDataPrefix(message, column_count, maximum_value_bytes);
+TtcRowData DecodeTtcRowData(const std::vector<uint8_t> &message, size_t column_count, size_t maximum_value_bytes,
+                            TtcChunkEncoding chunk_encoding) {
+    auto result = DecodeTtcRowDataPrefix(message, column_count, maximum_value_bytes, chunk_encoding);
     if (result.bytes_consumed != message.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC ROW_DATA has trailing bytes");
     }

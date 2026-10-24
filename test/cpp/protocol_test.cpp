@@ -1625,6 +1625,47 @@ static void TestLegacyBindMetadataHasNoOaccolid() {
     CHECK(modern_encoded.size() == encoded.size() + 11);
 }
 
+// A long value is framed as a 0xFE marker followed by chunk lengths, and the
+// chunk length is stated in the session's own dialect: a universal integer on
+// a modern session, a single raw byte on a legacy (11.2) one.
+//
+// Reading the legacy form as a universal integer takes the length byte for a
+// width -- 0x40 is a legal width -- and then the value's own bytes for the
+// number, so the row never decodes. On 11.2 that made every fetch of a value
+// over 252 bytes fail with "universal integer exceeds its declared width",
+// while short values and COUNT(*) kept working.
+//
+// The bytes below are a real ROW_DATA message from a live 11.2 fetch: the 0x07
+// message byte, then 0xFE, then the raw-byte chunk length 0x40, then that many
+// bytes of the value.
+static void TestLegacyLongValueUsesRawByteChunkLength() {
+    const std::vector<uint8_t> legacy_row = {
+        0x07,                         // ROW_DATA
+        0xfe,                         // long value
+        0x40,                         // chunk length: one raw byte
+        0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e,
+        0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e,
+        0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e,
+        0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e,
+        0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e,
+        0x4e, 0x4e, 0x4e, 0x4e,
+        0x00,                         // end of the long value
+    };
+    const std::vector<uint8_t> expected_value(64, 0x4e);
+
+    // The legacy dialect reads the chunk length as a raw byte.
+    const auto legacy = DecodeTtcRowData(legacy_row, 1, 16U << 20U, TtcChunkEncoding::RawByte);
+    CHECK(legacy.size() == 1);
+    CHECK(legacy[0].has_value());
+    CHECK(legacy[0].value() == expected_value);
+
+    // The modern dialect reads the same bytes as a universal integer, where
+    // 0x40 is a width -- so the value is not what the legacy dialect reads.
+    // It must fail rather than silently produce a different value.
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                 [&] { DecodeTtcRowData(legacy_row, 1, 16U << 20U, TtcChunkEncoding::UniversalInteger); });
+}
+
 static void TestTtcRowDataCodec() {
     ByteWriter writer;
     writer.WriteByte(TTC_MESSAGE_ROW_DATA)
@@ -7455,6 +7496,7 @@ int main() {
     TestTtcExecuteQueryLeavesTheFetchOnlyBitClear();
     TestLegacyExecuteRequestLayout();
     TestLegacyBindMetadataHasNoOaccolid();
+    TestLegacyLongValueUsesRawByteChunkLength();
     TestTtcExecuteNoBindsShape();
     TestTtcExecuteRefCursorBindShape();
 #if !defined(_WIN32)

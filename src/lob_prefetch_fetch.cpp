@@ -127,7 +127,7 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t
 
 TtcRowDataPrefix DecodePrefetchedRow(const uint8_t *data, size_t size,
     const std::vector<size_t> &wire_columns,const std::vector<OracleColumn> &columns,
-    const OracleLobPrefetchLimits &limits) {
+    const OracleLobPrefetchLimits &limits,TtcChunkEncoding chunk_encoding) {
     ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,"expected prefetched TTC ROW_DATA");
@@ -140,7 +140,7 @@ TtcRowDataPrefix DecodePrefetchedRow(const uint8_t *data, size_t size,
         }
         const auto &column=columns[index];
         if (!IsOracleLobType(column.oracle_type)) {
-            values.push_back(reader.ReadLengthPrefixed(limits.maximum_row_bytes-row_bytes));
+            values.push_back(reader.ReadLengthPrefixed(limits.maximum_row_bytes-row_bytes,chunk_encoding));
         } else {
             const auto start=reader.Position();
             const auto value=DecodeCursorLobPrefetchCell(reader,column.oracle_type == 112,
@@ -231,6 +231,12 @@ LobPrefetchFetchResponseDecoder::LobPrefetchFetchResponseDecoder(const std::vect
     if (preceding_row && preceding_row->size()!=columns.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,"prefetched preceding row column count is invalid");
     }
+    // A long value's chunk length is stated in the session's own dialect: a
+    // universal integer on a modern session, a single raw byte on a legacy
+    // (11.2) one. Reading the legacy form as a universal integer takes the
+    // length byte for a width and then the value's own bytes for the number,
+    // so the row never decodes.
+    chunk_encoding = legacy_session ? TtcChunkEncoding::RawByte : TtcChunkEncoding::UniversalInteger;
 }
 
 const TtcRowData *LobPrefetchFetchResponseDecoder::PreviousRow() const {
@@ -314,7 +320,7 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
                 // is its message byte and nothing else.
                 offset += 1;
             } else {
-                auto row = DecodePrefetchedRow(at,remaining,wire_columns,columns,limits);
+                auto row = DecodePrefetchedRow(at,remaining,wire_columns,columns,limits,chunk_encoding);
                 values = std::move(row.values);
                 offset += row.bytes_consumed;
             }
@@ -348,7 +354,7 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
             // dropped from the selection before the values are read.
             const auto wire_columns = WireCarryingColumns(columns, continuation.present_columns);
             const auto partial=DecodePrefetchedRow(at+continuation.bytes_consumed,
-                remaining-continuation.bytes_consumed,wire_columns,columns,limits);
+                remaining-continuation.bytes_consumed,wire_columns,columns,limits,chunk_encoding);
             offset += continuation.bytes_consumed + partial.bytes_consumed;
             account_row(partial.values,wire_columns,previous_row);
             auto merged = MergeChangedColumns(*previous_row,wire_columns,partial.values,columns.size());

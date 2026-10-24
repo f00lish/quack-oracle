@@ -130,8 +130,14 @@ private:
     const OracleLobPrefetchLimits &limits;
     uint8_t server_field_version;
     // Whether the server speaks the legacy (11.2) session dialect, which
-    // changes the layout of the TTIOER error body inside a fetch response.
+    // changes the layout of the TTIOER error body inside a fetch response
+    // and the encoding of a long value's chunk length.
     bool legacy_session = false;
+    // How this session states the length of a long value's chunk: a universal
+    // integer on a modern session, a single raw byte on a legacy one. It
+    // follows the session's own dialect, so it is derived from
+    // `legacy_session` rather than chosen per value.
+    TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger;
     std::optional<TtcRowData> preceding_row;
     TtcFetchResponse result;
     size_t resume_offset = 0;

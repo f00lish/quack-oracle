@@ -124,7 +124,8 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t
 
 TtcRowDataPrefix DecodePartialRowDataPrefix(const uint8_t *data, size_t size,
                                              const std::vector<size_t> &present_columns,
-                                             const std::vector<bool> &is_lob) {
+                                             const std::vector<bool> &is_lob,
+                                             TtcChunkEncoding chunk_encoding) {
     if (is_lob.size() != present_columns.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC partial row LOB map disagrees with its columns");
     }
@@ -141,7 +142,7 @@ TtcRowDataPrefix DecodePartialRowDataPrefix(const uint8_t *data, size_t size,
     // locators included. Reading them as ordinary length-prefixed values costs
     // nothing on the first row of a fetch and desynchronizes every row after
     // the first bit vector, which is why this shares the full decoder.
-    return DecodeTtcRowDataPrefix(data, size, is_lob, 16U << 20U);
+    return DecodeTtcRowDataPrefix(data, size, is_lob, 16U << 20U, chunk_encoding);
 }
 
 TtcRowData MergeChangedColumns(const TtcRowData &previous_row, const std::vector<size_t> &present_columns,
@@ -226,6 +227,13 @@ TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn>
     }
     row_columns = WireCarryingColumns(columns, std::nullopt);
     row_is_lob = LobColumns(columns, row_columns);
+    // A long value's chunk length is stated in the session's own dialect: a
+    // universal integer on a modern session, a single raw byte on a legacy
+    // (11.2) one. Reading the legacy form as a universal integer takes the
+    // length byte for a width and then the value's own bytes for the number,
+    // so the row never decodes -- which is what made every 11.2 fetch of a
+    // value over 252 bytes fail.
+    chunk_encoding = legacy_session ? TtcChunkEncoding::RawByte : TtcChunkEncoding::UniversalInteger;
 }
 
 const TtcRowData *TtcFetchResponseDecoder::PreviousRow() const {
@@ -290,7 +298,7 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
                 // is its message byte and nothing else.
                 offset += 1;
             } else {
-                auto row = DecodeTtcRowDataPrefix(at, remaining, is_lob);
+                auto row = DecodeTtcRowDataPrefix(at, remaining, is_lob, 16U << 20U, chunk_encoding);
                 values = std::move(row.values);
                 offset += row.bytes_consumed;
             }
@@ -324,7 +332,7 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
             const auto partial_is_lob = LobColumns(columns, wire_columns);
             auto partial = DecodePartialRowDataPrefix(at + continuation.bytes_consumed,
                                                             remaining - continuation.bytes_consumed, wire_columns,
-                                                            partial_is_lob);
+                                                            partial_is_lob, chunk_encoding);
             offset += continuation.bytes_consumed + partial.bytes_consumed;
             auto merged = MergeChangedColumns(*previous_row, wire_columns, std::move(partial.values), columns.size());
             result.used_row_continuation = true;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "oracle_scanner/byte_buffer.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -32,16 +34,29 @@ inline bool IsOracleLobType(uint16_t oracle_type) {
     return oracle_type == ORACLE_WIRE_TYPE_CLOB || oracle_type == ORACLE_WIRE_TYPE_BLOB;
 }
 
+// A value longer than 252 bytes is framed as a `0xFE` marker followed by
+// chunk lengths. The chunk length is stated in the session's own dialect: a
+// universal integer on a modern session, a single raw byte on a legacy (11.2)
+// one. Reading a legacy chunk length as a universal integer consumes the
+// length byte as a width and then the value's own bytes as the number, so
+// the row desynchronizes and the value never decodes.
+//
+// The encoding is therefore the caller's to state, from the session's own
+// legacy marker, exactly as the database-version response does.
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, const std::vector<bool> &is_lob,
-                                        size_t maximum_value_bytes = (1U << 20U));
+                                        size_t maximum_value_bytes = (1U << 20U),
+                                        TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 // The same, reading from a position inside a larger response rather than from
 // a copy of what is left of it.
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const std::vector<bool> &is_lob,
-                                        size_t maximum_value_bytes = (1U << 20U));
+                                        size_t maximum_value_bytes = (1U << 20U),
+                                        TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, size_t column_count,
-                                        size_t maximum_value_bytes = 16U << 20U);
+                                        size_t maximum_value_bytes = 16U << 20U,
+                                        TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 TtcRowData DecodeTtcRowData(const std::vector<uint8_t> &message, size_t column_count,
-                            size_t maximum_value_bytes = 16U << 20U);
+                            size_t maximum_value_bytes = 16U << 20U,
+                            TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 
 } // namespace oracle_scanner

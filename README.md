@@ -1462,14 +1462,6 @@ cannot inspect the binary.
 - **[PROVENANCE.md](PROVENANCE.md)** — what this project reuses and from where,
   plus every byte of recorded wire traffic in the tree with its SHA-256.
 
-Guarantees that hold by construction: no Oracle client is linked or loaded (CI
-checks the shipped binary on every build); no password, wallet password, key or
-bind value is ever logged or persisted; wallet ZIPs are read in memory and never
-written to disk; and TLS verification has no off switch.
-
-Never commit database credentials, wallets, production descriptors, or raw
-captures to this repository.
-
 This is an independent community project and is not affiliated with Oracle or
 DuckDB Labs.
 

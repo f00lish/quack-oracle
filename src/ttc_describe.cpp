@@ -73,6 +73,10 @@ struct ScaleCandidate {
     int64_t value = 0;
 };
 
+// Read the scale field after type/flags/precision have been consumed.
+// OneByte: a single signed byte — the majority form in the live corpus.
+// Compressed: the signed universal integer go-ora v1 reads (bit 7 = sign,
+// low 7 bits = magnitude width). `81 7f` is -127 either way.
 int64_t ReadScaleOneByte(ByteReader &reader) {
     return static_cast<int8_t>(reader.ReadByte());
 }
@@ -83,17 +87,14 @@ int64_t ReadScaleCompressed(ByteReader &reader) {
 
 using ScaleReader = int64_t (*)(ByteReader &);
 
-// first: one byte, signed. This is the width the live corpus shows for the
-// majority of NUMBER columns, and it is the cheaper of the two, so it is
-// tried first and the compressed form is only the fallback.
 const ScaleReader SCALE_READERS[] = {ReadScaleOneByte, ReadScaleCompressed};
 
 OracleColumn DecodeColumnWithScale(ByteReader &reader, uint8_t field_version, bool legacy_session,
-                                   const ScaleCandidate &scale) {
+                                   const ScaleCandidate &scale,
+                                   uint8_t oracle_type, int8_t precision) {
     OracleColumn column;
-    column.oracle_type = reader.ReadByte();
-    reader.ReadByte(); // flags
-    column.precision = static_cast<int8_t>(reader.ReadByte());
+    column.oracle_type = oracle_type;
+    column.precision = precision;
     column.scale = static_cast<int16_t>(scale.value);
     const auto maximum_size = reader.ReadUB4();
     reader.ReadUB4(); // maximum array elements
@@ -182,6 +183,11 @@ bool DecodeColumnsAndTrailer(const std::vector<uint8_t> &message, uint8_t field_
     (void)message;
     for (const auto scale_reader : SCALE_READERS) {
         ByteReader candidate(reader);
+        // type, flags, precision come before scale; read them on the
+        // candidate so the scale reader sees the correct offset.
+        const auto oracle_type = candidate.ReadByte();
+        candidate.ReadByte(); // flags
+        const auto precision = static_cast<int8_t>(candidate.ReadByte());
         ScaleCandidate scale;
         try {
             scale.value = scale_reader(candidate);
@@ -190,7 +196,8 @@ bool DecodeColumnsAndTrailer(const std::vector<uint8_t> &message, uint8_t field_
         }
         OracleColumn column;
         try {
-            column = DecodeColumnWithScale(candidate, field_version, legacy_session, scale);
+            column = DecodeColumnWithScale(candidate, field_version, legacy_session, scale,
+                                           oracle_type, precision);
         } catch (const ProtocolError &) {
             continue;
         }

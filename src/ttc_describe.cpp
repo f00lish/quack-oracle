@@ -4,6 +4,7 @@
 #include "oracle_scanner/protocol_error.hpp"
 
 #include <limits>
+#include <vector>
 
 namespace oracle_scanner {
 
@@ -47,12 +48,53 @@ std::string ReadDeclaredText(ByteReader &reader) {
     return {value->begin(), value->end()};
 }
 
-OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version, bool legacy_session) {
+// The scale of a NUMBER column in an 11.2 describe response is the float
+// marker -127, and the listener encodes it one of two ways. The single-byte
+// form sends -127 directly: `81`. The compressed form sends the signed
+// universal integer go-ora v1 reads (network/session.go GetInt64 with
+// compress=true), where the leading byte bit 7 is the sign and its low
+// seven bits are the width of the magnitude that follows: `81 7f` is -127.
+// The two encodings carry the same value, and the same server uses both
+// within one session, so the width cannot be decided from the scale field on
+// its own. DecodeColumnWithScale therefore runs each candidate through the
+// rest of the column, and DecodeColumnsAndTrailer backtracks across the
+// columns and the trailer to keep the candidate that lets the whole
+// descriptor stay self-consistent.
+//
+// A wrong choice desynchronizes the reader by one byte and the rest of the
+// column stops decoding: maximum_size is the next field and it is a universal
+// integer whose width must be at most four, so reading it from the wrong byte
+// throws "universal integer exceeds its declared width". That is the failure
+// the old one-size reader produced at column 2 of the live six-column
+// response: it read `81 01` as a two-byte scale of 1, then tried to read
+// maximum_size from `16` (22) and refused the width.
+
+struct ScaleCandidate {
+    int64_t value = 0;
+};
+
+int64_t ReadScaleOneByte(ByteReader &reader) {
+    return static_cast<int8_t>(reader.ReadByte());
+}
+
+int64_t ReadScaleCompressed(ByteReader &reader) {
+    return reader.ReadSignedUniversal(1);
+}
+
+using ScaleReader = int64_t (*)(ByteReader &);
+
+// first: one byte, signed. This is the width the live corpus shows for the
+// majority of NUMBER columns, and it is the cheaper of the two, so it is
+// tried first and the compressed form is only the fallback.
+const ScaleReader SCALE_READERS[] = {ReadScaleOneByte, ReadScaleCompressed};
+
+OracleColumn DecodeColumnWithScale(ByteReader &reader, uint8_t field_version, bool legacy_session,
+                                   const ScaleCandidate &scale) {
     OracleColumn column;
     column.oracle_type = reader.ReadByte();
     reader.ReadByte(); // flags
     column.precision = static_cast<int8_t>(reader.ReadByte());
-    column.scale = reader.ReadScale();
+    column.scale = static_cast<int16_t>(scale.value);
     const auto maximum_size = reader.ReadUB4();
     reader.ReadUB4(); // maximum array elements
     reader.ReadUB8(); // continuation flags
@@ -108,6 +150,62 @@ OracleColumn DecodeColumn(ByteReader &reader, uint8_t field_version, bool legacy
     return column;
 }
 
+// Decodes the columns and the trailer, backtracking across the scale
+// candidates when a column's choice does not lead to a self-consistent
+// descriptor. `explored` bounds the search so a malformed response cannot make
+// it diverge. The first scale candidate that lets every remaining column and
+// the trailer decode is kept.
+bool DecodeColumnsAndTrailer(const std::vector<uint8_t> &message, uint8_t field_version, bool legacy_session,
+                             ByteReader &reader, uint32_t column_count, std::vector<OracleColumn> &columns,
+                             uint32_t &explored) {
+    if (columns.size() == column_count) {
+        try {
+            ReadDeclaredBytes(reader); // current date
+            // The four fields between the two blocks are read without a width
+            // limit: the first of them in an 11.2 response states a length of
+            // eighty-one bytes, and a four-byte limit would refuse the response
+            // that the server sent in good faith.
+            reader.ReadUB4Unbounded();
+            reader.ReadUB4Unbounded();
+            reader.ReadUB4Unbounded();
+            reader.ReadUB4Unbounded();
+            ReadDeclaredBytes(reader); // descriptor tail
+        } catch (const ProtocolError &) {
+            return false;
+        }
+        return true;
+    }
+    if (++explored > 8192) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "TTC describe did not resolve a scale width within the search budget");
+    }
+    (void)message;
+    for (const auto scale_reader : SCALE_READERS) {
+        ByteReader candidate(reader);
+        ScaleCandidate scale;
+        try {
+            scale.value = scale_reader(candidate);
+        } catch (const ProtocolError &) {
+            continue;
+        }
+        OracleColumn column;
+        try {
+            column = DecodeColumnWithScale(candidate, field_version, legacy_session, scale);
+        } catch (const ProtocolError &) {
+            continue;
+        }
+        std::vector<OracleColumn> next_columns = columns;
+        next_columns.push_back(std::move(column));
+        if (DecodeColumnsAndTrailer(message, field_version, legacy_session, candidate, column_count, next_columns,
+                                    explored)) {
+            columns = std::move(next_columns);
+            reader = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
@@ -125,29 +223,14 @@ TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message,
     reader.ReadByte();
     TtcDescribeInfo result;
     result.columns.reserve(column_count);
-    for (uint32_t index = 0; index < column_count; ++index) {
-        try {
-            result.columns.push_back(DecodeColumn(reader, ttc_field_version, legacy_session));
-        } catch (const ProtocolError &error) {
-            throw ProtocolError(error.Kind(), "TTC describe column " + std::to_string(index) + " at offset " +
-                                                   std::to_string(reader.Position()) + ": " + error.what());
-        }
+    uint32_t explored = 0;
+    std::vector<OracleColumn> columns;
+    if (!DecodeColumnsAndTrailer(message, ttc_field_version, legacy_session, reader, column_count, columns, explored)) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                             "TTC describe column " + std::to_string(columns.size()) + " at offset " +
+                                 std::to_string(reader.Position()) + ": no scale width decoded the column");
     }
-    try {
-        ReadDeclaredBytes(reader); // current date
-        // The four fields between the two blocks are read without a width
-        // limit: the first of them in an 11.2 response states a length of
-        // eighty-one bytes, and a four-byte limit would refuse the response
-        // that the server sent in good faith.
-        reader.ReadUB4Unbounded();
-        reader.ReadUB4Unbounded();
-        reader.ReadUB4Unbounded();
-        reader.ReadUB4Unbounded();
-        ReadDeclaredBytes(reader); // descriptor tail
-    } catch (const ProtocolError &error) {
-        throw ProtocolError(error.Kind(), "TTC describe trailer at offset " + std::to_string(reader.Position()) + ": " +
-                                               error.what());
-    }
+    result.columns = std::move(columns);
     result.bytes_consumed = reader.Position();
     return result;
 }

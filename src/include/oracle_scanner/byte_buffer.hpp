@@ -46,14 +46,20 @@ public:
     // stays the limit everywhere else.
     uint32_t ReadUB4Unbounded();
 
-    // The scale of a column in a describe response is not a fixed-width
-    // field. An 11.2 listener sends it as one byte, but when the value
-    // cannot be stated in that byte it sends a negative-length form: the
-    // length byte has bit 7 set and the value follows in the next byte
-    // (`81 7f` is a scale of 127). Reading one byte and stopping there
-    // leaves the response desynchronized by one byte, and reading the
-    // second byte as if it were the next field shifts every later field.
-    int8_t ReadScale();
+    // The scale of a column in a describe response is a signed value, and the
+    // 11.2 listener does not state it in a single fixed width. A NUMBER column
+    // whose scale is the float marker -127 is sent one of two ways, and the
+    // same server uses both within a session: as a single signed byte
+    // (`81` is -127), or as the compressed signed integer go-ora v1 reads for
+    // bind-parameter scales (`81 7f` is -127 there too — see
+    // network/session.go GetInt64 with compress=true). Which width is in the
+    // response cannot be told from the scale field alone, so DecodeColumn
+    // carries each candidate through the rest of the descriptor and keeps the
+    // one that stays self-consistent. `81 7f` is therefore a scale of -127,
+    // not 127: bit 7 of the leading byte is the sign, and the next byte is the
+    // magnitude, which is what go-ora does and what the byte-aligned rest of
+    // the column confirms.
+    int64_t ReadSignedUniversal(size_t maximum_bytes);
     std::optional<std::vector<uint8_t>> ReadLengthPrefixed(size_t maximum_size,
                                                             TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
     std::string ReadNullTerminated(size_t maximum_size);

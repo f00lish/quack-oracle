@@ -100,13 +100,30 @@ uint16_t ByteReader::ReadUB2() {
     return static_cast<uint16_t>(ReadUniversal(2));
 }
 
-int8_t ByteReader::ReadScale() {
-    const auto first = ReadByte();
-    if ((first & 0x80U) == 0) {
-        return static_cast<int8_t>(first);
+// A signed universal integer in the compressed form go-ora v1 reads with
+// network/session.go GetInt64(size, compress=true, bigEndian=true): the first
+// byte states the width of the magnitude that follows and, in bit 7, that the
+// value is negative. `81 7f` is therefore -127 (sign bit + a one-byte
+// magnitude of 0x7f), and `01 7f` is 127 (no sign, one-byte magnitude 0x7f).
+// ReadUniversal refuses the sign bit because the unsigned universal integers
+// the rest of the protocol uses are never negative; this reader is the one
+// place that can be, and it stays out of ReadUniversal's path and its tests.
+//
+// The 11.2 listener uses this exact form for a column's scale when it sends
+// -127 as `81 7f`, and a one-byte signed form (`81`) when it sends -127 as a
+// single byte, so DecodeColumn carries both candidates through the column.
+int64_t ByteReader::ReadSignedUniversal(size_t maximum_bytes) {
+    const auto header = ReadByte();
+    const bool negative = (header & 0x80U) != 0;
+    const auto width = static_cast<size_t>(header & 0x7FU);
+    if (width > maximum_bytes) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "signed universal integer exceeds its declared width");
     }
-    // A negative length marker: the value follows in the next byte.
-    return static_cast<int8_t>(ReadByte());
+    uint64_t magnitude = 0;
+    for (size_t index = 0; index < width; index++) {
+        magnitude = (magnitude << 8U) | ReadByte();
+    }
+    return negative ? -static_cast<int64_t>(magnitude) : static_cast<int64_t>(magnitude);
 }
 
 uint64_t ByteReader::ReadUB8() {

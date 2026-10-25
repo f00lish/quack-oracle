@@ -25,6 +25,7 @@
 #include <thread>
 
 #include "oracle_scanner/byte_buffer.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/byte_stream.hpp"
 #include "oracle_scanner/auth_crypto.hpp"
 #include "oracle_scanner/call_registry.hpp"
@@ -461,7 +462,7 @@ static void TestTtcDescribeInfoVersionGates() {
 // a byte in a negative-length form. Both are read from real responses, so a
 // decoder that assumes the modern shape fails on them.
 static void TestTtcLegacy112DescribeColumns() {
-    const auto user = DecodeTtcDescribeInfoPrefix(Legacy112DescribeUserResponse, 12, true);
+    const auto user = DecodeTtcDescribeInfoPrefix(Legacy112DescribeUserResponse, 12, Legacy112Dialect());
     CHECK(user.columns.size() == 1);
     CHECK(user.columns[0].oracle_type == 1);
     CHECK(user.columns[0].name == "USER");
@@ -469,7 +470,7 @@ static void TestTtcLegacy112DescribeColumns() {
     CHECK(user.columns[0].nullable);
     CHECK(user.bytes_consumed == 78);
 
-    const auto two = DecodeTtcDescribeInfoPrefix(Legacy112DescribeTwoColumnResponse, 12, true);
+    const auto two = DecodeTtcDescribeInfoPrefix(Legacy112DescribeTwoColumnResponse, 12, Legacy112Dialect());
     CHECK(two.columns.size() == 2);
     CHECK(two.columns[0].oracle_type == 1);
     CHECK(two.columns[0].name == "TABLE_NAME");
@@ -482,7 +483,7 @@ static void TestTtcLegacy112DescribeColumns() {
     // must not silently succeed.
     bool rejected = false;
     try {
-        (void)DecodeTtcDescribeInfoPrefix(Legacy112DescribeUserResponse, 12, false);
+        (void)DecodeTtcDescribeInfoPrefix(Legacy112DescribeUserResponse, 12, ModernDialect());
     } catch (const ProtocolError &) {
         rejected = true;
     }
@@ -982,7 +983,7 @@ static void TestLegacyTtcErrorBody() {
     // body read as a 12C one must not silently succeed with a wrong answer.
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)DecodeTtcErrorPrefix(unknown_column, 12); });
     // The legacy path is reached through the same entry point.
-    const auto dispatched = DecodeTtcErrorPrefix(unknown_column, 12, true);
+    const auto dispatched = DecodeTtcErrorPrefix(unknown_column, 12, Legacy112Dialect());
     CHECK(dispatched.error_number == 904);
     CHECK(dispatched.bytes_consumed == unknown_column.size());
 }
@@ -1462,13 +1463,14 @@ static void TestTtcExecuteNoBindsCodec() {
     const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
     ByteReader reader(encoded);
     CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION && reader.ReadByte() == TTC_FUNCTION_EXECUTE && reader.ReadByte() == 3);
-    // 0x8027 is the options word: the request's own 7, plus PARSE, EXECUTE,
-    // NOT_PLSQL and the implicit result set. The fetch-only bit (0x40) is
-    // absent on purpose -- go-ora sets that bit only when a request neither
-    // parses nor executes, so a request that both parses and executes must
-    // leave it clear or the server reads the request as a fetch from a cursor
-    // that was never opened.
-    CHECK(reader.ReadUB4() == 0x8027 && reader.ReadUB4() == 0 && reader.ReadByte() == 1);
+    // 0x8067 is the options word: the request's own 7, plus PARSE, EXECUTE,
+    // NOT_PLSQL, the implicit result set and the FETCH bit. The FETCH bit is
+    // the DIALECT's decision, and on a modern (12.1+) listener it belongs
+    // here: python-oracledb Thin sets TNS_EXEC_OPTION_FETCH for a query that
+    // prefetches (execute.pyx:98-99, TNS_EXEC_OPTION_FETCH = 0x40 in
+    // constants.pxi), and the bit sits ALONGSIDE the parse and execute bits
+    // there. The upstream 0.6.0 request carries 0x8067 for the same reason.
+    CHECK(reader.ReadUB4() == 0x8067 && reader.ReadUB4() == 0 && reader.ReadByte() == 1);
     CHECK(reader.ReadUB4() == request.sql.size() && reader.ReadByte() == 1 && reader.ReadUB4() == 13);
     const std::vector<uint8_t> sql_bytes(request.sql.begin(), request.sql.end());
     CHECK(std::search(encoded.begin(), encoded.end(), sql_bytes.begin(), sql_bytes.end()) != encoded.end());
@@ -1476,16 +1478,30 @@ static void TestTtcExecuteNoBindsCodec() {
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeTtcExecuteNoBindsRequest(request); });
 }
 
-// The fetch-only option bit means "neither parse nor execute": it asks the
-// server to fetch from an already-open cursor. A query parses and executes,
-// so it must not carry that bit. Setting it is not a harmless extra -- the
-// server then reads the request as a fetch from a cursor that was never
-// opened, and answers with an internal conversion error instead of the
-// statement's own result.
-static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
+// The FETCH option bit (0x40) is a DIALECT decision, and the two dialects
+// disagree about it:
+//
+//   * A legacy (11.2) listener must NOT see it. go-ora v1 -- the only
+//     open-source client that speaks 11g -- sets that bit only when a
+//     request neither parses nor executes (command.go:404-406), and a request
+//     that both parses and executes must leave it clear or the listener reads
+//     the request as a fetch from a cursor that was never opened, and answers
+//     with an internal conversion error instead of the statement's own result.
+//
+//   * A modern (12.1+) listener MUST see it. python-oracledb Thin sets
+//     TNS_EXEC_OPTION_FETCH for a query that prefetches, and the bit sits
+//     ALONGSIDE the parse and execute bits there
+//     (execute.pyx:98-99, TNS_EXEC_OPTION_FETCH = 0x40 in constants.pxi).
+//     The upstream 0.6.0 request carries options 0x8067 for a query.
+//
+// A DML request carries the same core bits in BOTH dialects and never sets
+// the bit: it is not a query, so there is nothing to prefetch.
+static void TestTtcExecuteQueryFetchBitFollowsTheDialect() {
     TtcExecuteNoBindsRequest request;
     request.sql = "select 1 from dual";
     request.is_query = true;
+    // A modern session: the FETCH bit is present.
+    request.dialect = ModernDialect();
     const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
     // The options word is the fourth field: three bytes of function header
     // (message type, function code, sequence) and then the options themselves.
@@ -1494,13 +1510,27 @@ static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
     CHECK(reader.ReadByte() == TTC_FUNCTION_EXECUTE);
     (void)reader.ReadByte(); // sequence
     const auto options = reader.ReadUB4();
-    CHECK((options & 0x40) == 0);
+    CHECK((options & 0x40) != 0);   // fetch: a modern query prefetches
     CHECK((options & 0x01) != 0);   // parse
     CHECK((options & 0x20) != 0);   // execute
     CHECK((options & 0x8000) != 0); // not PL/SQL
 
-    // A DML request carries the same core bits and also leaves the bit
-    // clear; only a request that neither parses nor executes may set it.
+    // A legacy session: the same request, and the FETCH bit must be clear.
+    TtcExecuteNoBindsRequest legacy = request;
+    legacy.dialect = Legacy112Dialect();
+    const auto legacy_encoded = EncodeTtcExecuteNoBindsRequest(legacy);
+    ByteReader legacy_reader(legacy_encoded);
+    (void)legacy_reader.ReadByte();
+    (void)legacy_reader.ReadByte();
+    (void)legacy_reader.ReadByte();
+    const auto legacy_options = legacy_reader.ReadUB4();
+    CHECK((legacy_options & 0x40) == 0);
+    CHECK((legacy_options & 0x01) != 0);
+    CHECK((legacy_options & 0x20) != 0);
+    CHECK((legacy_options & 0x8000) != 0);
+
+    // A DML request carries the same core bits and leaves the bit clear in
+    // both dialects: it is not a query, so there is nothing to prefetch.
     TtcExecuteNoBindsRequest dml;
     dml.sql = "update t set a = 1";
     dml.is_query = false;
@@ -1511,6 +1541,15 @@ static void TestTtcExecuteQueryLeavesTheFetchOnlyBitClear() {
     (void)dml_reader.ReadByte();
     const auto dml_options = dml_reader.ReadUB4();
     CHECK((dml_options & 0x40) == 0);
+
+    TtcExecuteNoBindsRequest legacy_dml = dml;
+    legacy_dml.dialect = Legacy112Dialect();
+    const auto legacy_dml_encoded = EncodeTtcExecuteNoBindsRequest(legacy_dml);
+    ByteReader legacy_dml_reader(legacy_dml_encoded);
+    (void)legacy_dml_reader.ReadByte();
+    (void)legacy_dml_reader.ReadByte();
+    (void)legacy_dml_reader.ReadByte();
+    CHECK((legacy_dml_reader.ReadUB4() & 0x40) == 0);
 }
 
 // A legacy (11.2) session speaks the TTC version 6 dialect, and the execute
@@ -1527,7 +1566,7 @@ static void TestLegacyExecuteRequestLayout() {
     TtcExecuteNoBindsRequest request;
     request.sql = sql;
     request.is_query = true;
-    request.legacy_session = true;
+    request.dialect = Legacy112Dialect();
     const auto encoded = EncodeTtcExecuteNoBindsRequest(request);
 
     // go-ora's execute request for the same statement, byte for byte.
@@ -1564,7 +1603,7 @@ static void TestLegacyExecuteRequestLayout() {
     // The modern form is a different length, and the two must not be confused
     // for one another.
     TtcExecuteNoBindsRequest modern = request;
-    modern.legacy_session = false;
+    modern.dialect = ModernDialect();
     const auto modern_encoded = EncodeTtcExecuteNoBindsRequest(modern);
     CHECK(modern_encoded.size() == encoded.size() + 10);
 }
@@ -1587,7 +1626,7 @@ static void TestLegacyBindMetadataHasNoOaccolid() {
     request.sql = "BEGIN DELETE FROM \"k\" WHERE \"v\" = :v; END;";
     request.binds = {{"v", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'F'}}};
     request.is_plsql = true;
-    request.legacy_session = true;
+    request.dialect = Legacy112Dialect();
     const auto encoded = EncodeTtcExecuteBindsRequest(request);
 
     // The metadata starts after the SQL text and the al8i4 array, and ends at
@@ -1632,7 +1671,7 @@ static void TestLegacyBindMetadataHasNoOaccolid() {
     // longer -- and its execute tail is ten bytes longer, so the whole request
     // is eleven bytes longer.
     TtcExecuteBindsRequest modern = request;
-    modern.legacy_session = false;
+    modern.dialect = ModernDialect();
     const auto modern_encoded = EncodeTtcExecuteBindsRequest(modern);
     CHECK(modern_encoded.size() == encoded.size() + 11);
 }
@@ -1834,13 +1873,25 @@ static void TestTtcExecuteNoBindsShape() {
     const auto encoded = EncodeTtcExecuteNoBindsRequest(query);
     ByteReader reader(encoded);
     CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION && reader.ReadByte() == TTC_FUNCTION_EXECUTE && reader.ReadByte() == 1);
-    // A query's options word carries PARSE, EXECUTE, NOT_PLSQL and the
-    // implicit result set. It does not carry the fetch-only bit: that bit
-    // means "neither parse nor execute", and go-ora only sets it for a
-    // request that does neither.
-    CHECK(reader.ReadUB4() == 0x8021 && reader.ReadUB4() == 0);
+    // A query's options word carries PARSE, EXECUTE, NOT_PLSQL, the implicit
+    // result set and the FETCH bit. The FETCH bit is the DIALECT's decision:
+    // a modern (12.1+) listener wants it -- python-oracledb Thin sets
+    // TNS_EXEC_OPTION_FETCH for a query that prefetches
+    // (execute.pyx:98-99, TNS_EXEC_OPTION_FETCH = 0x40 in constants.pxi), and
+    // the upstream 0.6.0 request carries it too -- while a legacy (11.2)
+    // listener must not see it, because go-ora v1 sets it only for a request
+    // that neither parses nor executes (command.go:404-406).
+    CHECK(reader.ReadUB4() == 0x8061 && reader.ReadUB4() == 0);
     CHECK(reader.ReadByte() == 1 && reader.ReadUB4() == query.sql.size());
     CHECK(reader.ReadByte() == 1 && reader.ReadUB4() == 13);
+
+    // The same query on a legacy session: the FETCH bit is clear.
+    TtcExecuteNoBindsRequest legacy = query;
+    legacy.dialect = Legacy112Dialect();
+    const auto legacy_encoded = EncodeTtcExecuteNoBindsRequest(legacy);
+    ByteReader legacy_reader(legacy_encoded);
+    legacy_reader.Skip(3);
+    CHECK(legacy_reader.ReadUB4() == 0x8021);
 
     TtcExecuteNoBindsRequest dml;
     dml.sql = "insert into t values (1)";
@@ -2670,7 +2721,7 @@ static void TestLegacyRequestStatesChunkLengthsItsOwnWay() {
     TtcExecuteBindsRequest request;
     request.sql = "SELECT * FROM t WHERE c = :v";
     request.binds = {{"v", 1, BindDirection::BIND_IN, std::vector<uint8_t>(400, 0x41)}};
-    request.legacy_session = true;
+    request.dialect = Legacy112Dialect();
 
     const std::vector<uint8_t> marker {TNS_LONG_LENGTH_INDICATOR};
     const auto legacy = EncodeTtcExecuteBindsRequest(request);
@@ -2685,7 +2736,7 @@ static void TestLegacyRequestStatesChunkLengthsItsOwnWay() {
     // The modern request states the same chunk length as a universal integer,
     // so the byte after the marker is a width.
     TtcExecuteBindsRequest modern = request;
-    modern.legacy_session = false;
+    modern.dialect = ModernDialect();
     const auto modern_bytes = EncodeTtcExecuteBindsRequest(modern);
     const auto modern_at = std::search(modern_bytes.begin(), modern_bytes.end(), marker.begin(), marker.end());
     CHECK(modern_at != modern_bytes.end());
@@ -9572,7 +9623,7 @@ int main() {
     TestTtcOutBindsRow();
     TestTtcCallResponse();
     TestTtcExecuteNoBindsCodec();
-    TestTtcExecuteQueryLeavesTheFetchOnlyBitClear();
+    TestTtcExecuteQueryFetchBitFollowsTheDialect();
     TestLegacyExecuteRequestLayout();
     TestLegacyBindMetadataHasNoOaccolid();
     TestLegacyLongValueUsesRawByteChunkLength();

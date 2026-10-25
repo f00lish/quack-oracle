@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/ttc_row_data.hpp"
 
 #include <limits>
@@ -90,7 +91,7 @@ using ScaleReader = int64_t (*)(ByteReader &);
 
 const ScaleReader SCALE_READERS[] = {ReadScaleOneByte, ReadScaleCompressed};
 
-OracleColumn DecodeColumnWithScale(ByteReader &reader, uint8_t field_version, bool legacy_session,
+OracleColumn DecodeColumnWithScale(ByteReader &reader, uint8_t field_version, TtcDialect dialect,
                                    TtcChunkEncoding chunk_encoding, const ScaleCandidate &scale,
                                    uint8_t oracle_type, int8_t precision) {
     OracleColumn column;
@@ -115,7 +116,7 @@ OracleColumn DecodeColumnWithScale(ByteReader &reader, uint8_t field_version, bo
     // goes straight from the size field to nullable. Reading the field there
     // shifts every later field by two bytes, and the name that comes out is
     // the declared length of the text rather than the text itself.
-    if (!legacy_session) {
+    if (dialect.describe_has_oaccolid) {
         reader.ReadUB4(); // oaccolid
     }
     column.nullable = reader.ReadByte() != 0;
@@ -157,7 +158,7 @@ OracleColumn DecodeColumnWithScale(ByteReader &reader, uint8_t field_version, bo
 // descriptor. `explored` bounds the search so a malformed response cannot make
 // it diverge. The first scale candidate that lets every remaining column and
 // the trailer decode is kept.
-bool DecodeColumnsAndTrailer(const std::vector<uint8_t> &message, uint8_t field_version, bool legacy_session,
+bool DecodeColumnsAndTrailer(const std::vector<uint8_t> &message, uint8_t field_version, TtcDialect dialect,
                              TtcChunkEncoding chunk_encoding, ByteReader &reader, uint32_t column_count,
                              std::vector<OracleColumn> &columns, uint32_t &explored) {
     if (columns.size() == column_count) {
@@ -197,14 +198,14 @@ bool DecodeColumnsAndTrailer(const std::vector<uint8_t> &message, uint8_t field_
         }
         OracleColumn column;
         try {
-            column = DecodeColumnWithScale(candidate, field_version, legacy_session, chunk_encoding, scale,
+            column = DecodeColumnWithScale(candidate, field_version, dialect, chunk_encoding, scale,
                                            oracle_type, precision);
         } catch (const ProtocolError &) {
             continue;
         }
         std::vector<OracleColumn> next_columns = columns;
         next_columns.push_back(std::move(column));
-        if (DecodeColumnsAndTrailer(message, field_version, legacy_session, chunk_encoding, candidate, column_count,
+        if (DecodeColumnsAndTrailer(message, field_version, dialect, chunk_encoding, candidate, column_count,
                                     next_columns, explored)) {
             columns = std::move(next_columns);
             reader = candidate;
@@ -217,13 +218,13 @@ bool DecodeColumnsAndTrailer(const std::vector<uint8_t> &message, uint8_t field_
 } // namespace
 
 TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
-                                            bool legacy_session) {
+                                            TtcDialect dialect) {
     ByteReader reader(message);
     if (reader.ReadByte() != TTC_MESSAGE_DESCRIBE_INFO) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC DESCRIBE_INFO message");
     }
     // The session's dialect decides how the length of a long value is stated.
-    const auto chunk_encoding = ChunkEncodingFor(legacy_session);
+    const auto chunk_encoding = dialect.chunk_encoding;
     (void)reader.ReadLengthPrefixed(MAX_METADATA_BYTES, chunk_encoding); // version bytes
     reader.ReadUB4(); // maximum row size
     const auto column_count = reader.ReadUB4();
@@ -235,7 +236,7 @@ TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message,
     result.columns.reserve(column_count);
     uint32_t explored = 0;
     std::vector<OracleColumn> columns;
-    if (!DecodeColumnsAndTrailer(message, ttc_field_version, legacy_session, chunk_encoding, reader, column_count,
+    if (!DecodeColumnsAndTrailer(message, ttc_field_version, dialect, chunk_encoding, reader, column_count,
                                 columns, explored)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,
                              "TTC describe column " + std::to_string(columns.size()) + " at offset " +

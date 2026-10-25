@@ -30,17 +30,24 @@ public:
         return channel.LegacySession();
     }
 
+    // The session's dialect. Every response decoder this channel runs is
+    // given it, so the dialect is NOT a parameter on the methods below: the
+    // channel already knows it, and passing it in would let a caller pass a
+    // dialect that disagrees with the channel's own.
+    const TtcDialect &Dialect() const {
+        return channel.Dialect();
+    }
+
     //! Runs one LOB_OP and returns what it served. The end-of-call that
     //! follows the data is consumed here, so a caller sees a value or an
     //! error and never a half-read channel.
-    TtcLobResponse LobOperation(const TtcLobRequest &request, uint8_t server_field_version,
-                                bool legacy_session = false);
+    TtcLobResponse LobOperation(const TtcLobRequest &request, uint8_t server_field_version);
 
     //! Runs a LOB_OP that returns locators rather than data — creating,
     //! writing or releasing a temporary LOB — from an already encoded request.
     //! Returns the locator(s) the server sent back, concatenated.
     std::vector<uint8_t> LocatorOperation(const std::vector<uint8_t> &request, size_t locator_count, bool created,
-                                          uint8_t server_field_version, bool legacy_session = false);
+                                          uint8_t server_field_version);
 
     //! Held across a request and the response that answers it. See
     //! TtcChannel::LockCall.
@@ -50,16 +57,13 @@ public:
     void ExecuteBinds(OracleStatementHandle handle, const TtcExecuteBindsRequest &request);
     std::vector<uint8_t> ReceiveExecuteResponse(OracleStatementHandle handle);
     TtcExecuteResponse ReceiveDecodedExecuteResponse(OracleStatementHandle handle, uint8_t ttc_field_version = 12,
-                                                     uint8_t server_field_version = 12,
-                                                     bool legacy_session = false);
-    TtcErrorInfo ReceiveDmlResponse(OracleStatementHandle handle, uint8_t server_field_version = 12,
-                                    bool legacy_session = false);
+                                                     uint8_t server_field_version = 12);
+    TtcErrorInfo ReceiveDmlResponse(OracleStatementHandle handle, uint8_t server_field_version = 12);
     TtcPlsqlOutBindsResponse ReceivePlsqlOutBindsResponse(OracleStatementHandle handle,
                                                            const std::vector<OracleBind> &binds,
                                                            uint8_t ttc_field_version = 12);
     TtcCallResponse ReceiveCallResponse(OracleStatementHandle handle, const std::vector<OracleBind> &binds,
-                                        uint8_t ttc_field_version = 12, uint8_t server_field_version = 12,
-                                        bool legacy_session = false);
+                                        uint8_t ttc_field_version = 12, uint8_t server_field_version = 12);
     void CompleteExecute(OracleStatementHandle handle, bool is_query, uint32_t remote_cursor_id);
     void Fetch(OracleStatementHandle handle, uint8_t sequence, uint32_t requested_rows);
     // Re-executes the described cursor with a define for each column, so JSON
@@ -70,13 +74,12 @@ public:
         const std::vector<OracleColumn> &columns,uint32_t rows,uint8_t field_version,const OracleLobPrefetchLimits &limits);
     TtcFetchResponse ReceiveDecodedLobPrefetchFetchResponse(OracleStatementHandle handle,
         const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,uint8_t server_field_version,
-        const std::optional<TtcRowData> &preceding_row,bool legacy_session = false);
+        const std::optional<TtcRowData> &preceding_row);
     void Cancel(OracleStatementHandle handle);
     std::vector<uint8_t> ReceiveFetchResponse(OracleStatementHandle handle);
     TtcFetchResponse ReceiveDecodedFetchResponse(OracleStatementHandle handle, const std::vector<OracleColumn> &columns,
                                                  uint8_t server_field_version = 12,
-                                                 const std::optional<TtcRowData> &preceding_row = std::nullopt,
-                                                 bool legacy_session = false);
+                                                 const std::optional<TtcRowData> &preceding_row = std::nullopt);
     void MarkFetchExhausted(OracleStatementHandle handle);
     // Discards the local handle immediately and schedules its server cursor
     // for Oracle's next-call CLOSE_CURSORS piggyback when it has one.

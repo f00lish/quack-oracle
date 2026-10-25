@@ -223,8 +223,8 @@ TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_co
 
 LobPrefetchFetchResponseDecoder::LobPrefetchFetchResponseDecoder(const std::vector<OracleColumn> &columns_p,
     const OracleLobPrefetchLimits &limits_p,uint8_t server_field_version_p,const std::optional<TtcRowData> &preceding_row_p,
-    bool legacy_session_p)
-    : columns(columns_p), limits(limits_p), server_field_version(server_field_version_p), legacy_session(legacy_session_p),
+    TtcDialect dialect_p)
+    : columns(columns_p), limits(limits_p), server_field_version(server_field_version_p), dialect(dialect_p),
       preceding_row(preceding_row_p) {
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
@@ -238,7 +238,7 @@ LobPrefetchFetchResponseDecoder::LobPrefetchFetchResponseDecoder(const std::vect
     // (11.2) one. Reading the legacy form as a universal integer takes the
     // length byte for a width and then the value's own bytes for the number,
     // so the row never decodes.
-    chunk_encoding = legacy_session ? TtcChunkEncoding::RawByte : TtcChunkEncoding::UniversalInteger;
+    chunk_encoding = dialect.chunk_encoding;
 }
 
 const TtcRowData *LobPrefetchFetchResponseDecoder::PreviousRow() const {
@@ -374,7 +374,7 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
             // failure to do so is a real disagreement with the server rather
             // than something to paper over by swallowing the rest of the
             // message.
-            const auto completion = DecodeTtcErrorPrefix(Tail(message, offset), server_field_version, legacy_session);
+            const auto completion = DecodeTtcErrorPrefix(Tail(message, offset), server_field_version, dialect);
             result.exhausted = completion.error_number == 1403;
             result.completion = completion;
             if (completion.error_number != 0 && !result.exhausted) {

@@ -92,12 +92,12 @@ public:
                 if (!prefetched) { row[index]=ReadWholeLob(*row[index],character);continue; }
                 const auto call=channel.LockCall();
                 const auto cell=DecodeStoredLobPrefetch(*row[index],character,prefetch_limits,
-                    ChunkEncodingFor(channel.LegacySession()));
+                    channel.Dialect().chunk_encoding);
                 const auto content=MaterializePrefetchedOracleLob(cell,65536,prefetch_limits.maximum_content_bytes,
                     [&](const std::vector<uint8_t> &locator,uint64_t offset,uint64_t amount) {
                         TtcLobRequest request;request.sequence=NextCursorSequence();request.locator=locator;
                         request.operation=LOB_OP_READ;request.offset=offset;request.amount=amount;
-                        return channel.LobOperation(request,server_field_version,channel.LegacySession());
+                        return channel.LobOperation(request,server_field_version);
                     });
                 if (!content) { throw ProtocolError(ProtocolErrorKind::MALFORMED,"non-NULL prefetched LOB became NULL"); }
                 row[index]=character ? DecodeUtf16BeToUtf8(*content) : *content;
@@ -148,13 +148,13 @@ public:
                 // The session's dialect decides how the length of a long value
                 // is stated, so the read has to carry it: a legacy (11.2)
                 // session states each piece's length as one raw byte.
-                return channel.LobOperation(request, server_field_version, channel.LegacySession());
+                return channel.LobOperation(request, server_field_version);
             }, [&] {
                 TtcLobRequest request;
                 request.sequence = NextCursorSequence();
                 request.locator = locator;
                 request.operation = LOB_OP_GET_LENGTH;
-                return channel.LobOperation(request, server_field_version, channel.LegacySession()).amount;
+                return channel.LobOperation(request, server_field_version).amount;
             });
         return is_character ? DecodeUtf16BeToUtf8(content) : content;
     }
@@ -208,8 +208,8 @@ public:
             auto response_limits=prefetch_limits;
             response_limits.maximum_rows=count;
             auto response=prefetch_active ?
-                channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,response_limits,server_field_version,previous_row,channel.LegacySession()) :
-                channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row,channel.LegacySession());
+                channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,response_limits,server_field_version,previous_row) :
+                channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row);
             previous_row = response.last_row;
             exhausted = response.exhausted;
             OracleBatch decoded;decoded.rows=std::move(response.rows);ResolveLobs(decoded,prefetch_active);
@@ -275,33 +275,32 @@ private:
 class SessionTemporaryLobWriter final : public TemporaryLobWriter {
 public:
     SessionTemporaryLobWriter(TtcStatementChannel &channel_p, std::function<uint8_t()> next_sequence_p,
-                              uint8_t server_field_version_p, bool legacy_session_p)
+                              uint8_t server_field_version_p, TtcDialect dialect_p)
         : channel(channel_p), next_sequence(std::move(next_sequence_p)), server_field_version(server_field_version_p),
-          legacy_session(legacy_session_p) {
+          dialect(dialect_p) {
     }
 
     std::vector<uint8_t> Create(TtcTempLobKind kind) override {
-        return channel.LocatorOperation(EncodeTtcCreateTempLob(next_sequence(), kind), 1, true, server_field_version,
-                                         legacy_session);
+        return channel.LocatorOperation(EncodeTtcCreateTempLob(next_sequence(), kind), 1, true, server_field_version);
     }
 
     std::vector<uint8_t> Write(const std::vector<uint8_t> &locator, uint64_t offset,
                                const std::vector<uint8_t> &data) override {
         return channel.LocatorOperation(
-            EncodeTtcWriteLob(next_sequence(), locator, offset, data, ChunkEncodingFor(legacy_session)), 1, false,
-            server_field_version, legacy_session);
+            EncodeTtcWriteLob(next_sequence(), locator, offset, data, dialect.chunk_encoding), 1, false,
+            server_field_version);
     }
 
     void Free(const std::vector<std::vector<uint8_t>> &locators) override {
         (void)channel.LocatorOperation(EncodeTtcFreeTempLobs(next_sequence(), locators), locators.size(), false,
-                                       server_field_version, legacy_session);
+                                       server_field_version);
     }
 
 private:
     TtcStatementChannel &channel;
     std::function<uint8_t()> next_sequence;
     uint8_t server_field_version;
-    bool legacy_session;
+    TtcDialect dialect;
 };
 
 } // namespace
@@ -395,7 +394,7 @@ auto NativeOracleSession::WithTemporaryLobs(const std::vector<OracleBind> &binds
     }
     const auto call = channel->LockCall();
     SessionTemporaryLobWriter writer(*channel, [this] { return NextSequence(); }, connection->TtcServerFieldVersion(),
-                                     connection->LegacySession());
+                                     connection->Dialect());
     TemporaryLobScope scope(writer);
     auto converted = binds;
     try {
@@ -431,14 +430,14 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
     const auto handle = statements.Open(OracleSqlKind::QUERY);
     if (ordered_binds.empty()) {
         TtcExecuteNoBindsRequest request;
-    request.legacy_session = connection->LegacySession();
+    request.dialect = connection->Dialect();
         request.sequence = NextSequence();
         request.sql = sql;
         request.is_query = true;
         channel->ExecuteNoBinds(handle, request);
     } else {
         TtcExecuteBindsRequest request;
-    request.legacy_session = connection->LegacySession();
+    request.dialect = connection->Dialect();
         request.sequence = NextSequence();
         request.sql = sql;
         request.binds = ordered_binds;
@@ -446,8 +445,7 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
         channel->ExecuteBinds(handle, request);
     }
     const auto response = channel->ReceiveDecodedExecuteResponse(handle, connection->TtcFieldVersion(),
-                                                                  connection->TtcServerFieldVersion(),
-                                                                  channel->LegacySession());
+                                                                  connection->TtcServerFieldVersion());
     if (!response.completion || response.completion->cursor_id == 0) {
         statements.Poison(handle);
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query response has no cursor completion");
@@ -478,19 +476,19 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
     const auto handle = statements.Open(kind);
     if (ordered_binds.empty()) {
         TtcExecuteNoBindsRequest request;
-    request.legacy_session = connection->LegacySession();
+    request.dialect = connection->Dialect();
         request.sequence = NextSequence();
         request.sql = sql;
         channel->ExecuteNoBinds(handle, request);
     } else {
         TtcExecuteBindsRequest request;
-    request.legacy_session = connection->LegacySession();
+    request.dialect = connection->Dialect();
         request.sequence = NextSequence();
         request.sql = sql;
         request.binds = ordered_binds;
         channel->ExecuteBinds(handle, request);
     }
-    const auto completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(), channel->LegacySession());
+    const auto completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion());
     // The TTIOER completion names the server cursor this statement opened.
     // Recording it is what lets Close queue the piggybacked close; without it
     // the server keeps the cursor and a long run of statements on one session
@@ -529,15 +527,14 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
 
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         TtcExecuteBindsRequest execute;
-    execute.legacy_session = connection->LegacySession();
+    execute.dialect = connection->Dialect();
         execute.sequence = NextSequence();
         execute.sql = block;
         execute.binds = ordered_binds;
         execute.is_plsql = true;
         channel->ExecuteBinds(handle, execute);
         const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
-                                                        connection->TtcServerFieldVersion(),
-                                                        channel->LegacySession());
+                                                        connection->TtcServerFieldVersion());
         channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
         channel->Close(handle);
         if (!decoded.out_binds || decoded.out_binds->scalar_values.size() != 1 ||
@@ -580,7 +577,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
             // temporary LOB, one group at a time so they are released as soon
             // as the group has run.
             SessionTemporaryLobWriter lob_writer(*channel, [this] { return NextSequence(); },
-                                                 connection->TtcServerFieldVersion(), connection->LegacySession());
+                                                 connection->TtcServerFieldVersion(), connection->Dialect());
             TemporaryLobScope lobs(lob_writer);
             std::vector<std::vector<OracleBind>> converted;
             const bool use_converted = TemporaryLobScope::NeededRows(rows, start, end);
@@ -598,7 +595,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
                 auto ordered_first = OrderOracleStatementBinds(sql, row_at(start), OracleBindUse::DML);
                 const auto handle = statements.Open(OracleSqlKind::DML);
                 TtcExecuteBindsRequest execute;
-                execute.legacy_session = connection->LegacySession();
+                execute.dialect = connection->Dialect();
                 execute.sequence = NextSequence();
                 execute.sql = sql;
                 execute.binds = std::move(ordered_first);
@@ -610,8 +607,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
                 channel->ExecuteBinds(handle, execute);
                 TtcErrorInfo completion;
                 try {
-                    completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(),
-                                                            channel->LegacySession());
+                    completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion());
                 } catch (const OracleDmlError &error) {
                     // The server reports the iteration it was on, zero-based and
                     // relative to this request; the caller counts from the start of the
@@ -654,15 +650,14 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
 
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         TtcExecuteBindsRequest execute;
-    execute.legacy_session = connection->LegacySession();
+    execute.dialect = connection->Dialect();
         execute.sequence = NextSequence();
         execute.sql = block;
         execute.binds = ordered_binds;
         execute.is_plsql = true;
         channel->ExecuteBinds(handle, execute);
         const auto decoded = channel->ReceiveCallResponse(handle, ordered_binds, connection->TtcFieldVersion(),
-                                                          connection->TtcServerFieldVersion(),
-                                                          channel->LegacySession());
+                                                          connection->TtcServerFieldVersion());
         channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
         channel->Close(handle);
 
@@ -705,14 +700,14 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         if (binds.empty()) {
             TtcExecuteNoBindsRequest execute;
-    execute.legacy_session = connection->LegacySession();
+    execute.dialect = connection->Dialect();
             execute.sequence = NextSequence();
             execute.sql = sql;
             execute.is_plsql = true;
             channel->ExecuteNoBinds(handle, execute);
         } else {
             TtcExecuteBindsRequest execute;
-    execute.legacy_session = connection->LegacySession();
+    execute.dialect = connection->Dialect();
             execute.sequence = NextSequence();
             execute.sql = sql;
             execute.binds = binds;
@@ -720,8 +715,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
             channel->ExecuteBinds(handle, execute);
         }
         const auto decoded = channel->ReceiveCallResponse(handle, binds, connection->TtcFieldVersion(),
-                                                    connection->TtcServerFieldVersion(),
-                                                    channel->LegacySession());
+                                                    connection->TtcServerFieldVersion());
         channel->CompleteExecute(handle, false, decoded.completion ? decoded.completion->cursor_id : 0);
         channel->Close(handle);
 

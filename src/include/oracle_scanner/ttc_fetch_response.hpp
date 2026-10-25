@@ -30,7 +30,7 @@ struct TtcFetchResponse {
 TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, const std::vector<OracleColumn> &columns,
                                         uint8_t ttc_field_version = 12,
                                         const std::optional<TtcRowData> &preceding_row = std::nullopt,
-                                        bool legacy_session = false);
+                                        TtcDialect dialect = TtcDialect{});
 
 // Decodes one fetch response as it arrives in DATA fragments, without decoding
 // any row twice. Each call to Decode is given the whole response received so
@@ -45,7 +45,7 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
 class TtcFetchResponseDecoder {
 public:
     TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
-                            const std::optional<TtcRowData> &preceding_row, bool legacy_session = false);
+                            const std::optional<TtcRowData> &preceding_row, TtcDialect dialect = TtcDialect{});
 
     // True once the response is complete. Throws TRUNCATED, as
     // DecodeTtcFetchResponse does, when the bytes end inside a message, and
@@ -64,7 +64,7 @@ private:
     // Whether the server speaks the legacy (11.2) session dialect, which
     // changes the layout of the TTIOER error body inside a fetch response
     // and the encoding of a long value's chunk length.
-    bool legacy_session = false;
+    TtcDialect dialect;
     // How this session states the length of a long value's chunk: a universal
     // integer on a modern session, a single raw byte on a legacy one. It
     // follows the session's own dialect, so it is derived from

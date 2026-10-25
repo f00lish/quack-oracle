@@ -1,6 +1,7 @@
 #pragma once
 
 #include "oracle_scanner/session.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 
 #include <cstdint>
 #include <string>
@@ -17,11 +18,14 @@ constexpr uint16_t ORACLE_WIRE_TYPE_CURSOR = 102;
 // silently encoded as an ordinary scalar.
 struct TtcExecuteNoBindsRequest {
     uint8_t sequence = 1;
-    // Whether the server speaks the legacy (11.2) session dialect. In that
-    // dialect the third byte of the execute request is not a call sequence:
-    // go-ora writes zero there for every version it supports, and the older
-    // listener reads a non-zero value as something else.
-    bool legacy_session = false;
+    // The session's dialect. It is a VALUE, not a reference: a request
+    // outlives nothing and is copied around, and a reference member would
+    // make the struct non-assignable.
+    //
+    // In the legacy dialect the third byte of the execute request is not a
+    // call sequence: go-ora writes zero there for every version it supports,
+    // and the older listener reads a non-zero value as something else.
+    TtcDialect dialect = TtcDialect{};
     // Extra OALL8 option bits. Core PARSE/EXECUTE/FETCH/NOT_PLSQL bits are
     // derived from is_query and are always present for a fresh statement.
     uint32_t options = 0;
@@ -44,8 +48,8 @@ std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsReque
 // by ORACLE_WIRE_TYPE_CURSOR and use their special non-null placeholder.
 struct TtcExecuteBindsRequest {
     uint8_t sequence = 1;
-    // See TtcExecuteNoBindsRequest::legacy_session.
-    bool legacy_session = false;
+    // See TtcExecuteNoBindsRequest::dialect.
+    TtcDialect dialect = TtcDialect{};
     std::string sql;
     // Bind metadata for every execution, and the values of the first one.
     std::vector<OracleBind> binds;

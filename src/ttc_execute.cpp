@@ -2,6 +2,7 @@
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/ttc_auth.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/ttc_row_data.hpp"
 
 #include <algorithm>
@@ -15,12 +16,24 @@ constexpr uint32_t MAX_PREFETCH_ROWS = 1U << 20U;
 constexpr uint32_t MAX_BUFFER_BYTES = 16U << 20U;
 constexpr uint32_t OALL8_PARSE = 0x01;
 constexpr uint32_t OALL8_EXECUTE = 0x20;
-// The option word also has a 0x40 bit, and it is not a fetch request of its
-// own: it means "neither parse nor execute", so the server reads the request
-// as a fetch from an already-open cursor. go-ora's option builder only ever
-// sets it when both other bits are clear, so a request that parses and
-// executes must leave it clear. The bit is named here for the reader; no
-// request this file builds sets it.
+// The option word has a 0x40 bit, and the two dialects read it differently.
+//
+// A modern (12.1+) listener wants it on a query: python-oracledb Thin sets
+// TNS_EXEC_OPTION_FETCH for a query that prefetches
+// (src/oracledb/impl/thin/messages/execute.pyx:98-99, with
+// TNS_EXEC_OPTION_FETCH = 0x40 in constants.pxi), and the bit sits
+// ALONGSIDE the parse and execute bits there. The upstream 0.6.0 execute
+// request therefore carries options 0x8067 for a query.
+//
+// A legacy (11.2) listener must NOT see it: go-ora v1 -- the only
+// open-source client that speaks 11g -- sets that bit only when a request
+// neither parses nor executes (command.go:404-406), and a request that both
+// parses and executes must leave it clear or the listener reads the request
+// as a fetch from a cursor that was never opened.
+//
+// So the bit is a DIALECT property, and it is read from the dialect rather
+// than decided here.
+constexpr uint32_t OALL8_FETCH = 0x40;
 constexpr uint32_t OALL8_BIND = 0x08;
 constexpr uint32_t OALL8_NOT_PLSQL = 0x8000;
 constexpr uint32_t OALL8_PLSQL_BIND = 0x400;
@@ -51,7 +64,7 @@ void Validate(const TtcExecuteNoBindsRequest &request) {
 // zero there for every version -- is the reference for what it expects.
 template <typename Request>
 uint8_t ExecuteSequence(const Request &request) {
-    return request.legacy_session ? 0 : request.sequence;
+    return request.dialect.zero_execute_sequence ? 0 : request.sequence;
 }
 
 void WriteThinOall8Extension(ByteWriter &writer, uint8_t field_version) {
@@ -78,9 +91,9 @@ void WriteThinOall8Extension(ByteWriter &writer, uint8_t field_version) {
 //
 // The modern form is what the 12.2 capture this extension was built from
 // carries, and it is kept byte for byte.
-void WriteExecuteTail(ByteWriter &writer, bool legacy_session, bool has_binds, uint32_t bind_count,
+void WriteExecuteTail(ByteWriter &writer, TtcDialect dialect, bool has_binds, uint32_t bind_count,
                       uint8_t field_version) {
-    if (legacy_session) {
+    if (dialect.execute_tail_legacy) {
         if (has_binds) {
             writer.WriteByte(1).WriteUB4(bind_count);
         } else {
@@ -232,7 +245,7 @@ std::vector<uint32_t> IterationBufferSizes(const TtcExecuteBindsRequest &request
 
 void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
                       const std::vector<uint32_t> &buffer_sizes, uint8_t field_version,
-                      bool legacy_session) {
+                      TtcDialect dialect) {
     for (size_t index = 0; index < binds.size(); index++) {
         const auto &bind = binds[index];
         const auto character_type = IsCharacterType(bind.oracle_type) || bind.oracle_type == 112;
@@ -259,7 +272,7 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
         // answers the whole request with ORA-03115 -- "unsupported network
         // datatype or representation" -- before it ever looks at the
         // statement. go-ora's 11g client writes no OACCOLID either.
-        if (!legacy_session && field_version >= TTC_FIELD_VERSION_12_2) {
+        if (dialect.bind_metadata_has_oaccolid && field_version >= TTC_FIELD_VERSION_12_2) {
             writer.WriteUB4(0);
         }
     }
@@ -337,11 +350,16 @@ std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsReque
     writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(ExecuteSequence(request));
     uint32_t core_options = OALL8_PARSE | OALL8_EXECUTE;
     if (request.is_query) {
-        // A query parses and executes; the implicit result set is what makes
-        // the server open a cursor for it. The fetch-only bit must stay clear
-        // or the server reads the request as a fetch from a cursor that was
-        // never opened.
+        // The implicit result set is what makes the server open a cursor for
+        // the query; the FETCH bit is what makes it prefetch. On a modern
+        // listener both belong here -- python-oracledb sets them together
+        // with parse and execute. On a legacy (11.2) listener the FETCH bit
+        // must stay clear, because go-ora v1 sets it only for a request that
+        // neither parses nor executes.
         core_options |= OALL8_IMPLICIT_RESULTSETS;
+        if (request.dialect.query_sets_fetch_bit) {
+            core_options |= OALL8_FETCH;
+        }
     }
     if (!request.is_plsql) {
         core_options |= OALL8_NOT_PLSQL;
@@ -355,12 +373,14 @@ std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsReque
     // A legacy listener is told how many rows to prefetch in the same place
     // go-ora and the JDBC driver put it, and both use ten. The modern form
     // keeps the caller's own value.
-    const auto prefetch_rows = request.legacy_session ? 10U : request.prefetch_rows;
+    const auto prefetch_rows = request.dialect.legacy_prefetch_rows != 0
+        ? request.dialect.legacy_prefetch_rows
+        : request.prefetch_rows;
     writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(prefetch_rows);
     writer.WriteUB4(request.maximum_long_bytes);
-    WriteExecuteTail(writer, request.legacy_session, false, 0, request.ttc_field_version);
+    WriteExecuteTail(writer, request.dialect, false, 0, request.ttc_field_version);
     writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()),
-                              ChunkEncodingFor(request.legacy_session));
+                              request.dialect.chunk_encoding);
     writer.WriteUB4(1); // al8i4[0]: SQL must be parsed on a fresh cursor
     writer.WriteUB4(request.is_query ? 0 : 1); // al8i4[1]: query prefetch vs one DML/PLSQL iteration
     for (size_t index = 2; index < 13; index++) {
@@ -375,7 +395,12 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(ExecuteSequence(request));
     uint32_t options = OALL8_PARSE | OALL8_EXECUTE | OALL8_BIND;
     if (request.is_query) {
+        // See the note in EncodeTtcExecuteNoBindsRequest: the FETCH bit
+        // belongs to a modern query and must stay clear on a legacy one.
         options |= OALL8_IMPLICIT_RESULTSETS;
+        if (request.dialect.query_sets_fetch_bit) {
+            options |= OALL8_FETCH;
+        }
     }
     if (request.is_plsql) {
         options |= OALL8_PLSQL_BIND;
@@ -384,12 +409,14 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     }
     writer.WriteUB4(options).WriteUB4(0).WriteByte(1).WriteUB4(static_cast<uint32_t>(request.sql.size()));
     writer.WriteByte(1).WriteUB4(13).WriteByte(0).WriteByte(0);
-    const auto prefetch_rows = request.legacy_session ? 10U : request.prefetch_rows;
+    const auto prefetch_rows = request.dialect.legacy_prefetch_rows != 0
+        ? request.dialect.legacy_prefetch_rows
+        : request.prefetch_rows;
     writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(prefetch_rows).WriteUB4(request.maximum_long_bytes);
-    WriteExecuteTail(writer, request.legacy_session, true, static_cast<uint32_t>(request.binds.size()),
+    WriteExecuteTail(writer, request.dialect, true, static_cast<uint32_t>(request.binds.size()),
                       request.ttc_field_version);
     writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()),
-                              ChunkEncodingFor(request.legacy_session));
+                              request.dialect.chunk_encoding);
     // al8i4[1] is the execution count: one DML iteration, or as many as the
     // batch carries. A query leaves it zero.
     writer.WriteUB4(1).WriteUB4(request.is_query
@@ -400,10 +427,10 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     }
     const auto buffer_sizes = IterationBufferSizes(request);
     WriteBindMetadata(writer, request.binds, buffer_sizes, request.ttc_field_version,
-                      request.legacy_session);
+                      request.dialect);
     // One ROW_DATA message per iteration, in order. This is the whole of array
     // DML on the wire: the same parse, the same metadata, N rows of values.
-    const auto chunk_encoding = ChunkEncodingFor(request.legacy_session);
+    const auto chunk_encoding = request.dialect.chunk_encoding;
     WriteBindValues(writer, request.binds, buffer_sizes, chunk_encoding);
     for (const auto &iteration : request.additional_iterations) {
         WriteBindValues(writer, iteration, buffer_sizes, chunk_encoding);

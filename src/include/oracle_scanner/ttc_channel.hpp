@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_stream.hpp"
 #include "oracle_scanner/data_assembler.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/ttc_transaction.hpp"
 
@@ -18,7 +19,7 @@ namespace oracle_scanner {
 class TtcChannel {
 public:
     TtcChannel(TnsPacketStream &packets, size_t negotiated_sdu, size_t maximum_message_size = 16U << 20U,
-               bool cancellation_supported = true, bool legacy_session = false);
+               bool cancellation_supported = true, TtcDialect dialect = TtcDialect{});
 
     // Queues a server cursor release for the next TTC function call. Oracle
     // defines CLOSE_CURSORS as a piggyback, so sending it independently would
@@ -47,7 +48,15 @@ public:
     // message with the modern layout and reports a width error instead of
     // the server's own message.
     bool LegacySession() const {
-        return legacy_session;
+        return dialect.chunk_encoding == TtcChunkEncoding::RawByte;
+    }
+
+    // The session's dialect. It is ONE value rather than a flag plus a
+    // separate encoding argument, so a function that has to know how the
+    // session states a length takes the dialect and not a pair of loose
+    // parameters that could disagree with each other.
+    const TtcDialect &Dialect() const {
+        return dialect;
     }
 
     // One TTC call is a request and the response that answers it, and the two
@@ -70,7 +79,7 @@ private:
     uint8_t next_piggyback_sequence = 1;
     uint8_t wire_field_version = 0;
     bool cancellation_supported;
-    bool legacy_session = false;
+    TtcDialect dialect;
     std::atomic<bool> cancellation_requested {false};
     std::mutex outbound_mutex;
     std::recursive_mutex call_mutex;

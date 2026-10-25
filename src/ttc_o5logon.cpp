@@ -30,7 +30,7 @@ O5LogonResponse RunO5Logon(TtcChannel &channel, const O5LogonRequest &request) {
     // is comes from the session's own legacy marker, not from a bit of the
     // capability table: the 19c capability table has caps[37] == 0x01, so the
     // test go-ora uses to decide this would treat 19c as legacy.
-    const auto chunk_encoding = ChunkEncodingFor(local.legacy_session);
+    const auto chunk_encoding = local.dialect.chunk_encoding;
     channel.Send(EncodeTtcAuthFunction(TTC_FUNCTION_AUTH_PHASE_ONE, 1, local.username, local.auth_mode,
                                        local.phase_one_parameters, chunk_encoding));
     auto challenge_response = channel.Receive();

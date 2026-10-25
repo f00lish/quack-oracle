@@ -1,6 +1,7 @@
 #pragma once
 
 #include "oracle_scanner/byte_buffer.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/session.hpp"
 
 #include <cstdint>
@@ -75,7 +76,7 @@ std::vector<uint8_t> EncodeTtcFreeTempLobs(uint8_t sequence, const std::vector<s
 //! returned (empty for a release that returns none) and the end-of-call.
 //! `created` is true for CREATE_TEMP, whose reply carries two extra fields.
 std::vector<uint8_t> DecodeCompleteTtcLocatorCall(const std::vector<uint8_t> &response, size_t locator_count,
-                                                  bool created, uint8_t server_field_version, bool legacy_session = false);
+                                                  bool created, uint8_t server_field_version, TtcDialect dialect = TtcDialect{});
 
 TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t locator_size,
                                     TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
@@ -88,7 +89,7 @@ TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t 
 //! length in: a universal integer on a modern one, one raw byte on a legacy
 //! (11.2) one.
 TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, size_t locator_size,
-                                        uint8_t server_field_version, bool legacy_session = false);
+                                        uint8_t server_field_version, TtcDialect dialect = TtcDialect{});
 
 // A CLOB read comes back as AL16UTF16 — two bytes per BMP character, surrogate
 // pairs above it — whatever the database character set is and whatever the

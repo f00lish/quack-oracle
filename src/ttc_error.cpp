@@ -132,13 +132,16 @@ OracleServerError ParseTtcServerError(const std::vector<uint8_t> &message) {
 }
 
 TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
-                                   bool legacy_session) {
-    if (legacy_session) {
-        return DecodeTtcLegacyErrorPrefix(message, ChunkEncodingFor(legacy_session));
+                                   TtcDialect dialect) {
+    // The two error bodies are different layouts, so they are two functions
+    // and the dialect picks one. A legacy body has two extra leading fields
+    // and no row count; a modern one has neither.
+    if (dialect.legacy_error_body) {
+        return DecodeTtcLegacyErrorPrefix(message, dialect.chunk_encoding);
     }
     ByteReader reader(message);
     // The session's dialect decides how the length of a long value is stated.
-    const auto chunk_encoding = ChunkEncodingFor(legacy_session);
+    const auto chunk_encoding = dialect.chunk_encoding;
     try {
     if (reader.ReadByte() != TTC_MESSAGE_ERROR) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ERROR message");

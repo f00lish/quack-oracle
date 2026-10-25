@@ -69,21 +69,19 @@ TtcStatementChannel::TtcStatementChannel(TtcChannel &channel_p, OracleStatementR
     : channel(channel_p), statements(statements_p) {
 }
 
-TtcLobResponse TtcStatementChannel::LobOperation(const TtcLobRequest &request, uint8_t server_field_version,
-                                                    bool legacy_session) {
+TtcLobResponse TtcStatementChannel::LobOperation(const TtcLobRequest &request, uint8_t server_field_version) {
     TtcLobResponse result;
     LobExchange(EncodeTtcLobRequest(request), [&](const std::vector<uint8_t> &response) {
-        result = DecodeCompleteTtcLobCall(response, request.locator.size(), server_field_version, legacy_session);
+        result = DecodeCompleteTtcLobCall(response, request.locator.size(), server_field_version, channel.Dialect());
     });
     return result;
 }
 
 std::vector<uint8_t> TtcStatementChannel::LocatorOperation(const std::vector<uint8_t> &request, size_t locator_count,
-                                                           bool created, uint8_t server_field_version,
-                                                           bool legacy_session) {
+                                                           bool created, uint8_t server_field_version) {
     std::vector<uint8_t> locator;
     LobExchange(request, [&](const std::vector<uint8_t> &response) {
-        locator = DecodeCompleteTtcLocatorCall(response, locator_count, created, server_field_version, legacy_session);
+        locator = DecodeCompleteTtcLocatorCall(response, locator_count, created, server_field_version, channel.Dialect());
     });
     return locator;
 }
@@ -173,14 +171,13 @@ std::vector<uint8_t> TtcStatementChannel::ReceiveExecuteResponse(OracleStatement
 
 TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStatementHandle handle,
                                                                         uint8_t ttc_field_version,
-                                                                        uint8_t server_field_version,
-                                                                        bool legacy_session) {
+                                                                        uint8_t server_field_version) {
     try {
         std::optional<TtcExecuteResponse> decoded;
         (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
             decoded.reset();
             if (IsTtcErrorMessage(message)) {
-                const auto completion = DecodeTtcErrorPrefix(message, server_field_version, legacy_session);
+                const auto completion = DecodeTtcErrorPrefix(message, server_field_version, channel.Dialect());
                 if (completion.error_number != 0) {
                     throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                                         completion.message.empty() ? "Oracle query failed" : completion.message,
@@ -188,7 +185,7 @@ TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStat
                 }
             }
             decoded = DecodeTtcExecuteResponse(message, ttc_field_version, server_field_version,
-                                                    channel.LegacySession());
+                                                    channel.Dialect());
             return decoded->completed;
         });
         return std::move(*decoded);
@@ -200,12 +197,11 @@ TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStat
     }
 }
 
-TtcErrorInfo TtcStatementChannel::ReceiveDmlResponse(OracleStatementHandle handle, uint8_t server_field_version,
-                                                     bool legacy_session) {
+TtcErrorInfo TtcStatementChannel::ReceiveDmlResponse(OracleStatementHandle handle, uint8_t server_field_version) {
     try {
         TtcErrorInfo completion;
         (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
-            completion = DecodeTtcExecuteCompletion(message, server_field_version, legacy_session);
+            completion = DecodeTtcExecuteCompletion(message, server_field_version, channel.Dialect());
             return true;
         });
         if (completion.error_number != 0) {
@@ -243,12 +239,11 @@ TtcPlsqlOutBindsResponse TtcStatementChannel::ReceivePlsqlOutBindsResponse(Oracl
 }
 
 TtcCallResponse TtcStatementChannel::ReceiveCallResponse(OracleStatementHandle handle, const std::vector<OracleBind> &binds,
-                                                          uint8_t ttc_field_version, uint8_t server_field_version,
-                                                          bool legacy_session) {
+                                                          uint8_t ttc_field_version, uint8_t server_field_version) {
     try {
         std::optional<TtcCallResponse> decoded;
         (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
-            decoded = DecodeTtcCallResponse(message, binds, ttc_field_version, server_field_version, legacy_session);
+            decoded = DecodeTtcCallResponse(message, binds, ttc_field_version, server_field_version, channel.Dialect());
             return decoded->completed;
         });
         return std::move(*decoded);
@@ -307,13 +302,13 @@ void TtcStatementChannel::DefineLobPrefetch(OracleStatementHandle handle,uint8_t
 
 TtcFetchResponse TtcStatementChannel::ReceiveDecodedLobPrefetchFetchResponse(OracleStatementHandle handle,
     const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,uint8_t server_field_version,
-    const std::optional<TtcRowData> &preceding_row,bool legacy_session) {
+    const std::optional<TtcRowData> &preceding_row) {
     try {
         // A prefetched batch can be megabytes, so like a scalar fetch it is
         // decoded once, resuming after the last finished row on each fragment.
         std::optional<LobPrefetchFetchResponseDecoder> decoder;
         (void)ReceiveResponseFragments(channel,[&](const std::vector<uint8_t> &message) {
-            if (!decoder) { decoder.emplace(columns,limits,server_field_version,preceding_row,legacy_session); }
+            if (!decoder) { decoder.emplace(columns,limits,server_field_version,preceding_row,channel.Dialect()); }
             return decoder->Decode(message);
         });
         return decoder->Take();
@@ -344,8 +339,7 @@ std::vector<uint8_t> TtcStatementChannel::ReceiveFetchResponse(OracleStatementHa
 TtcFetchResponse TtcStatementChannel::ReceiveDecodedFetchResponse(OracleStatementHandle handle,
                                                                    const std::vector<OracleColumn> &columns,
                                                                    uint8_t server_field_version,
-                                                                   const std::optional<TtcRowData> &preceding_row,
-                                                                   bool legacy_session) {
+                                                                   const std::optional<TtcRowData> &preceding_row) {
     try {
         // Oracle does not delimit a data response for this client: on a legacy
         // 19c session it never sets END_OF_RESPONSE, and a response too large
@@ -359,7 +353,7 @@ TtcFetchResponse TtcStatementChannel::ReceiveDecodedFetchResponse(OracleStatemen
         // decoder resumes after the last row it finished instead of decoding
         // the whole response again for each one. A fragment can split any
         // field, but never a row that has already decoded completely.
-        TtcFetchResponseDecoder decoder(columns, server_field_version, preceding_row, legacy_session);
+        TtcFetchResponseDecoder decoder(columns, server_field_version, preceding_row, channel.Dialect());
         for (size_t fragments = 1;; fragments++) {
             bool complete = false;
             try {

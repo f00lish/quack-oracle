@@ -6,6 +6,7 @@
 #include "oracle_scanner/tns_handshake.hpp"
 #include "oracle_scanner/ttc_ano_negotiation.hpp"
 #include "oracle_scanner/ttc_channel.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/ttc_negotiation.hpp"
 #include "oracle_scanner/ttc_o5logon.hpp"
 
@@ -45,6 +46,13 @@ public:
     // a two-byte packet length and expects the Additional Network Option
     // negotiation before the TTC one, unlike 12.1 and later.
     bool LegacySession() const;
+    // The session's dialect, decided ONCE from the accept version the
+    // listener answered with. Everything downstream reads its dialect
+    // decisions from here, so there is exactly one place where the two
+    // protocols are told apart.
+    const TtcDialect &Dialect() const {
+        return dialect;
+    }
     OracleConnectionState State() const;
     // The connect data the accepted CONNECT carried, and what O5LOGON will send
     // as AUTH_CONNECT_STRING. After a redirect the first is the listener's
@@ -73,7 +81,7 @@ public:
 private:
     TnsClientConnection(std::unique_ptr<ByteStream> stream, uint16_t negotiated_sdu, std::string connect_descriptor,
                         std::string auth_connect_string, OracleClientIdentity client_identity, bool cancellation_supported,
-                        bool end_of_response_negotiated, bool legacy_session);
+                        bool end_of_response_negotiated, TtcDialect dialect);
 
     std::unique_ptr<ByteStream> stream;
     std::unique_ptr<TnsPacketStream> packets;
@@ -86,10 +94,11 @@ private:
     // says whether the session keys are padded.
     std::vector<uint8_t> runtime_capabilities;
     bool end_of_response_negotiated = false;
-    // Whether the listener speaks the legacy session dialect. It answers with
-    // a two-byte packet length and expects the Additional Network Option
-    // negotiation before the TTC one.
-    bool legacy_session = false;
+    // The session's dialect, decided once from the accept version the
+    // listener answered with. It answers with a two-byte packet length and
+    // expects the Additional Network Option negotiation before the TTC one
+    // when it is the legacy one.
+    TtcDialect dialect;
     std::string connect_descriptor;
     std::string auth_connect_string;
     OracleClientIdentity client_identity;

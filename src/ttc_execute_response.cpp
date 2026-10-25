@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/ttc_describe.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
 
@@ -11,10 +12,10 @@
 namespace oracle_scanner {
 
 TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
-                                            uint8_t server_field_version, bool legacy_session) {
+                                            uint8_t server_field_version, TtcDialect dialect) {
     TtcDescribeInfo describe;
     try {
-        describe = DecodeTtcDescribeInfoPrefix(message, ttc_field_version, legacy_session);
+        describe = DecodeTtcDescribeInfoPrefix(message, ttc_field_version, dialect);
     } catch (const ProtocolError &error) {
         throw ProtocolError(error.Kind(), std::string("TTC execute DESCRIBE_INFO: ") + error.what());
     }
@@ -25,7 +26,7 @@ TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message,
     TtcFetchResponse fetch;
     try {
         fetch = DecodeTtcFetchResponse(remainder, describe.columns, server_field_version, std::nullopt,
-                                        legacy_session);
+                                        dialect);
     } catch (const ProtocolError &error) {
         throw ProtocolError(error.Kind(), std::string("TTC execute response after DESCRIBE_INFO: ") + error.what());
     }
@@ -40,13 +41,13 @@ TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message,
 }
 
 TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
-                                        bool legacy_session) {
+                                        TtcDialect dialect) {
     try {
         // Oracle puts RETURN_PARAMETER ahead of the final TTIOER for DML
         // too. Drain those prefixes but intentionally do not use the PL/SQL
         // success fallback: DML must preserve the TTIOER row count.
         size_t offset = 0;
-        const auto chunk_encoding = ChunkEncodingFor(legacy_session);
+        const auto chunk_encoding = dialect.chunk_encoding;
         while (offset < message.size() && message[offset] == TTC_MESSAGE_PARAMETER) {
             const std::vector<uint8_t> tail(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
             const auto parameter = DecodeTtcReturnParameterPrefix(tail, chunk_encoding);
@@ -56,7 +57,7 @@ TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uin
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC non-query execute response has no completion");
         }
         const std::vector<uint8_t> completion(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-        return DecodeTtcErrorPrefix(completion, ttc_field_version, legacy_session);
+        return DecodeTtcErrorPrefix(completion, ttc_field_version, dialect);
     } catch (const ProtocolError &error) {
         const auto message_type = message.empty() ? std::string("none") : std::to_string(message.front());
         throw ProtocolError(error.Kind(), std::string("TTC non-query execute completion (message type ") + message_type +

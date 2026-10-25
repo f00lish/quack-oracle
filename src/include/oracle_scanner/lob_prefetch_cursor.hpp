@@ -115,7 +115,7 @@ TtcFetchResponse DecodeLobPrefetchFetchResponse(const std::vector<uint8_t> &mess
 class LobPrefetchFetchResponseDecoder {
 public:
     LobPrefetchFetchResponseDecoder(const std::vector<OracleColumn> &columns,const OracleLobPrefetchLimits &limits,
-        uint8_t server_field_version,const std::optional<TtcRowData> &preceding_row,bool legacy_session = false);
+        uint8_t server_field_version,const std::optional<TtcRowData> &preceding_row,TtcDialect dialect = TtcDialect{});
 
     // True once the response is complete; throws TRUNCATED when the bytes end
     // inside a message, keeping the rows finished so far for the next call.
@@ -132,7 +132,7 @@ private:
     // Whether the server speaks the legacy (11.2) session dialect, which
     // changes the layout of the TTIOER error body inside a fetch response
     // and the encoding of a long value's chunk length.
-    bool legacy_session = false;
+    TtcDialect dialect;
     // How this session states the length of a long value's chunk: a universal
     // integer on a modern session, a single raw byte on a legacy one. It
     // follows the session's own dialect, so it is derived from

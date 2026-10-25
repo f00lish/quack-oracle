@@ -21,10 +21,10 @@ std::vector<uint8_t> Tail(const std::vector<uint8_t> &message, size_t offset) {
 
 TtcCallResponse DecodeTtcCallResponse(const std::vector<uint8_t> &message, const std::vector<OracleBind> &binds,
                                       uint8_t ttc_field_version, uint8_t server_field_version,
-                                      bool legacy_session) {
+                                      TtcDialect dialect) {
     TtcCallResponse result;
     // The session's dialect decides how the length of a long value is stated.
-    const auto chunk_encoding = ChunkEncodingFor(legacy_session);
+    const auto chunk_encoding = dialect.chunk_encoding;
     std::optional<TtcIoVector> io_vector;
     std::vector<size_t> output_indexes;
     size_t offset = 0;
@@ -61,7 +61,7 @@ TtcCallResponse DecodeTtcCallResponse(const std::vector<uint8_t> &message, const
             break;
         }
         case TTC_MESSAGE_ERROR: {
-            const auto completion = DecodeTtcErrorPrefix(tail, server_field_version, legacy_session);
+            const auto completion = DecodeTtcErrorPrefix(tail, server_field_version, dialect);
             offset += completion.bytes_consumed;
             result.completion = completion;
             if (completion.error_number != 0) {

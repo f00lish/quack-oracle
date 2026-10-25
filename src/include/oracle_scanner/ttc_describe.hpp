@@ -1,6 +1,7 @@
 #pragma once
 
 #include "oracle_scanner/session.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,10 +16,14 @@ struct TtcDescribeInfo {
 
 // Decodes one DESCRIBE_INFO (type 16) prefix. The input may contain later TTC
 // messages; bytes_consumed identifies the first byte after its descriptor.
-// A legacy session is one that speaks the 11.2 dialect: its describe
-// response has a shorter column descriptor than the modern one.
+//
+// The dialect is the session's, and it is passed as ONE value rather than a
+// flag: the describe response differs between the two dialects in more than
+// one way (the OACCOLID field, and the scale width, which only the legacy
+// one needs to be searched for), and a single value keeps those decisions
+// together instead of spread over loose parameters.
 TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message,
                                             uint8_t ttc_field_version = 12,
-                                            bool legacy_session = false);
+                                            TtcDialect dialect = TtcDialect{});
 
 } // namespace oracle_scanner

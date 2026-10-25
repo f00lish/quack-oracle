@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -65,8 +66,11 @@ OracleServerError ParseTtcServerError(const std::vector<uint8_t> &message);
 // Decodes one TTIOER body. A legacy (11.2) session uses a different layout
 // for that body, so the caller must say which one applies; guessing produces
 // a universal-integer width error instead of the server's own message.
+//
+// The dialect says which layout it is AND how the session states the length
+// of a long value, so the two decisions cannot disagree with each other.
 TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version = 12,
-                                   bool legacy_session = false);
+                                   TtcDialect dialect = TtcDialect{});
 
 // Decodes the TTIOER body of a legacy (11.2) session. The layout is not the
 // 12C one: the legacy summary carries the end-of-call status and the

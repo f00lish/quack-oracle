@@ -30,7 +30,7 @@ struct O5LogonRequest {
     // a bit of the capability table: the 19c capability table has
     // caps[37] == 0x01, so the bit go-ora uses to decide this is not set
     // there, and copying that test would break the 19c path.
-    bool legacy_session = false;
+    TtcDialect dialect = TtcDialect{};
 };
 
 // Performs the TTC parameter exchange for the 12c verifier. The caller must

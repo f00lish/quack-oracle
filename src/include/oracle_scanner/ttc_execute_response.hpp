@@ -1,6 +1,7 @@
 #pragma once
 
 #include "oracle_scanner/session.hpp"
+#include "oracle_scanner/ttc_dialect.hpp"
 #include "oracle_scanner/ttc_error.hpp"
 #include "oracle_scanner/ttc_row_data.hpp"
 
@@ -24,12 +25,14 @@ struct TtcExecuteResponse {
 // messages and its TTIOER completion. The completion cursor_id is the server
 // cursor to use for OFETCH.
 TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message, uint8_t ttc_field_version = 12,
-                                            uint8_t server_field_version = 12, bool legacy_session = false);
+                                            uint8_t server_field_version = 12,
+                                            TtcDialect dialect = TtcDialect{});
 
 // Non-query OALL8 calls finish directly with TTIOER. Its wire-level message
 // type is ERROR even when its extended error number is zero, so callers must
 // decode it before deciding whether the execution failed.
 TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message,
-                                        uint8_t ttc_field_version = 12, bool legacy_session = false);
+                                        uint8_t ttc_field_version = 12,
+                                        TtcDialect dialect = TtcDialect{});
 
 } // namespace oracle_scanner

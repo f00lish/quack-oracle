@@ -24,13 +24,13 @@ constexpr uint8_t TTC_MESSAGE_LOB_END_OF_REQUEST = 29;
 // A refusal there is the server rejecting the operation (a stale locator, a
 // missing privilege) and has to reach the caller.
 size_t CompleteLobCall(const std::vector<uint8_t> &response, size_t offset, uint8_t server_field_version,
-                       bool legacy_session = false) {
+                       TtcDialect dialect = TtcDialect{}) {
     bool completed = false;
     while (offset < response.size()) {
         const std::vector<uint8_t> tail(response.begin() + static_cast<std::ptrdiff_t>(offset), response.end());
         switch (tail.front()) {
         case TTC_MESSAGE_ERROR: {
-            const auto completion = DecodeTtcErrorPrefix(tail, server_field_version, legacy_session);
+            const auto completion = DecodeTtcErrorPrefix(tail, server_field_version, dialect);
             if (completion.error_number != 0) {
                 throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                                     completion.message.empty() ? "Oracle refused a LOB operation" : completion.message,
@@ -170,7 +170,7 @@ TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t 
 }
 
 TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, size_t locator_size,
-                                        uint8_t server_field_version, bool legacy_session) {
+                                        uint8_t server_field_version, TtcDialect dialect) {
     if (response.empty()) {
         throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC LOB response is empty");
     }
@@ -179,13 +179,13 @@ TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, si
     // server's own reason into a complaint about the shape of its refusal. An
     // end-of-call cut short reads as TRUNCATED from the decoder itself.
     if (IsTtcErrorMessage(response)) {
-        const auto completion = DecodeTtcErrorPrefix(response, server_field_version, legacy_session);
+        const auto completion = DecodeTtcErrorPrefix(response, server_field_version, dialect);
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                             completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
                             completion.error_number);
     }
-    auto decoded = DecodeTtcLobResponse(response, locator_size, ChunkEncodingFor(legacy_session));
-    decoded.bytes_consumed = CompleteLobCall(response, decoded.bytes_consumed, server_field_version, legacy_session);
+    auto decoded = DecodeTtcLobResponse(response, locator_size, dialect.chunk_encoding);
+    decoded.bytes_consumed = CompleteLobCall(response, decoded.bytes_consumed, server_field_version, dialect);
     return decoded;
 }
 
@@ -345,12 +345,12 @@ std::vector<uint8_t> EncodeTtcFreeTempLobs(uint8_t sequence, const std::vector<s
 }
 
 std::vector<uint8_t> DecodeCompleteTtcLocatorCall(const std::vector<uint8_t> &response, size_t locator_count,
-                                                  bool created, uint8_t server_field_version, bool legacy_session) {
+                                                  bool created, uint8_t server_field_version, TtcDialect dialect) {
     if (response.empty()) {
         throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC LOB response is empty");
     }
     if (IsTtcErrorMessage(response)) {
-        const auto completion = DecodeTtcErrorPrefix(response, server_field_version, legacy_session);
+        const auto completion = DecodeTtcErrorPrefix(response, server_field_version, dialect);
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                             completion.message.empty() ? "Oracle refused a LOB operation" : completion.message,
                             completion.error_number);
@@ -371,7 +371,7 @@ std::vector<uint8_t> DecodeCompleteTtcLocatorCall(const std::vector<uint8_t> &re
     } else if (locator_count != 0 && created) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC CREATE_TEMP response has no locator");
     }
-    (void)CompleteLobCall(response, offset, server_field_version, legacy_session);
+    (void)CompleteLobCall(response, offset, server_field_version, dialect);
     return locator;
 }
 

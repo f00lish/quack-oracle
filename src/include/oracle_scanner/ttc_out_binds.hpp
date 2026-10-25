@@ -1,5 +1,6 @@
 #pragma once
 
+#include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/session.hpp"
 #include "oracle_scanner/ttc_cursor.hpp"
 #include "oracle_scanner/ttc_io_vector.hpp"
@@ -21,8 +22,12 @@ struct TtcOutBindsResult {
 // server-validated order returned by GetTtcOutputBindIndexes(). Each value is
 // followed by the Oracle SB4 actual-length field and the returned byte count
 // permits the caller to continue with a subsequent TTC message.
+// `chunk_encoding` says how the session states the length of a long value:
+// a universal integer on 19c and later, one raw byte on 11.2. An OUT bind
+// that returns a long value is such a value.
 TtcOutBindsResult DecodeTtcOutBindsRow(const std::vector<uint8_t> &message, const std::vector<OracleBind> &binds,
-                                       const std::vector<size_t> &output_indexes, uint8_t ttc_field_version = 12);
+                                       const std::vector<size_t> &output_indexes, uint8_t ttc_field_version = 12,
+                                       TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 
 struct TtcPlsqlOutBindsResponse {
     TtcIoVector io_vector;
@@ -36,6 +41,7 @@ struct TtcPlsqlOutBindsResponse {
 // warnings, or additional result data) deliberately remain unconsumed.
 TtcPlsqlOutBindsResponse DecodeTtcPlsqlOutBindsResponse(const std::vector<uint8_t> &message,
                                                          const std::vector<OracleBind> &binds,
-                                                         uint8_t ttc_field_version = 12);
+                                                         uint8_t ttc_field_version = 12,
+                                                         TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 
 } // namespace oracle_scanner

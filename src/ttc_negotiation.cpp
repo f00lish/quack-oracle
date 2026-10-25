@@ -12,23 +12,37 @@ namespace oracle_scanner {
 
 namespace {
 
+// A capability vector's length is a plain byte, so it cannot exceed 255.
+constexpr size_t MAX_CAPABILITY_VECTOR_BYTES = 255;
+// The data-types response carries the capability vectors and the whole type
+// representation table, so it is bounded on its own and much more loosely.
 constexpr size_t MAX_CAPABILITY_BYTES = 4096;
 constexpr size_t MAX_BANNER_BYTES = 1024;
 
+// The capability vectors in the TTC protocol and data-types messages are not
+// long values. Their length is a plain single byte, and go-ora reads it as
+// one: network/session.go GetByte() then GetBytes(len), with no 0xFE marker
+// and no chunk encoding anywhere in it (tcp_protocol_nego.go reads the
+// server's vectors that way, data_type_nego.go writes the client's that way).
+// The session's chunk encoding therefore does not apply to them, and a
+// length-prefixed read would be wrong twice over: it would refuse a vector
+// whose length byte is 0xFE or 0xFF, and it would read a longer one as a
+// chunked value. A capability vector is a fixed table of flags, so a plain
+// byte is all it needs.
 std::vector<uint8_t> ReadCapabilities(ByteReader &reader) {
-    auto value = reader.ReadLengthPrefixed(MAX_CAPABILITY_BYTES);
-    return value ? std::move(*value) : std::vector<uint8_t> {};
+    const auto length = reader.ReadByte();
+    if (length == 0) {
+        return {};
+    }
+    return reader.ReadRaw(length);
 }
 
 void WriteCapabilities(ByteWriter &writer, const std::vector<uint8_t> &value) {
-    if (value.size() > MAX_CAPABILITY_BYTES) {
+    if (value.size() > MAX_CAPABILITY_VECTOR_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC capability vector is too large");
     }
-    if (value.empty()) {
-        writer.WriteByte(0);
-    } else {
-        writer.WriteLengthPrefixed(value);
-    }
+    writer.WriteByte(static_cast<uint8_t>(value.size()));
+    writer.WriteRaw(value);
 }
 
 bool LooksLikeAno(const std::vector<uint8_t> &message) {

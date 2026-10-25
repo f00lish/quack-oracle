@@ -21,6 +21,16 @@ enum class TtcChunkEncoding {
     RawByte,
 };
 
+// The encoding a session uses. It is a property of the session and not of an
+// individual value: go-ora keeps one flag for the whole session
+// (network/session.go UseBigClrChunks) and consults it in the one function
+// that reads a length-prefixed value (GetClr) and in the one that writes one
+// (WriteClr/PutClr). A listener below 12.1 never sets it, so it states every
+// chunk length as one raw byte, in both directions.
+constexpr TtcChunkEncoding ChunkEncodingFor(bool legacy_session) {
+    return legacy_session ? TtcChunkEncoding::RawByte : TtcChunkEncoding::UniversalInteger;
+}
+
 class ByteReader {
 public:
     ByteReader(const uint8_t *data, size_t size);
@@ -86,7 +96,13 @@ public:
     ByteWriter &WriteUB2(uint16_t value);
     ByteWriter &WriteUB4(uint32_t value);
     ByteWriter &WriteUB8(uint64_t value);
-    ByteWriter &WriteLengthPrefixed(const std::optional<std::vector<uint8_t>> &value);
+    // Writes a value whose length is stated by the session. The chunk length
+    // is written the way the session states it: a universal integer on a
+    // modern one, one raw byte on a legacy (11.2) one. go-ora writes a long
+    // value the same way it reads one (network/session.go WriteClr/PutClr),
+    // so a request and its answer agree.
+    ByteWriter &WriteLengthPrefixed(const std::optional<std::vector<uint8_t>> &value,
+                                    TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
     ByteWriter &WriteNullTerminated(const std::string &value);
 
     const std::vector<uint8_t> &Data() const;

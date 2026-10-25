@@ -22,6 +22,8 @@ TtcCallResponse DecodeTtcCallResponse(const std::vector<uint8_t> &message, const
                                       uint8_t ttc_field_version, uint8_t server_field_version,
                                       bool legacy_session) {
     TtcCallResponse result;
+    // The session's dialect decides how the length of a long value is stated.
+    const auto chunk_encoding = ChunkEncodingFor(legacy_session);
     std::optional<TtcIoVector> io_vector;
     std::vector<size_t> output_indexes;
     size_t offset = 0;
@@ -40,20 +42,20 @@ TtcCallResponse DecodeTtcCallResponse(const std::vector<uint8_t> &message, const
             if (!io_vector || result.out_binds) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED, "PL/SQL response has an unexpected OUT-bind ROW_DATA");
             }
-            auto values = DecodeTtcOutBindsRow(tail, binds, output_indexes, ttc_field_version);
+            auto values = DecodeTtcOutBindsRow(tail, binds, output_indexes, ttc_field_version, chunk_encoding);
             offset += values.bytes_consumed;
             result.out_binds = std::move(values);
             break;
         }
         case TTC_MESSAGE_IMPLICIT_RESULT_SET: {
-            auto implicit = DecodeTtcImplicitResultSetPrefix(tail, ttc_field_version);
+            auto implicit = DecodeTtcImplicitResultSetPrefix(tail, ttc_field_version, chunk_encoding);
             result.implicit_cursors.insert(result.implicit_cursors.end(), std::make_move_iterator(implicit.cursors.begin()),
                                            std::make_move_iterator(implicit.cursors.end()));
             offset += implicit.bytes_consumed;
             break;
         }
         case TTC_MESSAGE_PARAMETER: {
-            const auto parameter = DecodeTtcReturnParameterPrefix(tail);
+            const auto parameter = DecodeTtcReturnParameterPrefix(tail, chunk_encoding);
             offset += parameter.bytes_consumed;
             break;
         }

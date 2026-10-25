@@ -234,14 +234,15 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
     }
 }
 
-void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds) {
+void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds,
+                      TtcChunkEncoding chunk_encoding) {
     writer.WriteByte(TTC_MESSAGE_ROW_DATA);
     for (const auto &bind : binds) {
         if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
             // OUT SYS_REFCURSOR has metadata but no client-side value.
             writer.WriteByte(0);
         } else if (bind.value) {
-            writer.WriteLengthPrefixed(bind.value);
+            writer.WriteLengthPrefixed(bind.value, chunk_encoding);
         } else {
             writer.WriteByte(0);
         }
@@ -278,7 +279,8 @@ std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsReque
     writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(prefetch_rows);
     writer.WriteUB4(request.maximum_long_bytes);
     WriteExecuteTail(writer, request.legacy_session, false, 0, request.ttc_field_version);
-    writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()));
+    writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()),
+                              ChunkEncodingFor(request.legacy_session));
     writer.WriteUB4(1); // al8i4[0]: SQL must be parsed on a fresh cursor
     writer.WriteUB4(request.is_query ? 0 : 1); // al8i4[1]: query prefetch vs one DML/PLSQL iteration
     for (size_t index = 2; index < 13; index++) {
@@ -306,7 +308,8 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     writer.WriteUB4(request.prefetch_buffer_bytes).WriteUB4(prefetch_rows).WriteUB4(request.maximum_long_bytes);
     WriteExecuteTail(writer, request.legacy_session, true, static_cast<uint32_t>(request.binds.size()),
                       request.ttc_field_version);
-    writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()));
+    writer.WriteLengthPrefixed(std::vector<uint8_t>(request.sql.begin(), request.sql.end()),
+                              ChunkEncodingFor(request.legacy_session));
     // al8i4[1] is the execution count: one DML iteration, or as many as the
     // batch carries. A query leaves it zero.
     writer.WriteUB4(1).WriteUB4(request.is_query
@@ -319,9 +322,10 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
                       request.legacy_session);
     // One ROW_DATA message per iteration, in order. This is the whole of array
     // DML on the wire: the same parse, the same metadata, N rows of values.
-    WriteBindValues(writer, request.binds);
+    const auto chunk_encoding = ChunkEncodingFor(request.legacy_session);
+    WriteBindValues(writer, request.binds, chunk_encoding);
     for (const auto &iteration : request.additional_iterations) {
-        WriteBindValues(writer, iteration);
+        WriteBindValues(writer, iteration, chunk_encoding);
     }
     return writer.Take();
 }

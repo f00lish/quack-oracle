@@ -24,7 +24,8 @@ struct TtcRowHeaderPrefix {
     size_t bytes_consumed = 0;
 };
 
-TtcRowHeaderPrefix DecodeRowHeaderPrefix(const uint8_t *data, size_t size, size_t column_count) {
+TtcRowHeaderPrefix DecodeRowHeaderPrefix(const uint8_t *data, size_t size, size_t column_count,
+                                       TtcChunkEncoding chunk_encoding) {
     ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_HEADER) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ROW_HEADER message");
@@ -42,7 +43,7 @@ TtcRowHeaderPrefix DecodeRowHeaderPrefix(const uint8_t *data, size_t size, size_
             throw ProtocolError(ProtocolErrorKind::MALFORMED,
                                 "TTC ROW_HEADER bit-vector width disagrees with described columns");
         }
-        const auto bit_vector = reader.ReadLengthPrefixed(bit_vector_size);
+        const auto bit_vector = reader.ReadLengthPrefixed(bit_vector_size, chunk_encoding);
         if (!bit_vector || bit_vector->size() != bit_vector_size) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC ROW_HEADER bit-vector length disagrees with payload");
         }
@@ -63,7 +64,7 @@ TtcRowHeaderPrefix DecodeRowHeaderPrefix(const uint8_t *data, size_t size, size_
     }
     const auto rowid_size = reader.ReadUB4();
     if (rowid_size != 0) {
-        const auto rowid = reader.ReadLengthPrefixed(rowid_size);
+        const auto rowid = reader.ReadLengthPrefixed(rowid_size, chunk_encoding);
         if (!rowid || rowid->size() != rowid_size) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC ROW_HEADER rowid length disagrees with payload");
         }
@@ -276,7 +277,7 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
         const auto remaining = message.size() - offset;
         switch (*at) {
         case TTC_MESSAGE_ROW_HEADER: {
-            const auto row_header = DecodeRowHeaderPrefix(at, remaining, columns.size());
+            const auto row_header = DecodeRowHeaderPrefix(at, remaining, columns.size(), chunk_encoding);
             offset += row_header.bytes_consumed;
             row_header_present_columns = row_header.present_columns;
             break;
@@ -340,7 +341,7 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
             break;
         }
         case TTC_MESSAGE_PARAMETER: {
-            const auto parameter = DecodeTtcReturnParameterPrefix(Tail(message, offset));
+            const auto parameter = DecodeTtcReturnParameterPrefix(Tail(message, offset), chunk_encoding);
             offset += parameter.bytes_consumed;
             break;
         }

@@ -13,20 +13,28 @@ std::vector<uint8_t> ToBytes(const std::string &value) {
     return std::vector<uint8_t>(value.begin(), value.end());
 }
 
-void WriteTwoLengths(ByteWriter &writer, const std::string &value) {
+void WriteTwoLengths(ByteWriter &writer, const std::string &value, TtcChunkEncoding chunk_encoding) {
     if (value.size() > MAX_AUTH_VALUE_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC authentication parameter is too large");
     }
     writer.WriteUB4(static_cast<uint32_t>(value.size()));
     if (!value.empty()) {
-        writer.WriteLengthPrefixed(ToBytes(value));
+        writer.WriteLengthPrefixed(ToBytes(value), chunk_encoding);
     }
 }
 
 } // namespace
 
+// Encodes the classic TTC authentication function shape. It is generic so
+// phase-one client metadata and phase-two proof parameters use one validator.
+//
+// `chunk_encoding` says how the session states the length of a long value. A
+// legacy (11.2) session states it as one raw byte, so the phase-two proof --
+// which carries the encrypted password and the session key -- has to be
+// written that way.
 std::vector<uint8_t> EncodeTtcAuthFunction(uint8_t function_code, uint8_t sequence, const std::string &username,
-                                           uint32_t auth_mode, const std::vector<TtcParameter> &parameters) {
+                                           uint32_t auth_mode, const std::vector<TtcParameter> &parameters,
+                                           TtcChunkEncoding chunk_encoding) {
     if ((function_code != TTC_FUNCTION_AUTH_PHASE_ONE && function_code != TTC_FUNCTION_AUTH_PHASE_TWO) ||
         username.size() > 252 || parameters.size() > MAX_AUTH_PARAMETERS) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC authentication function arguments are invalid");
@@ -40,14 +48,14 @@ std::vector<uint8_t> EncodeTtcAuthFunction(uint8_t function_code, uint8_t sequen
     writer.WriteUB4(static_cast<uint32_t>(parameters.size()));
     writer.WriteByte(1).WriteByte(1); // auth-out value and length descriptors
     if (!username.empty()) {
-        writer.WriteLengthPrefixed(ToBytes(username));
+        writer.WriteLengthPrefixed(ToBytes(username), chunk_encoding);
     }
     for (const auto &parameter : parameters) {
         if (parameter.key.empty()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC authentication parameter key is empty");
         }
-        WriteTwoLengths(writer, parameter.key);
-        WriteTwoLengths(writer, parameter.value);
+        WriteTwoLengths(writer, parameter.key, chunk_encoding);
+        WriteTwoLengths(writer, parameter.value, chunk_encoding);
         writer.WriteUB4(parameter.flags);
     }
     return writer.Take();

@@ -211,7 +211,8 @@ TtcPlsqlOutBindsResponse TtcStatementChannel::ReceivePlsqlOutBindsResponse(Oracl
             statements.Poison(handle);
             ThrowTtcServerError(response);
         }
-        return DecodeTtcPlsqlOutBindsResponse(response, binds, ttc_field_version);
+        return DecodeTtcPlsqlOutBindsResponse(response, binds, ttc_field_version,
+                                             ChunkEncodingFor(channel.LegacySession()));
     } catch (...) {
         if (statements.State(handle) != OracleStatementState::POISONED) {
             statements.Poison(handle);

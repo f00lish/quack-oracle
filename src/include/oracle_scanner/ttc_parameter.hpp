@@ -21,14 +21,24 @@ struct TtcReturnParameterPrefix {
     size_t bytes_consumed = 0;
 };
 
-std::vector<uint8_t> EncodeTtcParameters(const std::vector<TtcParameter> &parameters);
+// Encodes the classic TTC PARAMETER message body.
+//
+// `chunk_encoding` says how the session states the length of a long value: a
+// universal integer on 19c and later, one raw byte on 11.2. A parameter's key
+// and value are such values.
+std::vector<uint8_t> EncodeTtcParameters(const std::vector<TtcParameter> &parameters,
+                                         TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 // `chunk_encoding` says how the session states the length of each piece of a
 // long value: a universal integer on 19c and later, one raw byte on 11.2.
 std::vector<TtcParameter> DecodeTtcParameters(const std::vector<uint8_t> &message,
                                                TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 // Drains the execute-response RETURN_PARAMETER body (message type 8). It is
 // distinct from the authentication key/value PARAMETER grammar above.
-TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_t> &message);
+// `chunk_encoding` says how the session states the length of a long value:
+// a universal integer on 19c and later, one raw byte on 11.2. A return
+// parameter's key and value are such values.
+TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_t> &message,
+                                                       TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 O5LogonChallenge O5LogonChallengeFromParameters(const std::vector<TtcParameter> &parameters);
 // Reads an 11G challenge. An 11G challenge has a different parameter set from
 // 12C: it carries no PBKDF2 iteration counts and no combo-key salt.

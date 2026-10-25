@@ -25,19 +25,18 @@ O5LogonResponse RunO5Logon(TtcChannel &channel, const O5LogonRequest &request) {
     if (local.speedy_key_salt.size() != 16) {
         local.speedy_key_salt.resize(16, 0);
     }
-    channel.Send(EncodeTtcAuthFunction(TTC_FUNCTION_AUTH_PHASE_ONE, 1, local.username, local.auth_mode,
-                                       local.phase_one_parameters));
-    auto challenge_response = channel.Receive();
-    if (IsTtcErrorMessage(challenge_response)) {
-        ThrowTtcServerError(challenge_response);
-    }
     // A legacy listener states the length of each piece of a long value as one
     // raw byte; a modern one states it as a universal integer. Which one it
     // is comes from the session's own legacy marker, not from a bit of the
     // capability table: the 19c capability table has caps[37] == 0x01, so the
     // test go-ora uses to decide this would treat 19c as legacy.
-    const auto chunk_encoding = local.legacy_session ? TtcChunkEncoding::RawByte
-                                                      : TtcChunkEncoding::UniversalInteger;
+    const auto chunk_encoding = ChunkEncodingFor(local.legacy_session);
+    channel.Send(EncodeTtcAuthFunction(TTC_FUNCTION_AUTH_PHASE_ONE, 1, local.username, local.auth_mode,
+                                       local.phase_one_parameters, chunk_encoding));
+    auto challenge_response = channel.Receive();
+    if (IsTtcErrorMessage(challenge_response)) {
+        ThrowTtcServerError(challenge_response);
+    }
     auto challenge_parameters = DecodeTtcParameters(challenge_response, chunk_encoding);
     // The verifier in the challenge decides the algorithm. Reading it first
     // keeps a 12C challenge from being answered with the 11G one, and the
@@ -63,7 +62,7 @@ O5LogonResponse RunO5Logon(TtcChannel &channel, const O5LogonRequest &request) {
     phase_two_parameters.insert(phase_two_parameters.end(), local.phase_two_parameters.begin(),
                                 local.phase_two_parameters.end());
     channel.Send(EncodeTtcAuthFunction(TTC_FUNCTION_AUTH_PHASE_TWO, 2, local.username, 0x0101,
-                                       phase_two_parameters));
+                                       phase_two_parameters, chunk_encoding));
 
     auto proof_response = channel.Receive();
     if (IsTtcErrorMessage(proof_response)) {

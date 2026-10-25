@@ -48,7 +48,8 @@ std::vector<uint8_t> EncodeTtcLobRequest(const TtcLobRequest &request) {
     return writer.Take();
 }
 
-TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t locator_size) {
+TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t locator_size,
+                                    TtcChunkEncoding chunk_encoding) {
     if (locator_size == 0 || locator_size > MAX_LOCATOR_BYTES) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC LOB response decoder has an invalid locator size");
     }
@@ -59,7 +60,7 @@ TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t 
     }
     if (reader.PeekByte() == TTC_MESSAGE_LOB_DATA) {
         reader.ReadByte();
-        const auto data = reader.ReadLengthPrefixed(MAX_LOB_CHUNK_BYTES);
+        const auto data = reader.ReadLengthPrefixed(MAX_LOB_CHUNK_BYTES, chunk_encoding);
         if (data) {
             result.data = *data;
         }
@@ -94,7 +95,7 @@ TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, si
                             completion.message.empty() ? "Oracle refused a LOB read" : completion.message,
                             completion.error_number);
     }
-    auto decoded = DecodeTtcLobResponse(response, locator_size);
+    auto decoded = DecodeTtcLobResponse(response, locator_size, ChunkEncodingFor(legacy_session));
     // The return parameter is not the end of the call: an end-of-call follows
     // it, and only a whole one says the server is done. Nothing after the
     // parameter, or part of an end-of-call, means more of the response is

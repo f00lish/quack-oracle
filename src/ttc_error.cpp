@@ -93,7 +93,7 @@ void SkipPackedUb4Array(ByteReader &reader) {
     }
 }
 
-void SkipBatchMessages(ByteReader &reader) {
+void SkipBatchMessages(ByteReader &reader, TtcChunkEncoding chunk_encoding) {
     const auto count = reader.ReadUB2();
     if (count > MAX_BATCH_ERRORS) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC ERROR batch messages exceed supported bounds");
@@ -104,7 +104,7 @@ void SkipBatchMessages(ByteReader &reader) {
     reader.Skip(1);
     for (uint16_t index = 0; index < count; index++) {
         reader.ReadUB2();
-        (void)reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES);
+        (void)reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES, chunk_encoding);
         reader.Skip(2);
     }
 }
@@ -134,9 +134,11 @@ OracleServerError ParseTtcServerError(const std::vector<uint8_t> &message) {
 TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
                                    bool legacy_session) {
     if (legacy_session) {
-        return DecodeTtcLegacyErrorPrefix(message);
+        return DecodeTtcLegacyErrorPrefix(message, ChunkEncodingFor(legacy_session));
     }
     ByteReader reader(message);
+    // The session's dialect decides how the length of a long value is stated.
+    const auto chunk_encoding = ChunkEncodingFor(legacy_session);
     try {
     if (reader.ReadByte() != TTC_MESSAGE_ERROR) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ERROR message");
@@ -173,11 +175,11 @@ TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t t
     // arrays and the row count that follow them.
     const auto logical_rowid_bytes = reader.ReadUB4();
     if (logical_rowid_bytes != 0) {
-        (void)reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES);
+        (void)reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES, chunk_encoding);
     }
     SkipPackedUb2Array(reader);
     SkipPackedUb4Array(reader);
-    SkipBatchMessages(reader);
+    SkipBatchMessages(reader, chunk_encoding);
     const auto error_number = reader.ReadUB4();
     const uint64_t row_count = reader.ReadUB8();
     // Above a field-version gate the end-of-call carries two more universal
@@ -199,7 +201,7 @@ TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t t
     if (error_number != 0) {
         std::optional<std::vector<uint8_t>> text;
         try {
-            text = reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES);
+            text = reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES, chunk_encoding);
         } catch (const ProtocolError &error) {
             throw ProtocolError(error.Kind(), "TTC ERROR text at offset " + std::to_string(reader.Position()) + ": " + error.what());
         }
@@ -221,7 +223,8 @@ TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t t
     }
 }
 
-TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message) {
+TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message,
+                                         TtcChunkEncoding chunk_encoding) {
     // The legacy summary is the 11.2 shape of a TTIOER body. Its field order
     // and widths come from go-ora's summary reader for a session that
     // negotiated both the end-of-call status and the end-to-end sequence
@@ -276,7 +279,7 @@ TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message) {
         if (error_number != 0) {
             std::optional<std::vector<uint8_t>> text;
             try {
-                text = reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES);
+                text = reader.ReadLengthPrefixed(MAX_TTC_ERROR_TEXT_BYTES, chunk_encoding);
             } catch (const ProtocolError &error) {
                 throw ProtocolError(error.Kind(), "TTC ERROR text at offset " + std::to_string(reader.Position()) + ": " + error.what());
             }

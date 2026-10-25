@@ -1,5 +1,6 @@
 #pragma once
 
+#include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
 #include <cstdint>
@@ -78,7 +79,12 @@ TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t t
 // The layout was derived from go-ora's legacy summary reader and verified
 // byte-for-byte against two live 11.2 error responses (ORA-00904 and
 // ORA-03120): the decoded text ends exactly on the last byte of the body.
-TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message);
+// `chunk_encoding` says how the session states the length of a long value:
+// a universal integer on 19c and later, one raw byte on 11.2. The error text
+// is such a value, so an 11.2 session that sends a long one has to be read
+// that way.
+TtcErrorInfo DecodeTtcLegacyErrorPrefix(const std::vector<uint8_t> &message,
+                                         TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 [[noreturn]] void ThrowTtcServerError(const std::vector<uint8_t> &message);
 
 } // namespace oracle_scanner

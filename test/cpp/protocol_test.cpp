@@ -2544,6 +2544,218 @@ static void TestLegacyChunkEncoding() {
                         [&] { (void)wrong_reader.ReadLengthPrefixed(64, TtcChunkEncoding::UniversalInteger); });
 }
 
+// The chunk length of a long value is stated in the session's own dialect,
+// and every direction has to agree with it: what this client writes must be
+// what the server reads, and what the server writes must be what this client
+// reads. A legacy (11.2) session states each piece's length as one raw byte;
+// a modern one states it as a universal integer.
+//
+// The two forms are not interchangeable, and reading one as the other has to
+// fail loudly rather than produce a different value: a raw byte of 0x40 is a
+// length of 64, while a universal integer reads 0x40 as the width of the
+// number that follows and refuses it.
+static void TestSessionChunkEncodingRoundTrip() {
+    const std::vector<uint8_t> value(600, 0x4e);
+
+    // The legacy dialect: one raw byte per chunk length, 64 bytes per chunk
+    // (go-ora's ClrChunkSize is 0x40).
+    ByteWriter legacy;
+    legacy.WriteLengthPrefixed(value, TtcChunkEncoding::RawByte);
+    const auto legacy_bytes = legacy.Data();
+    CHECK(legacy_bytes[0] == TNS_LONG_LENGTH_INDICATOR);
+    CHECK(legacy_bytes[1] == 0x40);
+    ByteReader legacy_reader(legacy_bytes);
+    const auto legacy_value = legacy_reader.ReadLengthPrefixed(1U << 20U, TtcChunkEncoding::RawByte);
+    CHECK(legacy_value.has_value() && *legacy_value == value);
+
+    // The modern dialect: a universal integer per chunk length. A compressed
+    // universal integer states its own width, so the byte after the marker is
+    // the width of the number that follows.
+    ByteWriter modern;
+    modern.WriteLengthPrefixed(value, TtcChunkEncoding::UniversalInteger);
+    const auto modern_bytes = modern.Data();
+    CHECK(modern_bytes[0] == TNS_LONG_LENGTH_INDICATOR);
+    CHECK(modern_bytes[1] == 0x02); // width of the universal integer
+    CHECK(modern_bytes[2] == 0x02 && modern_bytes[3] == 0x58); // 600
+    ByteReader modern_reader(modern_bytes);
+    const auto modern_value = modern_reader.ReadLengthPrefixed(1U << 20U, TtcChunkEncoding::UniversalInteger);
+    CHECK(modern_value.has_value() && *modern_value == value);
+
+    // Reading one form as the other must fail rather than decode. The kind
+    // of failure is not pinned: the raw-byte reading of the modern frame
+    // consumes the value as chunks of the wrong size and runs out of bytes,
+    // while the universal-integer reading of the legacy frame refuses 0x40 as
+    // a width. What matters is that neither yields a value.
+    ByteReader wrong_legacy(modern_bytes);
+    ExpectProtocolError([&] { (void)wrong_legacy.ReadLengthPrefixed(1U << 20U, TtcChunkEncoding::RawByte); });
+    ByteReader wrong_modern(legacy_bytes);
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { (void)wrong_modern.ReadLengthPrefixed(1U << 20U, TtcChunkEncoding::UniversalInteger); });
+}
+
+// The real LOB_DATA frame an 11.2 listener sent for a 300-character CLOB,
+// captured from a live session (ora-poc/tns_now.log line 7118):
+//
+//   0e fe ff <255 bytes> ff <255 bytes> 5a <90 bytes> 00
+//
+// 0x0e is the LOB_DATA message, 0xfe the long-value marker, and each chunk
+// length is one raw byte: 255, 255 and 90, then a zero terminator.
+//
+// The 255-byte length is exactly why the modern reading of this frame fails:
+// 0xff has bit 7 set, so it is not a universal-integer width, and the
+// extension reported "negative universal integer is not valid here" for every
+// LOB read against 11.2.
+static void TestLegacyLobDataUsesRawByteChunkLength() {
+    std::vector<uint8_t> frame;
+    frame.push_back(14);  // TTC_MESSAGE_LOB_DATA
+    frame.push_back(254); // TNS_LONG_LENGTH_INDICATOR
+    size_t remaining = 600;
+    size_t phase = 0;
+    while (remaining > 0) {
+        const size_t chunk = (std::min)(remaining, size_t(255));
+        frame.push_back(static_cast<uint8_t>(chunk));
+        for (size_t index = 0; index < chunk; ++index) {
+            // The captured content is the UTF-16BE text "AAA...".
+            frame.push_back((phase++ % 2 == 0) ? 0x00 : 0x41);
+        }
+        remaining -= chunk;
+    }
+    frame.push_back(0); // end of the long value
+
+    ByteReader reader(frame);
+    reader.ReadByte(); // the LOB_DATA message byte
+    const auto value = reader.ReadLengthPrefixed(1U << 20U, TtcChunkEncoding::RawByte);
+    CHECK(value.has_value() && value->size() == 600);
+    CHECK(value && std::all_of(value->begin(), value->end(), [](uint8_t b) { return b == 0x00 || b == 0x41; }));
+
+    ByteReader wrong(frame);
+    wrong.ReadByte();
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { (void)wrong.ReadLengthPrefixed(1U << 20U, TtcChunkEncoding::UniversalInteger); });
+}
+
+// The LOB response decoder takes the encoding too, so the whole read path
+// works on a legacy session.
+static void TestLegacyLobResponseDecoderUsesRawByteChunkLength() {
+    ByteWriter writer;
+    writer.WriteByte(14);
+    writer.WriteLengthPrefixed(std::vector<uint8_t>(600, 0x41), TtcChunkEncoding::RawByte);
+    writer.WriteByte(TTC_MESSAGE_PARAMETER);
+    writer.WriteRaw(std::vector<uint8_t>(114, 0x11));
+    writer.WriteUB8(600);
+    const auto encoded = writer.Data();
+
+    const auto legacy = DecodeTtcLobResponse(encoded, 114, TtcChunkEncoding::RawByte);
+    CHECK(legacy.data.size() == 600 && legacy.amount == 600);
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { (void)DecodeTtcLobResponse(encoded, 114, TtcChunkEncoding::UniversalInteger); });
+}
+
+// What this client writes has to be stated the way the session states it, or
+// the server cannot parse the request. A bind value over 252 bytes is a long
+// value, and its chunk lengths are part of the request.
+static void TestLegacyRequestStatesChunkLengthsItsOwnWay() {
+    TtcExecuteBindsRequest request;
+    request.sql = "SELECT * FROM t WHERE c = :v";
+    request.binds = {{"v", 1, BindDirection::BIND_IN, std::vector<uint8_t>(400, 0x41)}};
+    request.legacy_session = true;
+
+    const std::vector<uint8_t> marker {TNS_LONG_LENGTH_INDICATOR};
+    const auto legacy = EncodeTtcExecuteBindsRequest(request);
+    const auto at = std::search(legacy.begin(), legacy.end(), marker.begin(), marker.end());
+    CHECK(at != legacy.end());
+    // A raw-byte chunk length is a length, never a width: the byte after the
+    // marker is at most 255 and the value follows immediately.
+    const auto offset = static_cast<size_t>(at - legacy.begin());
+    CHECK(legacy[offset + 1] == 0x40);
+    CHECK(legacy[offset + 2] == 0x41);
+
+    // The modern request states the same chunk length as a universal integer,
+    // so the byte after the marker is a width.
+    TtcExecuteBindsRequest modern = request;
+    modern.legacy_session = false;
+    const auto modern_bytes = EncodeTtcExecuteBindsRequest(modern);
+    const auto modern_at = std::search(modern_bytes.begin(), modern_bytes.end(), marker.begin(), marker.end());
+    CHECK(modern_at != modern_bytes.end());
+    const auto modern_offset = static_cast<size_t>(modern_at - modern_bytes.begin());
+    CHECK(modern_bytes[modern_offset + 1] == 0x02);
+    CHECK(modern_bytes[modern_offset + 2] == 0x01);
+    CHECK(modern_bytes[modern_offset + 3] == 0x90); // 400
+
+    // The authentication function states its parameter values the same way:
+    // the phase-two proof carries the encrypted password, so a wrong framing
+    // there fails the logon rather than the statement.
+    const std::vector<TtcParameter> parameters = {{"AUTH_SESSKEY", std::string(400, 'A'), 0}};
+    const auto legacy_auth = EncodeTtcAuthFunction(TTC_FUNCTION_AUTH_PHASE_ONE, 1, "scott", 1, parameters,
+                                                   TtcChunkEncoding::RawByte);
+    const auto auth_at = std::search(legacy_auth.begin(), legacy_auth.end(), marker.begin(), marker.end());
+    CHECK(auth_at != legacy_auth.end());
+    CHECK(legacy_auth[static_cast<size_t>(auth_at - legacy_auth.begin()) + 1] == 0x40);
+
+    const auto modern_auth = EncodeTtcAuthFunction(TTC_FUNCTION_AUTH_PHASE_ONE, 1, "scott", 1, parameters,
+                                                  TtcChunkEncoding::UniversalInteger);
+    const auto modern_auth_at = std::search(modern_auth.begin(), modern_auth.end(), marker.begin(), marker.end());
+    CHECK(modern_auth_at != modern_auth.end());
+    CHECK(modern_auth[static_cast<size_t>(modern_auth_at - modern_auth.begin()) + 1] == 0x02);
+}
+
+// A return parameter's key and value are long values, so a legacy session
+// states them the legacy way.
+static void TestLegacyReturnParameterUsesRawByteChunkLength() {
+    ByteWriter writer;
+    writer.WriteByte(TTC_MESSAGE_PARAMETER).WriteUB2(2).WriteUB4(7).WriteUB4(8);
+    writer.WriteUB2(3).WriteRaw(reinterpret_cast<const uint8_t *>("xyz"), 3);
+    writer.WriteUB2(1); // one key/value entry
+    writer.WriteUB2(300);
+    writer.WriteLengthPrefixed(std::vector<uint8_t>(300, 'k'), TtcChunkEncoding::RawByte);
+    writer.WriteUB2(300);
+    writer.WriteLengthPrefixed(std::vector<uint8_t>(300, 'v'), TtcChunkEncoding::RawByte);
+    writer.WriteUB2(0); // keyword number
+    writer.WriteUB2(2).WriteRaw(reinterpret_cast<const uint8_t *>("ok"), 2);
+    const auto encoded = writer.Data();
+
+    const auto legacy = DecodeTtcReturnParameterPrefix(encoded, TtcChunkEncoding::RawByte);
+    CHECK(legacy.bytes_consumed == encoded.size());
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { (void)DecodeTtcReturnParameterPrefix(encoded, TtcChunkEncoding::UniversalInteger); });
+}
+
+// The authentication parameters round-trip through the session's encoding as
+// well: the O5LOGON challenge is a PARAMETER message whose values are long
+// values on a legacy session.
+static void TestLegacyParameterRoundTripUsesRawByteChunkLength() {
+    const std::vector<TtcParameter> parameters = {{"AUTH_SESSKEY", std::string(300, 'A'), 0}};
+    const auto legacy = EncodeTtcParameters(parameters, TtcChunkEncoding::RawByte);
+    const auto decoded = DecodeTtcParameters(legacy, TtcChunkEncoding::RawByte);
+    CHECK(decoded.size() == 1 && decoded[0].key == "AUTH_SESSKEY" && decoded[0].value.size() == 300);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)DecodeTtcParameters(legacy, TtcChunkEncoding::UniversalInteger); });
+}
+
+// The capability vectors in the TTC protocol and data-types messages are NOT
+// long values: their length is a plain single byte, and go-ora reads and
+// writes them that way (tcp_protocol_nego.go reads the server's vectors with
+// GetByte then GetBytes; data_type_nego.go writes the client's the same way).
+// A length-prefixed read of them is wrong twice over: it refuses a vector
+// whose length byte is 0xFE or 0xFF, and it reads a longer one as a chunked
+// value.
+static void TestNegotiationCapabilityVectorIsNotAChunkedValue() {
+    ByteWriter message;
+    message.WriteByte(TTC_MESSAGE_PROTOCOL).WriteByte(6).WriteByte(0);
+    message.WriteNullTerminated("Oracle");
+    message.WriteUInt16LE(2000).WriteByte(0);
+    message.WriteUInt16LE(0); // no protocol element table
+    message.WriteUInt16BE(0); // no format descriptor
+    std::vector<uint8_t> capabilities(254, 0x11);
+    capabilities[TTC_CAPABILITY_FIELD_VERSION_INDEX] = 6;
+    message.WriteByte(static_cast<uint8_t>(capabilities.size()));
+    message.WriteRaw(capabilities);
+    message.WriteByte(0); // no runtime capabilities
+    const auto protocol = ParseTtcProtocolResponse(message.Data());
+    CHECK(protocol.compile_capabilities.size() == 254);
+    CHECK(protocol.server_field_version == 6);
+    CHECK(protocol.field_version == 6);
+}
+
 // An 11G challenge arrives as a TTC PARAMETER message. The 11.2 listener
 // states the length of each piece of a long value as one raw byte, so the
 // challenge has to be decoded with the legacy encoding -- and the verifier in
@@ -7522,6 +7734,13 @@ int main() {
     TestO5Logon11GRejectsMalformedChallenges();
     TestO5LogonVerifierAcceptance();
     TestLegacyChunkEncoding();
+    TestSessionChunkEncodingRoundTrip();
+    TestLegacyLobDataUsesRawByteChunkLength();
+    TestLegacyLobResponseDecoderUsesRawByteChunkLength();
+    TestLegacyRequestStatesChunkLengthsItsOwnWay();
+    TestLegacyReturnParameterUsesRawByteChunkLength();
+    TestLegacyParameterRoundTripUsesRawByteChunkLength();
+    TestNegotiationCapabilityVectorIsNotAChunkedValue();
     TestLegacy11GChallengeParameters();
     TestO5Logon11GPhaseTwoParameters();
     TestConnectDescriptor();

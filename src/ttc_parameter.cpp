@@ -19,13 +19,13 @@ std::vector<uint8_t> ToBytes(const std::string &value) {
     return std::vector<uint8_t>(value.begin(), value.end());
 }
 
-void WriteTwoLengths(ByteWriter &writer, const std::string &value) {
+void WriteTwoLengths(ByteWriter &writer, const std::string &value, TtcChunkEncoding chunk_encoding) {
     if (value.size() > MAX_PARAMETER_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC parameter exceeds supported length");
     }
     writer.WriteUB4(static_cast<uint32_t>(value.size()));
     if (!value.empty()) {
-        writer.WriteLengthPrefixed(ToBytes(value));
+        writer.WriteLengthPrefixed(ToBytes(value), chunk_encoding);
     }
 }
 
@@ -73,7 +73,8 @@ uint32_t ParseIterations(const std::string &value) {
 
 } // namespace
 
-TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_t> &message) {
+TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_t> &message,
+                                                       TtcChunkEncoding chunk_encoding) {
     ByteReader reader(message);
     if (reader.ReadByte() != TTC_MESSAGE_PARAMETER) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC RETURN_PARAMETER message");
@@ -97,11 +98,11 @@ TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_
     for (uint16_t index = 0; index < key_value_count; ++index) {
         const auto key_size = reader.ReadUB2();
         if (key_size > 0) {
-            (void)reader.ReadLengthPrefixed(key_size);
+            (void)reader.ReadLengthPrefixed(key_size, chunk_encoding);
         }
         const auto value_size = reader.ReadUB2();
         if (value_size > 0) {
-            (void)reader.ReadLengthPrefixed(value_size);
+            (void)reader.ReadLengthPrefixed(value_size, chunk_encoding);
         }
         reader.ReadUB2(); // keyword number
     }
@@ -113,15 +114,16 @@ TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_
     return {reader.Position()};
 }
 
-std::vector<uint8_t> EncodeTtcParameters(const std::vector<TtcParameter> &parameters) {
+std::vector<uint8_t> EncodeTtcParameters(const std::vector<TtcParameter> &parameters,
+                                         TtcChunkEncoding chunk_encoding) {
     if (parameters.size() > MAX_PARAMETER_COUNT) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "too many TTC parameters");
     }
     ByteWriter writer;
     writer.WriteByte(TTC_MESSAGE_PARAMETER).WriteUB4(static_cast<uint32_t>(parameters.size()));
     for (const auto &parameter : parameters) {
-        WriteTwoLengths(writer, parameter.key);
-        WriteTwoLengths(writer, parameter.value);
+        WriteTwoLengths(writer, parameter.key, chunk_encoding);
+        WriteTwoLengths(writer, parameter.value, chunk_encoding);
         writer.WriteUB4(parameter.flags);
     }
     return writer.Take();

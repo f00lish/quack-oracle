@@ -9,10 +9,14 @@ namespace oracle_scanner {
 // Isolated single-column probe, not a generic query/define implementation.
 // Layout verified against ordinary JDBC 19.3 post-auth SELECT captures on
 // owned 19c and Free servers. No SQL is resent by the define operation.
+//
+// `chunk_encoding` says how the session states the length of a long value: a
+// universal integer on 19c and later, one raw byte on 11.2.
 inline std::vector<uint8_t> EncodeLobPrefetchProbeRequest(uint8_t sequence, uint32_t cursor,
                                                         const std::string &sql, uint16_t type,
                                                         uint8_t form, uint32_t prefix_units,
-                                                        uint8_t field_version) {
+                                                        uint8_t field_version,
+                                                        TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger) {
     const bool define = cursor != 0;
     if (sequence == 0 || field_version != 12 || prefix_units > 32768 ||
         (type != 112 && type != 113) || (form != 1 && form != 2) ||
@@ -33,7 +37,7 @@ inline std::vector<uint8_t> EncodeLobPrefetchProbeRequest(uint8_t sequence, uint
     writer.WriteByte(0).WriteUB4(0).WriteByte(0).WriteUB4(0).WriteByte(0);
     writer.WriteByte(0).WriteUB4(0); // field-version 12 extension
     if (!define) {
-        writer.WriteLengthPrefixed(std::vector<uint8_t>(sql.begin(), sql.end()));
+        writer.WriteLengthPrefixed(std::vector<uint8_t>(sql.begin(), sql.end()), chunk_encoding);
     }
     for (unsigned i = 0; i < 13; ++i) {
         writer.WriteUB4(i == 0 ? (define ? 0 : 1) : i == 1 ? (define ? 1 : 0) :
@@ -50,6 +54,7 @@ inline std::vector<uint8_t> EncodeLobPrefetchProbeRequest(uint8_t sequence, uint
 inline std::optional<OracleLobPrefetch> DecodeLobPrefetchProbeCell(ByteReader &reader, bool character,
                                                                  uint32_t requested_units,
                                                                  size_t content_budget,
+                                                                 TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger,
                                                                  uint16_t national_charset = 0) {
     if (requested_units > 32768 || content_budget == 0) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "invalid LOB prefetch decoder bounds");
@@ -79,7 +84,7 @@ inline std::optional<OracleLobPrefetch> DecodeLobPrefetchProbeCell(ByteReader &r
                 throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "LOB prefetch charset is not verified UTF-16BE");
             }
         }
-        auto prefix = reader.ReadLengthPrefixed(static_cast<size_t>(requested_units) * width);
+        auto prefix = reader.ReadLengthPrefixed(static_cast<size_t>(requested_units) * width, chunk_encoding);
         if (prefix) { result.prefix = std::move(*prefix); }
         if (result.prefix.size() % width != 0) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "LOB prefetch has an incomplete UTF-16 unit");
@@ -89,7 +94,7 @@ inline std::optional<OracleLobPrefetch> DecodeLobPrefetchProbeCell(ByteReader &r
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "LOB prefetch exceeds its reported length");
         }
     }
-    auto locator = reader.ReadLengthPrefixed(locator_size);
+    auto locator = reader.ReadLengthPrefixed(locator_size, chunk_encoding);
     if (!locator || locator->size() != locator_size) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "LOB prefetch locator length mismatch");
     }

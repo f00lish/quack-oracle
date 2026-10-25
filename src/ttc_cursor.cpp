@@ -12,7 +12,7 @@ constexpr size_t MAX_NAME_BYTES = 1024;
 constexpr size_t MAX_IMPLICIT_CURSORS = 64;
 constexpr uint16_t ORACLE_CURSOR_TYPE = 102;
 
-std::string ReadString(ByteReader &reader, size_t declared_size) {
+std::string ReadString(ByteReader &reader, size_t declared_size, TtcChunkEncoding chunk_encoding) {
     if (declared_size > MAX_NAME_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC cursor descriptor name is too large");
     }
@@ -22,19 +22,19 @@ std::string ReadString(ByteReader &reader, size_t declared_size) {
     // The declared size bounds the name, it does not state its length: on a
     // database whose character set is not AL32UTF8 the server sizes it for the
     // set this client asked for and then sends fewer bytes. See ttc_parameter.cpp.
-    const auto value = reader.ReadLengthPrefixed(declared_size);
+    const auto value = reader.ReadLengthPrefixed(declared_size, chunk_encoding);
     if (!value) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC cursor descriptor name length disagrees with payload");
     }
     return {value->begin(), value->end()};
 }
 
-void SkipString(ByteReader &reader) {
+void SkipString(ByteReader &reader, TtcChunkEncoding chunk_encoding) {
     const auto length = reader.ReadUB4();
-    (void)ReadString(reader, length);
+    (void)ReadString(reader, length, chunk_encoding);
 }
 
-OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version) {
+OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version, TtcChunkEncoding chunk_encoding) {
     OracleColumn column;
     column.oracle_type = reader.ReadByte();
     reader.Skip(1); // flags
@@ -45,7 +45,7 @@ OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version) {
     reader.ReadUB8(); // continuation flags
     const auto oid_size = reader.ReadUB4();
     if (oid_size != 0) {
-        (void)ReadString(reader, oid_size);
+        (void)ReadString(reader, oid_size, chunk_encoding);
     }
     reader.ReadUB2(); // type version
     reader.ReadUB2(); // charset id
@@ -56,9 +56,9 @@ OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version) {
     reader.ReadUB4();
     column.nullable = reader.ReadByte() != 0;
     reader.Skip(1); // V7 name length
-    column.name = ReadString(reader, reader.ReadUB4());
-    SkipString(reader); // schema
-    SkipString(reader); // type name
+    column.name = ReadString(reader, reader.ReadUB4(), chunk_encoding);
+    SkipString(reader, chunk_encoding); // schema
+    SkipString(reader, chunk_encoding); // type name
     reader.ReadUB2();   // position
     reader.ReadUB4();   // UDS flags
     if (field_version >= 17) {
@@ -79,7 +79,8 @@ OracleColumn ReadColumn(ByteReader &reader, uint8_t field_version) {
 
 } // namespace
 
-TtcRefCursorDescriptor DecodeTtcRefCursorDescriptor(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
+TtcRefCursorDescriptor DecodeTtcRefCursorDescriptor(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
+                                                  TtcChunkEncoding chunk_encoding) {
     ByteReader reader(message);
     reader.ReadUB4(); // max row size
     const auto column_count = reader.ReadUB4();
@@ -90,11 +91,11 @@ TtcRefCursorDescriptor DecodeTtcRefCursorDescriptor(const std::vector<uint8_t> &
     std::vector<OracleColumn> columns;
     columns.reserve(column_count);
     for (uint32_t index = 0; index < column_count; index++) {
-        columns.push_back(ReadColumn(reader, ttc_field_version));
+        columns.push_back(ReadColumn(reader, ttc_field_version, chunk_encoding));
     }
     const auto current_date_size = reader.ReadUB4();
     if (current_date_size != 0) {
-        (void)ReadString(reader, current_date_size);
+        (void)ReadString(reader, current_date_size, chunk_encoding);
     }
     reader.ReadUB4();
     reader.ReadUB4();
@@ -102,7 +103,7 @@ TtcRefCursorDescriptor DecodeTtcRefCursorDescriptor(const std::vector<uint8_t> &
     reader.ReadUB4();
     const auto tail_size = reader.ReadUB4();
     if (tail_size != 0) {
-        (void)ReadString(reader, tail_size);
+        (void)ReadString(reader, tail_size, chunk_encoding);
     }
     const auto cursor_id = reader.ReadUB2();
     if (cursor_id == 0) {
@@ -111,7 +112,8 @@ TtcRefCursorDescriptor DecodeTtcRefCursorDescriptor(const std::vector<uint8_t> &
     return {cursor_id, std::move(columns), reader.Position()};
 }
 
-TtcImplicitResultSet DecodeTtcImplicitResultSetPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
+TtcImplicitResultSet DecodeTtcImplicitResultSetPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
+                                                       TtcChunkEncoding chunk_encoding) {
     ByteReader reader(message);
     if (reader.ReadByte() != TTC_MESSAGE_IMPLICIT_RESULT_SET) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC implicit-result-set message");
@@ -128,7 +130,7 @@ TtcImplicitResultSet DecodeTtcImplicitResultSetPrefix(const std::vector<uint8_t>
         const auto descriptor_start = reader.Position();
         const std::vector<uint8_t> descriptor_message(message.begin() + static_cast<std::ptrdiff_t>(descriptor_start),
                                                       message.end());
-        auto descriptor = DecodeTtcRefCursorDescriptor(descriptor_message, ttc_field_version);
+        auto descriptor = DecodeTtcRefCursorDescriptor(descriptor_message, ttc_field_version, chunk_encoding);
         reader.Skip(descriptor.bytes_consumed);
         result.cursors.push_back(std::move(descriptor));
     }
@@ -136,8 +138,9 @@ TtcImplicitResultSet DecodeTtcImplicitResultSetPrefix(const std::vector<uint8_t>
     return result;
 }
 
-TtcImplicitResultSet DecodeTtcImplicitResultSet(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
-    auto result = DecodeTtcImplicitResultSetPrefix(message, ttc_field_version);
+TtcImplicitResultSet DecodeTtcImplicitResultSet(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
+                                                 TtcChunkEncoding chunk_encoding) {
+    auto result = DecodeTtcImplicitResultSetPrefix(message, ttc_field_version, chunk_encoding);
     if (result.bytes_consumed != message.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC implicit-result-set message has trailing bytes");
     }

@@ -46,9 +46,10 @@ TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uin
         // too. Drain those prefixes but intentionally do not use the PL/SQL
         // success fallback: DML must preserve the TTIOER row count.
         size_t offset = 0;
+        const auto chunk_encoding = ChunkEncodingFor(legacy_session);
         while (offset < message.size() && message[offset] == TTC_MESSAGE_PARAMETER) {
             const std::vector<uint8_t> tail(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-            const auto parameter = DecodeTtcReturnParameterPrefix(tail);
+            const auto parameter = DecodeTtcReturnParameterPrefix(tail, chunk_encoding);
             offset += parameter.bytes_consumed;
         }
         if (offset == message.size()) {

@@ -23,7 +23,8 @@ void SkipSB4(ByteReader &reader) {
 } // namespace
 
 TtcOutBindsResult DecodeTtcOutBindsRow(const std::vector<uint8_t> &message, const std::vector<OracleBind> &binds,
-                                       const std::vector<size_t> &output_indexes, uint8_t ttc_field_version) {
+                                       const std::vector<size_t> &output_indexes, uint8_t ttc_field_version,
+                                       TtcChunkEncoding chunk_encoding) {
     ByteReader reader(message);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ROW_DATA for PL/SQL OUT binds");
@@ -47,7 +48,7 @@ TtcOutBindsResult DecodeTtcOutBindsRow(const std::vector<uint8_t> &message, cons
             // example 0x4c), not a boolean marker. The descriptor itself is
             // self-delimiting, so only null markers are special.
             const auto remaining = reader.ReadRaw(reader.Remaining());
-            auto descriptor = DecodeTtcRefCursorDescriptor(remaining, ttc_field_version);
+            auto descriptor = DecodeTtcRefCursorDescriptor(remaining, ttc_field_version, chunk_encoding);
             // Rebuild a cursor over the original tail so the SB4 trailer is
             // read in place and bytes_consumed remains relative to message.
             const auto descriptor_end = message.size() - remaining.size() + descriptor.bytes_consumed;
@@ -59,7 +60,7 @@ TtcOutBindsResult DecodeTtcOutBindsRow(const std::vector<uint8_t> &message, cons
             result.cursor_values[output_position] = std::move(descriptor);
             continue;
         }
-        result.scalar_values[output_position] = reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
+        result.scalar_values[output_position] = reader.ReadLengthPrefixed(MAX_VALUE_BYTES, chunk_encoding);
         SkipSB4(reader);
     }
     result.bytes_consumed = message.size() - reader.Remaining();
@@ -68,7 +69,7 @@ TtcOutBindsResult DecodeTtcOutBindsRow(const std::vector<uint8_t> &message, cons
 
 TtcPlsqlOutBindsResponse DecodeTtcPlsqlOutBindsResponse(const std::vector<uint8_t> &message,
                                                          const std::vector<OracleBind> &binds,
-                                                         uint8_t ttc_field_version) {
+                                                         uint8_t ttc_field_version, TtcChunkEncoding chunk_encoding) {
     const auto io_vector = DecodeTtcIoVectorPrefix(message);
     if (io_vector.bytes_consumed >= message.size()) {
         throw ProtocolError(ProtocolErrorKind::TRUNCATED, "PL/SQL response has no OUT-bind ROW_DATA message");
@@ -76,7 +77,7 @@ TtcPlsqlOutBindsResponse DecodeTtcPlsqlOutBindsResponse(const std::vector<uint8_
     const auto output_indexes = GetTtcOutputBindIndexes(io_vector, binds);
     const std::vector<uint8_t> row_message(message.begin() + static_cast<std::ptrdiff_t>(io_vector.bytes_consumed),
                                            message.end());
-    auto values = DecodeTtcOutBindsRow(row_message, binds, output_indexes, ttc_field_version);
+    auto values = DecodeTtcOutBindsRow(row_message, binds, output_indexes, ttc_field_version, chunk_encoding);
     // Read the count before the move: a braced initializer is evaluated left to
     // right, so `values` is already moved from by the time the last element is
     // computed, and reading a moved-from member is unspecified even where a

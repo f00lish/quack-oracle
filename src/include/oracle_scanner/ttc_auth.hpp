@@ -14,8 +14,12 @@ constexpr uint8_t TTC_FUNCTION_AUTH_PHASE_TWO = 115;
 
 // Encodes the classic TTC authentication function shape. It is generic so
 // phase-one client metadata and phase-two proof parameters use one validator.
+//
+// `chunk_encoding` says how the session states the length of a long value: a
+// universal integer on a modern one, one raw byte on a legacy (11.2) one.
 std::vector<uint8_t> EncodeTtcAuthFunction(uint8_t function_code, uint8_t sequence, const std::string &username,
-                                           uint32_t auth_mode, const std::vector<TtcParameter> &parameters);
+                                           uint32_t auth_mode, const std::vector<TtcParameter> &parameters,
+                                           TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 std::vector<TtcParameter> BuildO5LogonPhaseTwoParameters(const O5LogonResponse &response);
 
 } // namespace oracle_scanner

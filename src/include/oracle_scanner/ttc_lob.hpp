@@ -1,5 +1,6 @@
 #pragma once
 
+#include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/session.hpp"
 
 #include <cstdint>
@@ -44,7 +45,12 @@ struct TtcLobResponse {
 // Decodes the LOB_DATA and return-parameter prefix of a LOB_OP response. The
 // end-of-call that follows is left to the caller, which is the same division
 // the execute and fetch paths use.
-TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t locator_size);
+//
+// `chunk_encoding` says how the session states the length of each piece of a
+// long value. A legacy (11.2) session states it as one raw byte, so a CLOB or
+// BLOB over 252 bytes -- which is every real one -- has to be read that way.
+TtcLobResponse DecodeTtcLobResponse(const std::vector<uint8_t> &message, size_t locator_size,
+                                    TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 
 //! The whole response to one LOB operation: the data, the return parameter and
 //! the end-of-call that closes it. TRUNCATED means more of it has yet to arrive

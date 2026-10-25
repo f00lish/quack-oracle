@@ -261,7 +261,8 @@ ByteWriter &ByteWriter::WriteUB8(uint64_t value) {
 // Empty and NULL share one wire form; see ByteReader::ReadLengthPrefixed for
 // the decoding half of that policy. An empty VARCHAR2 bind therefore reaches
 // Oracle as NULL, which is what Oracle itself does with `''`.
-ByteWriter &ByteWriter::WriteLengthPrefixed(const std::optional<std::vector<uint8_t>> &value) {
+ByteWriter &ByteWriter::WriteLengthPrefixed(const std::optional<std::vector<uint8_t>> &value,
+                                            TtcChunkEncoding chunk_encoding) {
     if (!value.has_value() || value->empty()) {
         return WriteByte(TNS_NULL_LENGTH_INDICATOR);
     }
@@ -271,9 +272,24 @@ ByteWriter &ByteWriter::WriteLengthPrefixed(const std::optional<std::vector<uint
     }
     WriteByte(TNS_LONG_LENGTH_INDICATOR);
     size_t offset = 0;
+    if (chunk_encoding == TtcChunkEncoding::RawByte) {
+        // A legacy session states the length of each piece as one raw byte, so
+        // a piece cannot be longer than 255 bytes -- and 0xFE and 0xFF are
+        // taken by the long-value and NULL markers, so a piece stays under
+        // that. go-ora's 11.2 client writes 64-byte pieces
+        // (network/session.go ClrChunkSize is 0x40).
+        constexpr size_t chunk_size = 0x40;
+        while (offset < value->size()) {
+            const auto count = (std::min)(chunk_size, value->size() - offset);
+            WriteByte(static_cast<uint8_t>(count));
+            WriteRaw(value->data() + offset, count);
+            offset += count;
+        }
+        return WriteByte(0);
+    }
     constexpr size_t chunk_size = 0x8000;
     while (offset < value->size()) {
-        auto count = (std::min)(chunk_size, value->size() - offset);
+        const auto count = (std::min)(chunk_size, value->size() - offset);
         WriteUB4(static_cast<uint32_t>(count));
         WriteRaw(value->data() + offset, count);
         offset += count;

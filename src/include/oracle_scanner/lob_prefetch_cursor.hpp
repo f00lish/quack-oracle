@@ -149,9 +149,14 @@ private:
 
 // Zero-length ordinary CLOB can omit charset metadata (owned JDBC capture).
 // No character decoding is needed; any nonempty prefix still fails below.
+//
+// `chunk_encoding` says how the session states the length of a long value: a
+// universal integer on 19c and later, one raw byte on 11.2. The prefetched
+// prefix and the locator are such values.
 inline std::optional<OracleLobPrefetch> DecodeCursorLobPrefetchCell(ByteReader &reader, bool character,
                                                                  uint32_t requested_units,
                                                                  size_t content_budget,
+                                                                 TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger,
                                                                  uint16_t national_charset = 0) {
     if (requested_units > 32768 || content_budget == 0) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "invalid LOB prefetch decoder bounds");
@@ -182,7 +187,7 @@ inline std::optional<OracleLobPrefetch> DecodeCursorLobPrefetchCell(ByteReader &
                 throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "LOB prefetch charset is not verified UTF-16BE");
             }
         }
-        auto prefix = reader.ReadLengthPrefixed(static_cast<size_t>(requested_units) * width);
+        auto prefix = reader.ReadLengthPrefixed(static_cast<size_t>(requested_units) * width, chunk_encoding);
         if (prefix) { result.prefix = std::move(*prefix); }
         if (result.prefix.size() % width != 0) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "LOB prefetch has an incomplete UTF-16 unit");
@@ -192,7 +197,7 @@ inline std::optional<OracleLobPrefetch> DecodeCursorLobPrefetchCell(ByteReader &
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "LOB prefetch exceeds its reported length");
         }
     }
-    auto locator = reader.ReadLengthPrefixed(locator_size);
+    auto locator = reader.ReadLengthPrefixed(locator_size, chunk_encoding);
     if (!locator || locator->size() != locator_size) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "LOB prefetch locator length mismatch");
     }
@@ -201,12 +206,14 @@ inline std::optional<OracleLobPrefetch> DecodeCursorLobPrefetchCell(ByteReader &
 }
 
 inline std::optional<OracleLobPrefetch> DecodeStoredLobPrefetch(const std::vector<uint8_t> &cell,
-    bool character,const OracleLobPrefetchLimits &limits) {
+    bool character,const OracleLobPrefetchLimits &limits,
+    TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger) {
     if (cell.size() > limits.maximum_row_bytes) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,"stored LOB prefetch cell exceeds row budget");
     }
     ByteReader reader(cell);
-    auto value=DecodeCursorLobPrefetchCell(reader,character,limits.prefix_units,limits.maximum_content_bytes);
+    auto value=DecodeCursorLobPrefetchCell(reader,character,limits.prefix_units,limits.maximum_content_bytes,
+        chunk_encoding);
     if (!value || reader.Remaining() != 0) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,"stored LOB prefetch cell is not one non-NULL value");
     }

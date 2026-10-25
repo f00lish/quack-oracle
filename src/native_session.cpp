@@ -83,7 +83,8 @@ public:
                 const bool character=columns[index].oracle_type==ORACLE_WIRE_TYPE_CLOB;
                 if (!prefetched) { row[index]=ReadWholeLob(*row[index],character);continue; }
                 const auto call=channel.LockCall();
-                const auto cell=DecodeStoredLobPrefetch(*row[index],character,prefetch_limits);
+                const auto cell=DecodeStoredLobPrefetch(*row[index],character,prefetch_limits,
+                    ChunkEncodingFor(channel.LegacySession()));
                 const auto content=MaterializePrefetchedOracleLob(cell,65536,prefetch_limits.maximum_content_bytes,
                     [&](const std::vector<uint8_t> &locator,uint64_t offset,uint64_t amount) {
                         TtcLobRequest request;request.sequence=NextCursorSequence();request.locator=locator;
@@ -107,7 +108,10 @@ public:
                 request.operation = LOB_OP_READ;
                 request.offset = offset;
                 request.amount = amount;
-                return channel.LobOperation(request, server_field_version);
+                // The session's dialect decides how the length of a long value
+                // is stated, so the read has to carry it: a legacy (11.2)
+                // session states each piece's length as one raw byte.
+                return channel.LobOperation(request, server_field_version, channel.LegacySession());
             }, [&] {
                 TtcLobRequest request;
                 request.sequence = NextCursorSequence();

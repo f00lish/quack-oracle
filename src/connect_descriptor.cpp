@@ -215,7 +215,9 @@ static std::string BuildDescriptor(const ConnectionConfig &config, const Connect
         result << "(CID=(PROGRAM=" << identity.program << ")(HOST=" << identity.machine << ")(USER=" << identity.os_user
                << "))";
     }
-    result << (config.sid.empty() ? "SERVICE_NAME=" + config.service_name : "SID=" + config.sid) << ')';
+    // The service is its own parenthesised group, so the identity block above
+    // and the service below each carry their own parentheses.
+    result << '(' << (config.sid.empty() ? "SERVICE_NAME=" + config.service_name : "SID=" + config.sid) << ')';
     if (!config.instance_name.empty()) {
         result << "(INSTANCE_NAME=" << config.instance_name << ')';
     }

@@ -22,6 +22,11 @@ struct TtcDescribeInfo {
 // one way (the OACCOLID field, and the scale width, which only the legacy
 // one needs to be searched for), and a single value keeps those decisions
 // together instead of spread over loose parameters.
+//
+// The two dialects have two separate readers. The modern one is this
+// function's own body and is unchanged from before 11.2 support existed; the
+// legacy one is in ttc_describe_legacy.hpp. This function chooses between
+// them and does nothing else.
 TtcDescribeInfo DecodeTtcDescribeInfoPrefix(const std::vector<uint8_t> &message,
                                             uint8_t ttc_field_version = 12,
                                             TtcDialect dialect = TtcDialect{});

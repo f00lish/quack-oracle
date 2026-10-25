@@ -787,7 +787,7 @@ TtcProtocolInfo TnsClientConnection::Negotiate(const TtcNegotiationOptions &opti
     auto result = RunTtcNegotiation(Ttc(), options);
     ttc_field_version = result.field_version;
     ttc_server_field_version = result.server_field_version;
-    runtime_capabilities = result.runtime_capabilities;
+    compile_capabilities = result.compile_capabilities;
     Ttc().SetWireFieldVersion(result.field_version);
     state = OracleConnectionState::TTC_NEGOTIATED;
     return result;
@@ -835,8 +835,13 @@ O5LogonResponse TnsClientConnection::AuthenticateO5Logon(const std::string &user
     // The bit index is 4, well inside the table on every listener that has
     // one; a table that is too short leaves the default (padded), which is
     // what 11.2 uses.
-    if (runtime_capabilities.size() > 4) {
-        request.session_keys_padded = (runtime_capabilities[4] & 2) == 0;
+    //
+    // It is the COMPILE-time table. go-ora v1 (auth_object.go:99), v2
+    // (v2/auth_object.go:153) and v3 (v3/auth_object.go:159) all read
+    // ServerCompileTimeCaps[4] -- the runtime table is a different table,
+    // and the two disagree on some listeners.
+    if (compile_capabilities.size() > 4) {
+        request.session_keys_padded = (compile_capabilities[4] & 2) == 0;
     }
     // The session's own dialect decides how the challenge states the
     // length of each piece of a long value.

@@ -23,7 +23,8 @@ std::vector<uint8_t> EncodeTtcCloseCursorsPiggyback(uint8_t sequence, const std:
     return writer.Take();
 }
 
-std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndToEndAttributes &attributes) {
+std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndToEndAttributes &attributes,
+                                                 TtcChunkEncoding chunk_encoding) {
     if (attributes.Empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC end-to-end piggyback has no attribute");
     }
@@ -76,13 +77,13 @@ std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndTo
     const std::optional<std::string> &const_action = action;
     for (const auto *value : {&attributes.client_identifier, &attributes.module, &const_action, &attributes.client_info}) {
         if (*value && !(*value)->empty()) {
-            writer.WriteLengthPrefixed(std::vector<uint8_t>((*value)->begin(), (*value)->end()));
+            writer.WriteLengthPrefixed(std::vector<uint8_t>((*value)->begin(), (*value)->end()), chunk_encoding);
         }
     }
     return writer.Take();
 }
 
-size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size) {
+size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size, TtcChunkEncoding chunk_encoding) {
     constexpr uint8_t SESSION_RETURN = 5;
     constexpr size_t MAX_ELEMENTS = 1024;
     constexpr size_t MAX_VALUE_BYTES = 64U << 10U;
@@ -107,10 +108,10 @@ size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size) {
         // A key and a value, each length-prefixed when present, and a flags
         // field; the report only echoes what the client just set.
         if (reader.ReadUB2() > 0) {
-            (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
+            (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES, chunk_encoding);
         }
         if (reader.ReadUB2() > 0) {
-            (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
+            (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES, chunk_encoding);
         }
         reader.ReadUB2();
     }
@@ -120,11 +121,12 @@ size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size) {
     return reader.Position();
 }
 
-size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset) {
+size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset, TtcChunkEncoding chunk_encoding) {
     if (offset > message.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected a TTC server piggyback");
     }
-    return offset + SkippedTtcServerPiggybackBytes(message.data() + offset, message.size() - offset);
+    return offset + SkippedTtcServerPiggybackBytes(message.data() + offset, message.size() - offset,
+                                                   chunk_encoding);
 }
 
 } // namespace oracle_scanner

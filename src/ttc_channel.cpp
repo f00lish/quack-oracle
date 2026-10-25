@@ -66,11 +66,14 @@ void TtcChannel::Ping(uint8_t sequence, uint8_t server_field_version) {
     auto response = Receive();
     // The report of the attributes just set comes ahead of the acknowledgement.
     while (!response.empty() && response.front() == TTC_MESSAGE_SERVER_PIGGYBACK) {
-        const auto after = SkipTtcServerPiggyback(response, 0);
+        const auto after = SkipTtcServerPiggyback(response, 0, dialect.chunk_encoding);
         response.erase(response.begin(), response.begin() + static_cast<std::ptrdiff_t>(after));
     }
     if (IsTtcErrorMessage(response)) {
-        const auto error = DecodeTtcErrorPrefix(response, server_field_version);
+        // The dialect decides which TTIOER layout the body has. Reading a
+        // legacy body with the modern layout reports a universal-integer
+        // width error instead of the server's own message.
+        const auto error = DecodeTtcErrorPrefix(response, server_field_version, dialect);
         if (error.error_number != 0) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                                 error.message.empty() ? "Oracle ping failed" : error.message, error.error_number);
@@ -132,7 +135,8 @@ void TtcChannel::Send(const std::vector<uint8_t> &request) {
     const bool end_to_end = !pending_end_to_end.Empty();
     uint8_t piggyback_sequence = next_piggyback_sequence;
     if (end_to_end) {
-        outbound = WithHeaderToken(EncodeTtcEndToEndPiggyback(piggyback_sequence++, pending_end_to_end),
+        outbound = WithHeaderToken(EncodeTtcEndToEndPiggyback(piggyback_sequence++, pending_end_to_end,
+                                                             dialect.chunk_encoding),
                                    wire_field_version);
     }
     if (!pending_close_cursors.empty()) {

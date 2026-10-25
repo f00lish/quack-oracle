@@ -80,6 +80,7 @@ set(EXTENSION_SOURCES
     src/ttc_fetch_response.cpp
     src/lob_prefetch_fetch.cpp
     src/ttc_describe.cpp
+    src/ttc_describe_legacy.cpp
     src/ttc_execute_response.cpp
     src/ttc_cursor.cpp
     src/ttc_call_response.cpp
@@ -166,6 +167,7 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/ttc_fetch_response.cpp
                  src/lob_prefetch_fetch.cpp
                  src/ttc_describe.cpp
+    src/ttc_describe_legacy.cpp
                  src/ttc_execute_response.cpp
                  src/ttc_cursor.cpp
                  src/ttc_call_response.cpp

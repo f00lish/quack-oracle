@@ -89,10 +89,14 @@ private:
     uint16_t negotiated_sdu;
     uint8_t ttc_field_version = ORACLE_CLIENT_TTC_FIELD_VERSION;
     uint8_t ttc_server_field_version = ORACLE_CLIENT_TTC_FIELD_VERSION;
-    // The server's capability table from the TTC negotiation. The 11G
-    // password verifier needs one bit of it: (ServerCompileTimeCaps[4] & 2)
-    // says whether the session keys are padded.
-    std::vector<uint8_t> runtime_capabilities;
+    // The server's COMPILE-TIME capability table from the TTC negotiation.
+    // The 11G password verifier needs one bit of it:
+    // (ServerCompileTimeCaps[4] & 2) says whether the session keys are
+    // padded. It is the COMPILE table and not the runtime table: go-ora v1
+    // (auth_object.go:99), v2 (v2/auth_object.go:153) and v3
+    // (v3/auth_object.go:159) all read ServerCompileTimeCaps[4], and the two
+    // tables are different tables.
+    std::vector<uint8_t> compile_capabilities;
     bool end_of_response_negotiated = false;
     // The session's dialect, decided once from the accept version the
     // listener answered with. It answers with a two-byte packet length and

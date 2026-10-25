@@ -1,5 +1,7 @@
 #pragma once
 
+#include "oracle_scanner/ttc_dialect.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -43,11 +45,18 @@ constexpr size_t TTC_CLIENT_INFO_MAXIMUM = 64;
 // above change, listing the values it now holds; it is skipped, and anything
 // else is refused rather than guessed at. Returns the offset after it.
 constexpr uint8_t TTC_MESSAGE_SERVER_PIGGYBACK = 23;
-size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset);
+// The dialect decides how the session states the length of a long value, and
+// the session-return report's keys and values are length-prefixed values like
+// any other. Reading them with the wrong encoding desynchronizes the reader
+// on a legacy (11.2) session.
+size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset,
+                               TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 //! The same on a buffer: how many bytes of it the piggyback at its start takes.
-size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size);
+size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size,
+                                      TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 
-std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndToEndAttributes &attributes);
+std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndToEndAttributes &attributes,
+                                                 TtcChunkEncoding chunk_encoding = TtcChunkEncoding::UniversalInteger);
 std::vector<uint8_t> EncodeTtcCloseCursorsPiggyback(uint8_t sequence, const std::vector<uint32_t> &cursor_ids);
 
 } // namespace oracle_scanner

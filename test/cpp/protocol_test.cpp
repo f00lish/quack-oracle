@@ -70,6 +70,7 @@
 #include "oracle_scanner/ttc_statement_channel.hpp"
 #include "oracle_scanner/ttc_row_data.hpp"
 #include "oracle_scanner/ttc_negotiation.hpp"
+#include "oracle_scanner/ttc_data_types_template.hpp"
 #include "oracle_scanner/ttc_o5logon.hpp"
 #include "oracle_scanner/transaction.hpp"
 #include "oracle_scanner/session_factory.hpp"
@@ -2729,6 +2730,96 @@ static void TestLegacyParameterRoundTripUsesRawByteChunkLength() {
     const auto decoded = DecodeTtcParameters(legacy, TtcChunkEncoding::RawByte);
     CHECK(decoded.size() == 1 && decoded[0].key == "AUTH_SESSKEY" && decoded[0].value.size() == 300);
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)DecodeTtcParameters(legacy, TtcChunkEncoding::UniversalInteger); });
+}
+
+// The 19c data-types request this client actually sends is the captured
+// baseline in ttc_data_types_template.hpp, and that capture is the only
+// ground truth about 19c's framing available offline. Decoding it proves the
+// 19c vectors are plain-byte too: 53 bytes of compile capabilities and 11 of
+// runtime capabilities, each stated by a single length byte.
+//
+// It also pins the two things a 19c regression would break silently:
+//
+//   * the length byte is NOT 0xFE/0xFF, so a length-prefixed reader happens
+//     to agree with a plain-byte reader on THIS capture -- the two readings
+//     only diverge at 254/255, which is why the plain-byte rule is the one
+//     that is implemented rather than the one that is merely observed to work;
+//   * the compile vector's caps[37] is 0xb8, whose bit 32 is set. go-ora
+//     reads that bit to decide that a session uses big (universal integer)
+//     CLR chunks, so 19c is a modern session. The dialect therefore has to
+//     come from the session's own legacy marker and never from this bit:
+//     caps[7] (the field version) is 12 here, while a legacy session
+//     negotiates field version 6, and an 11.2 listener's own table would
+//     otherwise be indistinguishable from a modern one by this bit alone.
+static void TestNineteenCDataTypesTemplateUsesPlainByteCapabilityLengths() {
+    const auto &message = ORACLE_19C_TTC_DATA_TYPES_TEMPLATE;
+    CHECK(message.size() == 2642);
+    CHECK(message[0] == TTC_MESSAGE_DATA_TYPES);
+
+    // go-ora's data_type_nego.go writeMessage() lays the request out as:
+    //   message code | charset in | charset out | server flags |
+    //   len(compile caps) | compile caps | len(runtime caps) | runtime caps
+    //   | type representations
+    CHECK(message[1] == 0x69 && message[2] == 0x03); // AL32UTF8, little endian
+    CHECK(message[3] == 0x69 && message[4] == 0x03);
+
+    const auto compile_length = message[6];
+    CHECK(compile_length == 53);
+    CHECK(compile_length != TNS_LONG_LENGTH_INDICATOR && compile_length != TNS_NULL_LENGTH_INDICATOR);
+    const auto compile_caps = std::vector<uint8_t>(message.begin() + 7, message.begin() + 7 + compile_length);
+
+    const auto runtime_length_offset = 7 + compile_length;
+    const auto runtime_length = message[runtime_length_offset];
+    CHECK(runtime_length == 11);
+    const auto runtime_caps = std::vector<uint8_t>(message.begin() + runtime_length_offset + 1,
+                                                   message.begin() + runtime_length_offset + 1 + runtime_length);
+
+    // The field version a modern server reports, and the bit go-ora uses to
+    // pick the big-chunk dialect.
+    CHECK(compile_caps[TTC_CAPABILITY_FIELD_VERSION_INDEX] == 12);
+    CHECK((compile_caps[37] & 32) != 0);
+
+    // A 19c server answers with the same plain-byte framing, so the reader
+    // that handles the captured request has to handle the captured answer
+    // too. A length-prefixed reader would take a length byte of 254 or 255
+    // for a long-value marker and refuse the vector; a plain-byte reader
+    // reads it as 254 or 255 bytes.
+    for (const size_t length : {size_t(254), size_t(255)}) {
+        ByteWriter response;
+        response.WriteByte(TTC_MESSAGE_PROTOCOL).WriteByte(6).WriteByte(0);
+        response.WriteNullTerminated("Oracle Database 19c");
+        response.WriteUInt16LE(ORACLE_CHARSET_AL32UTF8).WriteByte(0);
+        response.WriteUInt16LE(0); // no protocol element table
+        response.WriteUInt16BE(0); // no format descriptor
+        std::vector<uint8_t> capabilities(length, 0x11);
+        capabilities[TTC_CAPABILITY_FIELD_VERSION_INDEX] = 12;
+        response.WriteByte(static_cast<uint8_t>(length));
+        response.WriteRaw(capabilities);
+        response.WriteByte(0); // no runtime capabilities
+        const auto protocol = ParseTtcProtocolResponse(response.Data());
+        CHECK(protocol.compile_capabilities.size() == length);
+        CHECK(protocol.server_field_version == 12);
+    }
+}
+
+// A modern session states the length of each piece of a long value as a
+// universal integer, so a value over 252 bytes is framed with a width byte
+// and then that many bytes of the number. The 19c dialect is the one this
+// client has always spoken, so the modern framing has to stay byte for byte
+// what it was: the 0x8000-byte piece size and the universal-integer length
+// are both load-bearing.
+static void TestModernLongValueKeepsItsUniversalIntegerFraming() {
+    const std::vector<uint8_t> value(600, 0x4e);
+    ByteWriter writer;
+    writer.WriteLengthPrefixed(value, TtcChunkEncoding::UniversalInteger);
+    const auto bytes = writer.Data();
+    CHECK(bytes[0] == TNS_LONG_LENGTH_INDICATOR);
+    CHECK(bytes[1] == 0x02); // the universal integer's own width
+    CHECK(bytes[2] == 0x02 && bytes[3] == 0x58); // 600
+
+    ByteReader reader(bytes);
+    const auto decoded = reader.ReadLengthPrefixed(1U << 20U, TtcChunkEncoding::UniversalInteger);
+    CHECK(decoded.has_value() && *decoded == value);
 }
 
 // The capability vectors in the TTC protocol and data-types messages are NOT
@@ -7741,6 +7832,8 @@ int main() {
     TestLegacyReturnParameterUsesRawByteChunkLength();
     TestLegacyParameterRoundTripUsesRawByteChunkLength();
     TestNegotiationCapabilityVectorIsNotAChunkedValue();
+    TestNineteenCDataTypesTemplateUsesPlainByteCapabilityLengths();
+    TestModernLongValueKeepsItsUniversalIntegerFraming();
     TestLegacy11GChallengeParameters();
     TestO5Logon11GPhaseTwoParameters();
     TestConnectDescriptor();

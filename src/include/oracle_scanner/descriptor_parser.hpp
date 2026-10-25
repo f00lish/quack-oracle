@@ -32,6 +32,8 @@ struct ParsedConnectDescriptor {
     std::optional<uint32_t> connect_timeout_seconds;
     std::optional<uint32_t> transport_connect_timeout_seconds;
     std::string service_name;
+    // The older way to name the database; a descriptor has one of the two.
+    std::string sid;
     std::string instance_name;
     std::string server_type;
     // From (security=...). An empty DN means the descriptor named none, which
@@ -45,7 +47,8 @@ struct ParsedConnectDescriptor {
 // Parses the descriptor subset this client honours. Everything a descriptor
 // can say either takes effect, is harmless and documented as ignored, or is
 // refused by name — a setting that would silently change meaning (TAF's
-// FAILOVER_MODE, SOURCE_ROUTE=ON, DESCRIPTION_LIST, SID, SERVER=POOLED) is
+// FAILOVER_MODE, SOURCE_ROUTE=ON, a DESCRIPTION_LIST whose descriptions name
+// different databases, SERVER=POOLED) is
 // UNSUPPORTED rather than dropped.
 ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor);
 
@@ -70,5 +73,15 @@ void ValidateRedirectReconnectData(const std::string &text);
 // Finds one case-insensitive alias definition in tnsnames.ora and returns its
 // complete DESCRIPTION value. The input is bounded by the wallet reader.
 std::string FindTnsAliasDescriptor(const std::string &tnsnames, const std::string &alias);
+
+// Easy Connect: [tcp[s]://]host[:port][,host[:port]...]/service[:server][/instance][?key=value&...].
+// IsEasyConnectString says whether a DSN has that shape (it names a host or a
+// service, so is neither a descriptor, which starts with '(', nor a bare
+// tnsnames alias). EasyConnectToDescriptor rewrites one into the equivalent
+// (DESCRIPTION=...) so the one descriptor parser decides what is accepted;
+// parameters it does not know are refused by name, not dropped. Timeouts are
+// whole seconds. Values are not percent-decoded.
+bool IsEasyConnectString(const std::string &text);
+std::string EasyConnectToDescriptor(const std::string &text);
 
 } // namespace oracle_scanner

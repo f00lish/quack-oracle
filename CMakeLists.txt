@@ -71,6 +71,8 @@ set(EXTENSION_SOURCES
     src/oracle_types.cpp
     src/oracle_connection.cpp
     src/oracle_filter.cpp
+    src/oracle_optimizer.cpp
+    src/oracle_snapshot.cpp
     src/oracle_write.cpp
     src/oracle_callable.cpp
     src/oracle_pool.cpp
@@ -89,6 +91,10 @@ set(EXTENSION_SOURCES
     src/ttc_negotiation.cpp
     src/ttc_o5logon.cpp
     src/value_codec.cpp
+    src/oson.cpp
+    src/temp_lob.cpp
+    src/oracle_vector.cpp
+    src/ttc_define.cpp
     src/auth_crypto.cpp
     src/bind_validation.cpp
     src/sql_binds.cpp
@@ -171,6 +177,10 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/ttc_negotiation.cpp
                  src/ttc_o5logon.cpp
                  src/value_codec.cpp
+                 src/oson.cpp
+                 src/temp_lob.cpp
+                 src/oracle_vector.cpp
+                 src/ttc_define.cpp
                  src/auth_crypto.cpp
                  src/bind_validation.cpp
                  src/sql_binds.cpp
@@ -257,6 +267,16 @@ if(ORACLE_SCANNER_BUILD_TESTS)
   target_include_directories(oracle_scanner_typed_composite_live_test PRIVATE ${CMAKE_SOURCE_DIR}/extension/core_functions/include)
   target_include_directories(oracle_scanner_typed_composite_live_test PRIVATE src/include)
   target_compile_features(oracle_scanner_typed_composite_live_test PRIVATE cxx_std_17)
+
+  # Opt-in live checks of the NCHAR, INTERVAL, ROWID and LONG column types; see
+  # the file header.
+  add_executable(oracle_scanner_new_types_live_test test/cpp/new_types_live_test.cpp)
+  target_link_libraries(oracle_scanner_new_types_live_test PRIVATE duckdb_static)
+  link_extension_libraries(oracle_scanner_new_types_live_test PRIVATE)
+  target_link_libraries(oracle_scanner_new_types_live_test PRIVATE ${EXTENSION_NAME} core_functions_extension)
+  target_include_directories(oracle_scanner_new_types_live_test PRIVATE ${CMAKE_SOURCE_DIR}/extension/core_functions/include)
+  target_include_directories(oracle_scanner_new_types_live_test PRIVATE src/include)
+  target_compile_features(oracle_scanner_new_types_live_test PRIVATE cxx_std_17)
 endif()
 
 install(

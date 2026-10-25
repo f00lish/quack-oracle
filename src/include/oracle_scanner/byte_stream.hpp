@@ -3,6 +3,7 @@
 #include "oracle_scanner/tns_packet.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -107,10 +108,23 @@ public:
     void Send(const std::vector<TnsPacket> &packets);
     TnsPacket Receive();
 
+    //! What has crossed the connection so far, packet headers included. A round
+    //! trip is a request after which a response was read.
+    struct Statistics {
+        uint64_t bytes_sent = 0;
+        uint64_t bytes_received = 0;
+        uint64_t round_trips = 0;
+    };
+    Statistics GetStatistics() const;
+
 private:
     ByteStream &stream;
     bool large_length;
     size_t packet_limit;
+    std::atomic<uint64_t> bytes_sent {0};
+    std::atomic<uint64_t> bytes_received {0};
+    std::atomic<uint64_t> round_trips {0};
+    std::atomic<bool> awaiting_response {false};
 };
 
 } // namespace oracle_scanner

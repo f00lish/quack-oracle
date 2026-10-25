@@ -382,4 +382,97 @@ std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire) 
     return static_cast<int64_t>(magnitude);
 }
 
+constexpr uint32_t INTERVAL_SIGN_OFFSET = 0x80000000U;
+constexpr int INTERVAL_FIELD_OFFSET = 60;
+
+static void PutBigEndian(std::vector<uint8_t> &out, uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<uint8_t>(value >> shift));
+    }
+}
+
+static uint32_t GetBigEndian(const uint8_t *data) {
+    return (static_cast<uint32_t>(data[0]) << 24U) | (static_cast<uint32_t>(data[1]) << 16U) |
+           (static_cast<uint32_t>(data[2]) << 8U) | data[3];
+}
+
+static int32_t ReadOffsetInteger(const uint8_t *data) {
+    return static_cast<int32_t>(static_cast<int64_t>(GetBigEndian(data)) - static_cast<int64_t>(INTERVAL_SIGN_OFFSET));
+}
+
+static int ReadIntervalField(uint8_t byte, int limit, const char *what) {
+    const auto value = static_cast<int>(byte) - INTERVAL_FIELD_OFFSET;
+    if (value < -limit || value > limit) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, std::string("Oracle INTERVAL ") + what + " is out of range");
+    }
+    return value;
+}
+
+std::vector<uint8_t> EncodeOracleIntervalYearMonth(int32_t years, int32_t months) {
+    std::vector<uint8_t> wire;
+    PutBigEndian(wire, static_cast<uint32_t>(static_cast<int64_t>(years) + INTERVAL_SIGN_OFFSET));
+    wire.push_back(static_cast<uint8_t>(months + INTERVAL_FIELD_OFFSET));
+    return wire;
+}
+
+OracleIntervalYearMonth DecodeOracleIntervalYearMonth(const std::vector<uint8_t> &wire) {
+    if (wire.size() != 5) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle INTERVAL YEAR TO MONTH must be 5 bytes");
+    }
+    OracleIntervalYearMonth result;
+    result.months = static_cast<int64_t>(ReadOffsetInteger(wire.data())) * 12 + ReadIntervalField(wire[4], 11, "month");
+    return result;
+}
+
+std::vector<uint8_t> EncodeOracleIntervalDaySecond(int32_t days, int32_t hours, int32_t minutes, int32_t seconds,
+                                                   int32_t nanoseconds) {
+    std::vector<uint8_t> wire;
+    PutBigEndian(wire, static_cast<uint32_t>(static_cast<int64_t>(days) + INTERVAL_SIGN_OFFSET));
+    wire.push_back(static_cast<uint8_t>(hours + INTERVAL_FIELD_OFFSET));
+    wire.push_back(static_cast<uint8_t>(minutes + INTERVAL_FIELD_OFFSET));
+    wire.push_back(static_cast<uint8_t>(seconds + INTERVAL_FIELD_OFFSET));
+    PutBigEndian(wire, static_cast<uint32_t>(static_cast<int64_t>(nanoseconds) + INTERVAL_SIGN_OFFSET));
+    return wire;
+}
+
+OracleIntervalDaySecond DecodeOracleIntervalDaySecond(const std::vector<uint8_t> &wire) {
+    if (wire.size() != 11) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle INTERVAL DAY TO SECOND must be 11 bytes");
+    }
+    OracleIntervalDaySecond result;
+    result.days = ReadOffsetInteger(wire.data());
+    const auto hours = ReadIntervalField(wire[4], 23, "hour");
+    const auto minutes = ReadIntervalField(wire[5], 59, "minute");
+    const auto seconds = ReadIntervalField(wire[6], 59, "second");
+    const auto nanoseconds = ReadOffsetInteger(wire.data() + 7);
+    if (nanoseconds <= -1000000000 || nanoseconds >= 1000000000) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle INTERVAL fractional seconds are out of range");
+    }
+    result.nanoseconds =
+        ((static_cast<int64_t>(hours) * 60 + minutes) * 60 + seconds) * 1000000000LL + nanoseconds;
+    return result;
+}
+
+std::optional<std::string> TryDecodeOracleRowid(const std::vector<uint8_t> &wire) {
+    size_t offset = 0;
+    if (wire.size() == 13 && wire[0] == 1) {
+        offset = 1;
+    } else if (wire.size() != 12) {
+        return std::nullopt;
+    }
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto *data = wire.data() + offset;
+    std::string text;
+    const auto put = [&](uint64_t value, int digits) {
+        for (int shift = (digits - 1) * 6; shift >= 0; shift -= 6) {
+            text.push_back(alphabet[(value >> shift) & 63U]);
+        }
+    };
+    put(GetBigEndian(data), 6);
+    put((static_cast<uint32_t>(data[4]) << 8U) | data[5], 3);
+    put(GetBigEndian(data + 6), 6);
+    put((static_cast<uint32_t>(data[10]) << 8U) | data[11], 3);
+    return text;
+}
+
 } // namespace oracle_scanner

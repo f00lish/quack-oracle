@@ -73,6 +73,12 @@ struct ConnectRouting {
 };
 
 struct ConnectionConfig {
+    // Session attributes Oracle shows in V$SESSION and SYS_CONTEXT, set once
+    // when the session opens. Empty means leave them alone.
+    std::string client_identifier;
+    std::string module;
+    std::string action;
+    std::string client_info;
     // Caller-owned IO budget; excluded from secrets, target keys and pooling.
     std::shared_ptr<OracleIoDeadline> io_deadline;
     // Set instead, for a session reused across callers: the deadline is read
@@ -84,6 +90,8 @@ struct ConnectionConfig {
     std::string host;
     uint16_t port = 1521;
     std::string service_name;
+    // Names the database by SID instead; exactly one of the two is set.
+    std::string sid;
     // Optional CONNECT_DATA elements a descriptor may carry. INSTANCE_NAME pins
     // the connection to one database instance; SERVER is DEDICATED or SHARED.
     std::string instance_name;

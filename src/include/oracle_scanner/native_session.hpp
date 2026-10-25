@@ -36,6 +36,7 @@ public:
     void Cancel() override;
     void Close() override;
     bool ReadyForReuse() const override;
+    OracleIoStats IoStats() const override;
     bool BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) override;
 
 private:
@@ -44,6 +45,12 @@ private:
     void RequireOpen() const;
     std::unique_ptr<OracleCursor> OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds);
     uint64_t ExecuteStatement(const std::string &sql, const std::vector<OracleBind> &binds, OracleSqlKind kind);
+    //! Runs `operation` with the binds of one statement, sending any LOB value
+    //! too large for an ordinary bind through a temporary LOB that is released
+    //! when the statement is done.
+    template <class Operation>
+    auto WithTemporaryLobs(const std::vector<OracleBind> &binds, Operation operation)
+        -> decltype(operation(binds));
 
     std::unique_ptr<TnsClientConnection> connection;
     OracleStatementRegistry statements;

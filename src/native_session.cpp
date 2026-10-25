@@ -8,14 +8,17 @@
 #include "oracle_scanner/sql_statement.hpp"
 #include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
+#include "oracle_scanner/temp_lob.hpp"
 #include "oracle_scanner/lob_reader.hpp"
 #include "oracle_scanner/io_deadline_binding.hpp"
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
+#include "oracle_scanner/ttc_define.hpp"
 #include "oracle_scanner/value_codec.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
 
 #include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <utility>
 
@@ -48,6 +51,7 @@ public:
                 prefetch_eligible=false;
             }
         }
+        inline_eligible = !prefetch_eligible && SupportsInlineLobDefine(columns, field_version);
         if (!pending.empty()) {
             previous_row = pending.back();
         }
@@ -70,17 +74,21 @@ public:
     void ResolveLobs(OracleBatch &batch,bool prefetched=false) {
         bool any = false;
         for (const auto &column : columns) {
-            any = any || IsOracleLobType(column.oracle_type);
+            any = any || IsOracleLocatorType(column.oracle_type);
         }
         if (!any) {
             return;
         }
         for (auto &row : batch.rows) {
             for (size_t index = 0; index < row.size() && index < columns.size(); index++) {
-                if (!IsOracleLobType(columns[index].oracle_type) || !row[index]) {
+                if (!IsOracleLocatorType(columns[index].oracle_type) || !row[index]) {
                     continue;
                 }
                 const bool character=columns[index].oracle_type==ORACLE_WIRE_TYPE_CLOB;
+                if (columns[index].inline_lob_cells && !prefetched) {
+                    row[index]=ResolveInlineLob(*row[index],character);
+                    continue;
+                }
                 if (!prefetched) { row[index]=ReadWholeLob(*row[index],character);continue; }
                 const auto call=channel.LockCall();
                 const auto cell=DecodeStoredLobPrefetch(*row[index],character,prefetch_limits,
@@ -95,6 +103,35 @@ public:
                 row[index]=character ? DecodeUtf16BeToUtf8(*content) : *content;
             }
         }
+    }
+
+    // A value that came with its row: whole, when what the server sent covers
+    // it, and otherwise the rest of it is read from the locator. A CLOB or BLOB
+    // came with only its size, so the size spares the length request.
+    std::vector<uint8_t> ResolveInlineLob(const std::vector<uint8_t> &cell, bool character) {
+        const auto lob = DecodeTtcInlineLob(cell);
+        if (!character && lob.prefix.size() == lob.total) {
+            return lob.prefix;
+        }
+        OracleLobPrefetch prefetch;
+        prefetch.character = character;
+        prefetch.total_units = lob.total;
+        prefetch.prefix_units = lob.prefix.size();
+        prefetch.prefix = lob.prefix;
+        prefetch.locator = lob.locator;
+        const auto call = channel.LockCall();
+        const auto content = MaterializePrefetchedOracleLob(
+            std::optional<OracleLobPrefetch>(std::move(prefetch)), 65536, prefetch_limits.maximum_content_bytes,
+            [&](const std::vector<uint8_t> &locator, uint64_t offset, uint64_t amount) {
+                TtcLobRequest request;
+                request.sequence = NextCursorSequence();
+                request.locator = locator;
+                request.operation = LOB_OP_READ;
+                request.offset = offset;
+                request.amount = amount;
+                return channel.LobOperation(request, server_field_version);
+            });
+        return character ? DecodeUtf16BeToUtf8(*content) : *content;
     }
 
     std::vector<uint8_t> ReadWholeLob(const std::vector<uint8_t> &locator, bool is_character) {
@@ -155,12 +192,18 @@ public:
             const auto call = channel.LockCall();
             const auto desired=requested_rows-result.rows.size();
             const auto count=prefetch_eligible ? BoundedLobPrefetchRows(columns,desired,prefetch_limits) :
+                inline_eligible ? InlineLobRows(columns,desired) :
                 static_cast<uint32_t>((std::min)(desired,size_t((std::numeric_limits<uint32_t>::max)())));
             const auto sequence=NextCursorSequence();
             if (prefetch_eligible && !prefetch_active) {
                 channel.DefineLobPrefetch(handle,sequence,columns,count,field_version,prefetch_limits);
                 // Never interpret an old locator as a prefetched descriptor.
                 previous_row.reset();prefetch_active=true;
+            } else if (inline_eligible && !inline_active) {
+                channel.DefineInlineLobs(handle,sequence,columns,count);
+                for (auto &column : columns) { column.inline_lob_cells = IsOracleLocatorType(column.oracle_type); }
+                // The rows before the define carry locators only.
+                previous_row.reset();inline_active=true;
             } else { channel.Fetch(handle,sequence,count); }
             auto response_limits=prefetch_limits;
             response_limits.maximum_rows=count;
@@ -223,7 +266,42 @@ private:
     uint8_t field_version=0;
     bool prefetch_eligible=false;
     bool prefetch_active=false;
+    bool inline_eligible=false;
+    bool inline_active=false;
     OracleLobPrefetchLimits prefetch_limits;
+};
+
+// Temporary LOB operations on the session's own channel.
+class SessionTemporaryLobWriter final : public TemporaryLobWriter {
+public:
+    SessionTemporaryLobWriter(TtcStatementChannel &channel_p, std::function<uint8_t()> next_sequence_p,
+                              uint8_t server_field_version_p, bool legacy_session_p)
+        : channel(channel_p), next_sequence(std::move(next_sequence_p)), server_field_version(server_field_version_p),
+          legacy_session(legacy_session_p) {
+    }
+
+    std::vector<uint8_t> Create(TtcTempLobKind kind) override {
+        return channel.LocatorOperation(EncodeTtcCreateTempLob(next_sequence(), kind), 1, true, server_field_version,
+                                         legacy_session);
+    }
+
+    std::vector<uint8_t> Write(const std::vector<uint8_t> &locator, uint64_t offset,
+                               const std::vector<uint8_t> &data) override {
+        return channel.LocatorOperation(
+            EncodeTtcWriteLob(next_sequence(), locator, offset, data, ChunkEncodingFor(legacy_session)), 1, false,
+            server_field_version, legacy_session);
+    }
+
+    void Free(const std::vector<std::vector<uint8_t>> &locators) override {
+        (void)channel.LocatorOperation(EncodeTtcFreeTempLobs(next_sequence(), locators), locators.size(), false,
+                                       server_field_version, legacy_session);
+    }
+
+private:
+    TtcStatementChannel &channel;
+    std::function<uint8_t()> next_sequence;
+    uint8_t server_field_version;
+    bool legacy_session;
 };
 
 } // namespace
@@ -259,6 +337,25 @@ std::unique_ptr<NativeOracleSession> NativeOracleSession::Connect(const Connecti
     connection->AuthenticateO5Logon(config.user, password);
     auto session = std::unique_ptr<NativeOracleSession>(new NativeOracleSession(std::move(connection)));
     session->deadline_binding = config.io_deadline_binding;
+    TtcEndToEndAttributes attributes;
+    if (!config.client_identifier.empty()) {
+        attributes.client_identifier = config.client_identifier;
+    }
+    if (!config.module.empty()) {
+        attributes.module = config.module;
+    }
+    if (!config.action.empty()) {
+        attributes.action = config.action;
+    }
+    if (!config.client_info.empty()) {
+        attributes.client_info = config.client_info;
+    }
+    if (!attributes.Empty()) {
+        // Sent at once, in front of a ping, so the first statement does not
+        // have to find the server's report of it in its own response.
+        session->connection->Ttc().QueueEndToEndAttributes(attributes);
+        session->connection->Ttc().Ping(session->NextSequence(), session->connection->TtcServerFieldVersion());
+    }
     return session;
 }
 
@@ -288,6 +385,28 @@ uint8_t NativeOracleSession::NextSequence() {
         next_sequence = 1;
     }
     return result;
+}
+
+template <class Operation>
+auto NativeOracleSession::WithTemporaryLobs(const std::vector<OracleBind> &binds, Operation operation)
+    -> decltype(operation(binds)) {
+    if (!TemporaryLobScope::Needed(binds)) {
+        return operation(binds);
+    }
+    const auto call = channel->LockCall();
+    SessionTemporaryLobWriter writer(*channel, [this] { return NextSequence(); }, connection->TtcServerFieldVersion(),
+                                     connection->LegacySession());
+    TemporaryLobScope scope(writer);
+    auto converted = binds;
+    try {
+        scope.Convert(converted);
+        auto result = operation(converted);
+        scope.Release();
+        return result;
+    } catch (...) {
+        scope.ReleaseQuietly();
+        throw;
+    }
 }
 
 void NativeOracleSession::RequireOpen() const {
@@ -340,7 +459,9 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
 
 uint64_t NativeOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {
     return RunNativeOperation(*lifetime, [&]() {
-        return ExecuteStatement(sql, binds, OracleSqlKind::DML);
+        return WithTemporaryLobs(binds, [&](const std::vector<OracleBind> &effective) {
+            return ExecuteStatement(sql, effective, OracleSqlKind::DML);
+        });
     });
 }
 
@@ -382,6 +503,7 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
 uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) {
     RequireOpen();
     return RunNativeOperation(*lifetime, [&]() {
+    return WithTemporaryLobs(binds, [&](const std::vector<OracleBind> &binds) {
         const auto call = channel->LockCall();
         auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::DML);
         // PL/SQL bind variables are stricter than SQL placeholders: begin the
@@ -435,6 +557,7 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
         }
         return result;
     });
+    });
 }
 
 // One OALL8 per group of rows rather than one per row: Oracle parses the
@@ -453,37 +576,64 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
             RequireOpen();
             const auto call = channel->LockCall();
             const auto end = (std::min)(rows.size(), start + maximum_iterations_per_execute);
-            auto ordered_first = OrderOracleStatementBinds(sql, rows[start], OracleBindUse::DML);
-            const auto handle = statements.Open(OracleSqlKind::DML);
-            TtcExecuteBindsRequest execute;
-    execute.legacy_session = connection->LegacySession();
-            execute.sequence = NextSequence();
-            execute.sql = sql;
-            execute.binds = std::move(ordered_first);
-            execute.additional_iterations.reserve(end - start - 1);
-            for (size_t index = start + 1; index < end; index++) {
-                execute.additional_iterations.push_back(OrderOracleStatementBinds(sql, rows[index], OracleBindUse::DML));
+            // A LOB value too large for an ordinary bind goes through a
+            // temporary LOB, one group at a time so they are released as soon
+            // as the group has run.
+            SessionTemporaryLobWriter lob_writer(*channel, [this] { return NextSequence(); },
+                                                 connection->TtcServerFieldVersion(), connection->LegacySession());
+            TemporaryLobScope lobs(lob_writer);
+            std::vector<std::vector<OracleBind>> converted;
+            const bool use_converted = TemporaryLobScope::NeededRows(rows, start, end);
+            if (use_converted) {
+                converted.assign(rows.begin() + static_cast<std::ptrdiff_t>(start),
+                                 rows.begin() + static_cast<std::ptrdiff_t>(end));
             }
-            channel->ExecuteBinds(handle, execute);
-            TtcErrorInfo completion;
+            const auto row_at = [&](size_t index) -> const std::vector<OracleBind> & {
+                return use_converted ? converted[index - start] : rows[index];
+            };
             try {
-                completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(), channel->LegacySession());
-            } catch (const OracleDmlError &error) {
-                // The server reports the iteration it was on, zero-based and
-                // relative to this request; the caller counts from the start of the
-                // batch it handed over.
-                // The row goes first: Oracle's own text is what a reader looks
-                // for, and anything appended after it competes with the newline
-                // Oracle ends it with.
-                throw ProtocolError(error.Kind(), "row " + std::to_string(start + error.FailedRow() + 1) +
-                                                      " of the batch failed: " + error.what(), error.OracleCode());
+                if (use_converted) {
+                    lobs.ConvertRows(converted);
+                }
+                auto ordered_first = OrderOracleStatementBinds(sql, row_at(start), OracleBindUse::DML);
+                const auto handle = statements.Open(OracleSqlKind::DML);
+                TtcExecuteBindsRequest execute;
+                execute.legacy_session = connection->LegacySession();
+                execute.sequence = NextSequence();
+                execute.sql = sql;
+                execute.binds = std::move(ordered_first);
+                execute.additional_iterations.reserve(end - start - 1);
+                for (size_t index = start + 1; index < end; index++) {
+                    execute.additional_iterations.push_back(
+                        OrderOracleStatementBinds(sql, row_at(index), OracleBindUse::DML));
+                }
+                channel->ExecuteBinds(handle, execute);
+                TtcErrorInfo completion;
+                try {
+                    completion = channel->ReceiveDmlResponse(handle, connection->TtcServerFieldVersion(),
+                                                            channel->LegacySession());
+                } catch (const OracleDmlError &error) {
+                    // The server reports the iteration it was on, zero-based and
+                    // relative to this request; the caller counts from the start of the
+                    // batch it handed over.
+                    // The row goes first: Oracle's own text is what a reader looks
+                    // for, and anything appended after it competes with the newline
+                    // Oracle ends it with.
+                    throw ProtocolError(error.Kind(), "row " + std::to_string(start + error.FailedRow() + 1) +
+                                                          " of the batch failed: " + error.what(), error.OracleCode());
+                }
+                channel->CompleteExecute(handle, false, completion.cursor_id);
+                channel->Close(handle);
+                if ((std::numeric_limits<uint64_t>::max)() - affected_rows < completion.row_count) {
+                    throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                        "native Oracle DML batch row count overflows uint64");
+                }
+                affected_rows += completion.row_count;
+                lobs.Release();
+            } catch (...) {
+                lobs.ReleaseQuietly();
+                throw;
             }
-            channel->CompleteExecute(handle, false, completion.cursor_id);
-            channel->Close(handle);
-            if ((std::numeric_limits<uint64_t>::max)() - affected_rows < completion.row_count) {
-                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "native Oracle DML batch row count overflows uint64");
-            }
-            affected_rows += completion.row_count;
         }
         return affected_rows;
     });
@@ -493,6 +643,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
                                                               const std::vector<OracleBind> &binds) {
     RequireOpen();
     return RunNativeOperation(*lifetime, [&]() {
+    return WithTemporaryLobs(binds, [&](const std::vector<OracleBind> &binds) {
         const auto call = channel->LockCall();
         // The statement already names its own OUT binds — `RETURNING x INTO :y` —
         // so unlike ExecuteWithRowCount nothing is appended to it. Wrapping it in a
@@ -530,6 +681,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
         }
         return outputs;
     });
+    });
 }
 
 OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
@@ -542,7 +694,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
             binds.push_back(*request.return_bind);
         }
         binds.insert(binds.end(), request.arguments.begin(), request.arguments.end());
-        if (request.kind == OracleCallableKind::DML_COMPOSITE) {
+        if (request.kind == OracleCallableKind::DML_COMPOSITE || request.kind == OracleCallableKind::ANONYMOUS_BLOCK) {
             // A procedure block names its binds in argument order; a composite
             // names them in whatever order its statements do, and PL/SQL binds
             // by first occurrence, so the values follow the block.
@@ -633,6 +785,18 @@ void NativeOracleSession::Rollback() {
     } catch (...) {
         lifetime->exchange_failed = true;
         throw;
+    }
+}
+
+OracleIoStats NativeOracleSession::IoStats() const {
+    if (!connection) {
+        return {};
+    }
+    try {
+        const auto statistics = connection->Packets().GetStatistics();
+        return {statistics.bytes_sent, statistics.bytes_received, statistics.round_trips};
+    } catch (const std::exception &) {
+        return {};
     }
 }
 

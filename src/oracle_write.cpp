@@ -12,6 +12,7 @@
 // not negotiate.
 
 #include "oracle_adapter.hpp"
+#include "oracle_scanner/temp_lob.hpp"
 #include "duckdb/catalog/catalog.hpp"
 
 #include <optional>
@@ -33,9 +34,12 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
+#include "oracle_scanner/oracle_vector.hpp"
+#include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/session_factory.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -331,6 +335,8 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
         }
         timestamp = timestamp_t(microseconds);
         extra_nanoseconds = remainder;
+    } else if (value.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
+        timestamp = timestamp_t(value.GetValue<timestamp_tz_t>().value);
     } else if (value.type().id() == LogicalTypeId::DATE) {
         timestamp = Timestamp::FromDatetime(value.GetValue<date_t>(), dtime_t(0));
     } else if (value.type().id() == LogicalTypeId::TIMESTAMP) {
@@ -379,6 +385,107 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
 
 } // namespace
 
+// One bind carries at most this much (the TTC bind limit). Writing a LOB through
+// an ordinary bind therefore stops here.
+constexpr size_t MAX_LOB_WRITE_BYTES = oracle_scanner::TEMP_LOB_MAXIMUM_BYTES;
+constexpr size_t MAX_JSON_WRITE_BYTES = MAX_LOB_WRITE_BYTES;
+
+namespace {
+const vector<Value> &VectorChildren(const Value &list) {
+    return list.type().id() == LogicalTypeId::ARRAY ? ArrayValue::GetChildren(list) : ListValue::GetChildren(list);
+}
+
+// The elements of a VECTOR value, in the storage format the column has. A
+// column of any format is mapped to a list of DOUBLE, so that is written as
+// FLOAT64 and the server converts it to whatever each row's format is.
+void FillVectorElements(oracle_scanner::OracleVector &target, const vector<Value> &children, const OracleColumn &column) {
+    for (const auto &child : children) {
+        if (child.IsNull()) {
+            RefuseValue(column, "a VECTOR has no NULL element");
+        }
+        try {
+            switch (target.format) {
+            case oracle_scanner::ORACLE_VECTOR_FLOAT32: {
+                const float number = child.GetValue<float>();
+                if (!std::isfinite(number)) {
+                    RefuseValue(column, "a VECTOR has no infinity or NaN element");
+                }
+                target.float32.push_back(number);
+                break;
+            }
+            case oracle_scanner::ORACLE_VECTOR_FLOAT64: {
+                const double number = child.GetValue<double>();
+                if (!std::isfinite(number)) {
+                    RefuseValue(column, "a VECTOR has no infinity or NaN element");
+                }
+                target.float64.push_back(number);
+                break;
+            }
+            case oracle_scanner::ORACLE_VECTOR_INT8: {
+                const auto number = child.GetValue<int64_t>();
+                if (number < -128 || number > 127) {
+                    RefuseValue(column, "an INT8 VECTOR element must be between -128 and 127");
+                }
+                target.int8.push_back(static_cast<int8_t>(number));
+                break;
+            }
+            default: {
+                const auto number = child.GetValue<int64_t>();
+                if (number < 0 || number > 255) {
+                    RefuseValue(column, "a BINARY VECTOR holds bytes, 0 to 255");
+                }
+                target.binary.push_back(static_cast<uint8_t>(number));
+                break;
+            }
+            }
+        } catch (const ConversionException &) {
+            RefuseValue(column, "a VECTOR element does not fit the column's storage format");
+        }
+    }
+}
+
+// A VECTOR value as the image a bind carries. A dense one is its list or array
+// of numbers; a sparse one is STRUCT(dimensions, indices, values).
+std::vector<uint8_t> VectorImage(const Value &value, const OracleColumn &column) {
+    const auto type = value.type().id();
+    const bool sparse = (column.vector_flags & oracle_scanner::ORACLE_VECTOR_COLUMN_SPARSE) != 0;
+    oracle_scanner::OracleVector target;
+    target.format = column.vector_format != 0 ? column.vector_format : oracle_scanner::ORACLE_VECTOR_FLOAT64;
+    target.sparse = sparse;
+    if (sparse) {
+        if (type != LogicalTypeId::STRUCT) {
+            RefuseBind(column, value, "a sparse VECTOR column takes STRUCT(dimensions, indices, values)");
+        }
+        const auto &children = StructValue::GetChildren(value);
+        if (children.size() != 3 || children[0].IsNull() || children[1].IsNull() || children[2].IsNull()) {
+            RefuseBind(column, value, "a sparse VECTOR needs its dimensions, indices and values");
+        }
+        target.dimensions = children[0].GetValue<uint32_t>();
+        for (const auto &index : VectorChildren(children[1])) {
+            if (index.IsNull()) {
+                RefuseValue(column, "a sparse VECTOR has no NULL index");
+            }
+            target.indices.push_back(index.GetValue<uint32_t>());
+        }
+        FillVectorElements(target, VectorChildren(children[2]), column);
+    } else {
+        if (type != LogicalTypeId::LIST && type != LogicalTypeId::ARRAY) {
+            RefuseBind(column, value, "a VECTOR column takes a list or array of numbers");
+        }
+        FillVectorElements(target, VectorChildren(value), column);
+        target.dimensions = static_cast<uint32_t>(VectorChildren(value).size());
+        if (target.format == oracle_scanner::ORACLE_VECTOR_BINARY) {
+            target.dimensions *= 8;
+        }
+    }
+    try {
+        return oracle_scanner::EncodeOracleVector(target);
+    } catch (const oracle_scanner::ProtocolError &error) {
+        RefuseValue(column, error.what());
+    }
+}
+} // namespace
+
 OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, const std::string &name) {
     // A column this client cannot read is one it cannot reason about writing
     // either, and it refuses with the type named.
@@ -387,6 +494,39 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     bind.name = name;
     bind.oracle_type = column.oracle_type;
     bind.direction = BindDirection::BIND_IN;
+    // What goes on the wire is settled before the NULL test: a batch declares
+    // its bind metadata once, so a NULL row has to describe its column exactly
+    // as a row with a value does.
+    if (column.oracle_type == 231) {
+        // A local-zone column is written as a TIMESTAMP of UTC wall time.
+        bind.oracle_type = 180;
+    }
+    if (column.oracle_type == 112) {
+        // A LOB is written as the ordinary bind of its content, as
+        // python-oracledb Thin does: a VARCHAR2 for a CLOB or NCLOB (the server
+        // converts to the national set itself, so the bind stays in the
+        // database set), a RAW for a BLOB. Oracle accepts one past the usual
+        // 32767 bytes when the target is a LOB, and the value goes out in the
+        // chunked form the length prefix already has.
+        bind.oracle_type = 1;
+    } else if (column.oracle_type == 113) {
+        bind.oracle_type = 23;
+    } else if (column.oracle_type == 119) {
+        // JSON is written as its text, which the server converts: the form
+        // python-oracledb falls back to for a string bound to one. A VECTOR is
+        // bound as its image (see VectorImage).
+        bind.oracle_type = 1;
+    }
+    if ((column.oracle_type == 1 || column.oracle_type == 96) && column.character_set_form == 2) {
+        bind.character_set_form = 2;
+    }
+    // Set before the NULL test as well: array DML binds a column the same way in
+    // every row, so a NULL row has to say it stands for a LOB too.
+    if (column.oracle_type == 112 || column.oracle_type == 119) {
+        bind.lob_content = 112;
+    } else if (column.oracle_type == 113) {
+        bind.lob_content = 113;
+    }
     if (value.IsNull()) {
         return bind;
     }
@@ -404,6 +544,13 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
             // than relying on the server to make the substitution.
             return bind;
         }
+        if (column.character_set_form == 2) {
+            // NCHAR and NVARCHAR2: the bind says it is the national form and
+            // the value is UTF-16BE, which is what python-oracledb sends for
+            // DB_TYPE_NVARCHAR and what a read returns.
+            bind.value = EncodingFor(column, [&] { return oracle_scanner::EncodeUtf8ToUtf16Be(text); });
+            return bind;
+        }
         bind.value = std::vector<uint8_t>(text.begin(), text.end());
         return bind;
     }
@@ -419,7 +566,8 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
         if (!value.type().IsNumeric()) {
             RefuseBind(column, value, "a NUMBER column takes a numeric or decimal-text value");
         }
-        if (type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE) {
+        if ((type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE) &&
+            column.unconstrained_number != OracleColumn::UNCONSTRAINED_DOUBLE) {
             // Going through binary floating point would round the value on its
             // way into an exact decimal column.
             RefuseBind(column, value, "FLOAT and DOUBLE are not exact; cast to DECIMAL or VARCHAR first");
@@ -436,6 +584,106 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
             column, [&] { return oracle_scanner::EncodeOracleTimestamp(DateTimeFromValue(value, column), false); });
         return bind;
     }
+    case 231: { // TIMESTAMP WITH LOCAL TIME ZONE
+        // The session is UTC, so a TIMESTAMPTZ is bound as the TIMESTAMP of its
+        // UTC wall time and Oracle files it as the instant it names. Only a
+        // TIMESTAMPTZ says which instant is meant; a bare TIMESTAMP would
+        // silently be read as UTC.
+        if (type != LogicalTypeId::TIMESTAMP_TZ) {
+            RefuseBind(column, value, "a TIMESTAMP WITH LOCAL TIME ZONE column takes TIMESTAMPTZ");
+        }
+        bind.value = EncodingFor(
+            column, [&] { return oracle_scanner::EncodeOracleTimestamp(DateTimeFromValue(value, column), false); });
+        return bind;
+    }
+    case 252: { // BOOLEAN
+        if (type != LogicalTypeId::BOOLEAN) {
+            RefuseBind(column, value, "a BOOLEAN column takes BOOLEAN");
+        }
+        // Two bytes, as python-oracledb sends them: a 1, then 1 for true and 0
+        // for false.
+        bind.value = std::vector<uint8_t> {1, static_cast<uint8_t>(value.GetValue<bool>() ? 1 : 0)};
+        return bind;
+    }
+    case 182: { // INTERVAL YEAR TO MONTH
+        if (type != LogicalTypeId::INTERVAL) {
+            RefuseBind(column, value, "an INTERVAL YEAR TO MONTH column takes INTERVAL");
+        }
+        const auto interval = value.GetValue<interval_t>();
+        if (interval.days != 0 || interval.micros != 0) {
+            RefuseValue(column, "an INTERVAL YEAR TO MONTH holds whole months; this interval has days or time");
+        }
+        bind.value = EncodingFor(column, [&] {
+            return oracle_scanner::EncodeOracleIntervalYearMonth(interval.months / 12, interval.months % 12);
+        });
+        return bind;
+    }
+    case 183: { // INTERVAL DAY TO SECOND
+        if (type != LogicalTypeId::INTERVAL) {
+            RefuseBind(column, value, "an INTERVAL DAY TO SECOND column takes INTERVAL");
+        }
+        const auto interval = value.GetValue<interval_t>();
+        if (interval.months != 0) {
+            // A month is not a fixed number of days, so there is no exact
+            // DAY TO SECOND for it.
+            RefuseValue(column, "an INTERVAL DAY TO SECOND cannot hold months");
+        }
+        constexpr int64_t MICROS_PER_DAY = 86400LL * 1000000LL;
+        // Whole days inside the time part move to the day count, so the hour
+        // field stays 0..23 as Oracle requires.
+        const int64_t days = static_cast<int64_t>(interval.days) + interval.micros / MICROS_PER_DAY;
+        const int64_t micros = interval.micros % MICROS_PER_DAY;
+        if ((days > 0 && micros < 0) || (days < 0 && micros > 0)) {
+            // Oracle's interval has one sign for every field.
+            RefuseValue(column, "the days and the time part of this interval have opposite signs");
+        }
+        if (days > NumericLimits<int32_t>::Maximum() || days < NumericLimits<int32_t>::Minimum()) {
+            RefuseValue(column, "the day count is out of range");
+        }
+        const int64_t seconds_total = micros / 1000000LL;
+        bind.value = EncodingFor(column, [&] {
+            return oracle_scanner::EncodeOracleIntervalDaySecond(
+                static_cast<int32_t>(days), static_cast<int32_t>(seconds_total / 3600),
+                static_cast<int32_t>(seconds_total / 60 % 60), static_cast<int32_t>(seconds_total % 60),
+                static_cast<int32_t>(micros % 1000000LL * 1000));
+        });
+        return bind;
+    }
+    case 112:   // CLOB and NCLOB
+    case 113: { // BLOB
+        const bool character = column.oracle_type == 112;
+        if (type != (character ? LogicalTypeId::VARCHAR : LogicalTypeId::BLOB)) {
+            RefuseBind(column, value, character ? "a CLOB column takes VARCHAR" : "a BLOB column takes BLOB");
+        }
+        const auto bytes = character ? value.GetValue<std::string>() : StringValue::Get(value);
+        if (bytes.empty()) {
+            // An empty CLOB value is NULL on the way in, like any empty string.
+            return bind;
+        }
+        if (bytes.size() > MAX_LOB_WRITE_BYTES) {
+            RefuseValue(column, "a LOB value is limited to " + std::to_string(MAX_LOB_WRITE_BYTES >> 20U) + " MiB");
+        }
+        bind.value = std::vector<uint8_t>(bytes.begin(), bytes.end());
+        return bind;
+    }
+    case 119: { // JSON
+        if (type != LogicalTypeId::VARCHAR) {
+            RefuseBind(column, value, "a JSON column takes VARCHAR or JSON text");
+        }
+        const auto text = value.GetValue<std::string>();
+        if (text.empty()) {
+            return bind;
+        }
+        if (text.size() > MAX_JSON_WRITE_BYTES) {
+            RefuseValue(column, "a JSON value is limited to " + std::to_string(MAX_JSON_WRITE_BYTES >> 20U) +
+                                    " MiB of text");
+        }
+        bind.value = std::vector<uint8_t>(text.begin(), text.end());
+        return bind;
+    }
+    case 127: // VECTOR, bound as its image
+        bind.value = VectorImage(value, column);
+        return bind;
     case 181:
         // Readable because the value carries its own offset, but nothing on the
         // DuckDB side of this mapping carries one to write back.
@@ -539,6 +787,75 @@ OracleColumn OracleRowIdColumn() {
     column.nullable = false;
     return column;
 }
+
+namespace {
+
+// The OUT binds that carry a RETURNING clause's values back, one per column.
+std::vector<OracleBind> ReturningOutputs(const std::vector<OracleColumn> &returned_columns) {
+    std::vector<OracleBind> outputs;
+    for (idx_t column_index = 0; column_index < returned_columns.size(); column_index++) {
+        OracleBind output;
+        output.name = "r" + std::to_string(column_index + 1);
+        output.oracle_type = returned_columns[column_index].oracle_type;
+        if (output.oracle_type == 96) {
+            // A CHAR OUT bind is blank-padded to the whole buffer (32767
+            // here), not to the column's width. Asked for as VARCHAR2 the
+            // value comes back as the column holds it, already padded to
+            // the declared width.
+            output.oracle_type = 1;
+        }
+        if ((returned_columns[column_index].oracle_type == 1 || returned_columns[column_index].oracle_type == 96) &&
+            returned_columns[column_index].character_set_form == 2) {
+            output.character_set_form = 2;
+        }
+        output.direction = BindDirection::BIND_OUT;
+        output.maximum_bytes = 32767;
+        outputs.push_back(std::move(output));
+    }
+    return outputs;
+}
+
+// The columns a RETURNING over the whole table covers, and the clause that asks
+// for them. DuckDB evaluates RETURNING over every column of the table, so a
+// column this client cannot hand back rules the clause out.
+struct ReturningPlan {
+    std::vector<OracleColumn> columns;
+    std::string clause;
+};
+
+ReturningPlan PlanReturning(const TableCatalogEntry &table, const std::vector<OracleColumn> &columns,
+                            const char *statement, const std::string &first_out_name_prefix = "r") {
+    ReturningPlan plan;
+    std::string returned_list;
+    std::string into_list;
+    for (auto &column : table.GetColumns().Physical()) {
+        const auto position = column.Physical().index;
+        if (position >= columns.size()) {
+            throw InternalException("Oracle RETURNING column %llu is outside the table's Oracle metadata",
+                                    static_cast<uint64_t>(position));
+        }
+        RequireReadableColumn(columns[position]);
+        if (columns[position].oracle_type == 112 || columns[position].oracle_type == 113 ||
+            columns[position].oracle_type == 119 || columns[position].oracle_type == 127) {
+            // Oracle hands a LOB in RETURNING back as a locator, not as
+            // content, and this client has no capture of that exchange.
+            throw NotImplementedException("Oracle %s ... RETURNING cannot return the LOB, JSON or VECTOR column \"%s\"; "
+                                          "run it without RETURNING and read the rows back",
+                                          statement, columns[position].name);
+        }
+        if (!returned_list.empty()) {
+            returned_list += ", ";
+            into_list += ", ";
+        }
+        returned_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
+        into_list += ":" + first_out_name_prefix + std::to_string(plan.columns.size() + 1);
+        plan.columns.push_back(columns[position]);
+    }
+    plan.clause = " RETURNING " + returned_list + " INTO " + into_list;
+    return plan;
+}
+
+} // namespace
 
 namespace {
 
@@ -664,12 +981,7 @@ private:
                 binds.push_back(OracleBindForColumn(chunk.GetValue(source_indexes[column_index], row_index),
                                                     bound_columns[column_index], std::to_string(column_index + 1)));
             }
-            for (idx_t column_index = 0; column_index < returned_columns.size(); column_index++) {
-                OracleBind output;
-                output.name = "r" + std::to_string(column_index + 1);
-                output.oracle_type = returned_columns[column_index].oracle_type;
-                output.direction = BindDirection::BIND_OUT;
-                output.maximum_bytes = 32767;
+            for (auto &output : ReturningOutputs(returned_columns)) {
                 binds.push_back(std::move(output));
             }
             std::vector<OracleBind> values;
@@ -723,9 +1035,10 @@ private:
 class OracleRowIdWriteOperator : public PhysicalOperator {
 public:
     OracleRowIdWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-                             OracleWriteTarget target_p, std::string sql_p)
+                             OracleWriteTarget target_p, std::string sql_p,
+                             std::vector<OracleColumn> returned_columns_p = {})
         : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-          target(std::move(target_p)), sql(std::move(sql_p)) {
+          target(std::move(target_p)), sql(std::move(sql_p)), returned_columns(std::move(returned_columns_p)) {
     }
 
     bool IsSink() const override {
@@ -736,8 +1049,12 @@ public:
         return true;
     }
 
-    unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
-        return make_uniq<OracleInsertGlobalState>();
+    unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+        auto state = make_uniq<OracleInsertGlobalState>();
+        if (!returned_columns.empty()) {
+            state->returned = make_uniq<ColumnDataCollection>(context, types);
+        }
+        return std::move(state);
     }
 
     unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
@@ -750,6 +1067,9 @@ public:
             return SinkResultType::NEED_MORE_INPUT;
         }
         chunk.Flatten();
+        if (!returned_columns.empty()) {
+            return SinkReturning(context, chunk, global_state);
+        }
         // PhysicalUpdate and PhysicalDelete both put the row identity last, and
         // reading it from the chunk keeps this independent of how wide the
         // projection above happened to be.
@@ -780,23 +1100,92 @@ public:
 
     SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
         auto &source_state = input.global_state.Cast<OracleInsertSourceState>();
+        auto &global_state = sink_state->Cast<OracleInsertGlobalState>();
+        if (global_state.returned) {
+            if (!source_state.scan_started) {
+                global_state.returned->InitializeScan(source_state.scan);
+                source_state.scan_started = true;
+            }
+            global_state.returned->Scan(source_state.scan, chunk);
+            return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+        }
         if (source_state.emitted) {
             return SourceResultType::FINISHED;
         }
         source_state.emitted = true;
-        auto &global_state = sink_state->Cast<OracleInsertGlobalState>();
         chunk.SetChildCardinality(1);
         chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
         return SourceResultType::FINISHED;
     }
 
 protected:
+    // With RETURNING, one statement per row: it names the row by ROWID, so it
+    // changes one row or none. The statement also reports SQL%ROWCOUNT, because
+    // a row deleted since the scan read it returns nothing, and the OUT binds
+    // would then read as a row of NULLs.
+    SinkResultType SinkReturning(ExecutionContext &context, DataChunk &chunk, OracleInsertGlobalState &global_state) const {
+        const auto rowid_index = chunk.ColumnCount() - 1;
+        DataChunk row_chunk;
+        row_chunk.Initialize(Allocator::DefaultAllocator(), types);
+        for (idx_t row_index = 0; row_index < chunk.size(); row_index++) {
+            auto binds = LeadingBinds(chunk, row_index);
+            const auto rowid = chunk.GetValue(rowid_index, row_index);
+            if (rowid.IsNull()) {
+                throw InternalException("Oracle row identity is missing for a row of \"%s\"", target.object_name);
+            }
+            binds.push_back(OracleBindForColumn(rowid, OracleRowIdColumn(), std::to_string(binds.size() + 1)));
+            for (auto &output : ReturningOutputs(returned_columns)) {
+                binds.push_back(std::move(output));
+            }
+            OracleBind count;
+            count.name = "rc";
+            count.oracle_type = 2;
+            count.direction = BindDirection::BIND_OUT;
+            count.maximum_bytes = 22;
+            binds.push_back(std::move(count));
+            std::vector<OracleBind> values;
+            try {
+                auto &session = TransactionSession(context.client, target);
+                values = TranslatingOracleErrors(FailureMessage(), [&] { return session.ExecuteReturning(sql, binds); });
+            } catch (...) {
+                PoisonTransactionSession(context.client, target.catalog_name);
+                throw;
+            }
+            if (values.size() != returned_columns.size() + 1 || !values.back().value) {
+                throw InternalException("Oracle RETURNING produced %llu values for %llu columns and a row count",
+                                        static_cast<uint64_t>(values.size()), static_cast<uint64_t>(returned_columns.size()));
+            }
+            if (oracle_scanner::DecodeOracleNumber(*values.back().value) == "0") {
+                continue;
+            }
+            const auto row = row_chunk.size();
+            for (idx_t column_index = 0; column_index < returned_columns.size(); column_index++) {
+                row_chunk.data[column_index].SetValue(row,
+                                   TranslatingOracleErrors("Oracle could not convert a RETURNING value", [&] {
+                                       return ValueFor(returned_columns[column_index], values[column_index].value);
+                                   }));
+            }
+            row_chunk.SetChildCardinality(row + 1);
+            global_state.inserted_rows++;
+            if (row_chunk.size() == STANDARD_VECTOR_SIZE) {
+                global_state.returned->Append(row_chunk);
+                row_chunk.Reset();
+            }
+        }
+        if (row_chunk.size() != 0) {
+            global_state.returned->Append(row_chunk);
+        }
+        return SinkResultType::NEED_MORE_INPUT;
+    }
+
     //! The binds that come before the row identity, empty for a DELETE.
     virtual std::vector<OracleBind> LeadingBinds(DataChunk &chunk, idx_t row_index) const = 0;
     virtual const char *FailureMessage() const = 0;
 
     OracleWriteTarget target;
     std::string sql;
+    //! The table's columns, in order, when the statement has RETURNING.
+    std::vector<OracleColumn> returned_columns;
 };
 
 class OracleDeleteOperator final : public OracleRowIdWriteOperator {
@@ -821,9 +1210,9 @@ class OracleUpdateOperator final : public OracleRowIdWriteOperator {
 public:
     OracleUpdateOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
                          OracleWriteTarget target_p, std::string sql_p, std::vector<idx_t> source_indexes_p,
-                         std::vector<OracleColumn> set_columns_p)
+                         std::vector<OracleColumn> set_columns_p, std::vector<OracleColumn> returned_columns_p = {})
         : OracleRowIdWriteOperator(physical_plan, std::move(types), estimated_cardinality, std::move(target_p),
-                                   std::move(sql_p)),
+                                   std::move(sql_p), std::move(returned_columns_p)),
           source_indexes(std::move(source_indexes_p)), set_columns(std::move(set_columns_p)) {
     }
 
@@ -876,17 +1265,19 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
     // puts a projection over the source whose select list has, per physical
     // column, a reference into the source for a named column and the column's
     // bound default — a constant NULL for an Oracle table, which has no DuckDB
-    // default — for an unnamed one. So the projection's select list is read:
-    // a column whose expression is not a reference (possibly under a cast,
-    // which GetDefaultExpressionForColumn adds) was not named. The old map is
-    // still honoured when present, for a plan that reaches here some other way.
+    // default — for an unnamed one. The default is moved out of
+    // op.bound_defaults to do it, which is what says a column was left out:
+    // the projection's expressions cannot, because the optimizer folds
+    // constants into them and merges projections, so a named column can end up
+    // as a constant or a computation. The old map is still honoured when
+    // present, for a plan that reaches here some other way.
     std::vector<idx_t> source_indexes;
     std::vector<OracleColumn> bound_columns;
     std::string column_list;
     std::string value_list;
     const auto *projection =
         plan->type == PhysicalOperatorType::PROJECTION ? &plan->Cast<PhysicalProjection>() : nullptr;
-    const auto names_column = [&](idx_t physical) -> std::optional<idx_t> {
+    const auto names_column = [&](idx_t physical, idx_t storage) -> std::optional<idx_t> {
         if (!op.column_index_map.empty()) {
             const auto mapped = op.column_index_map[PhysicalIndex(physical)];
             if (mapped == DConstants::INVALID_INDEX) {
@@ -898,6 +1289,15 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
             // No projection means the source already matches the table
             // column for column, so every column is named and in order.
             return physical;
+        }
+        if (storage < op.bound_defaults.size()) {
+            // The binder moves a column's bound default into the projection when
+            // the statement does not name it and only reads it for one it does,
+            // so a default that has gone is exactly an unnamed column. The
+            // expression itself cannot say: the optimizer folds constants and
+            // merges projections, and a column the user wrote as a constant or
+            // a computation then looks no different from one left out.
+            return op.bound_defaults[storage] ? std::optional<idx_t>(physical) : std::nullopt;
         }
         const Expression *expression = projection->select_list[physical].get();
         // A cast is a function expression of type OPERATOR_CAST in 2.0;
@@ -917,7 +1317,7 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
         if (position >= columns.size()) {
             throw InternalException("Oracle INSERT column %llu is outside the table's Oracle metadata", position);
         }
-        const auto named = names_column(position);
+        const auto named = names_column(position, column.StorageOid());
         if (!named) {
             continue;
         }
@@ -927,38 +1327,23 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
             value_list += ", ";
         }
         column_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
-        value_list += ":" + std::to_string(bound_columns.size() + 1);
+        value_list += OracleBindExpression(columns[position], bound_columns.size() + 1);
         source_indexes.push_back(source_index);
         bound_columns.push_back(columns[position]);
     }
     if (bound_columns.empty()) {
         throw NotImplementedException("Oracle INSERT needs at least one column");
     }
-    auto sql = "INSERT INTO " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " (" + column_list +
+    auto sql = "INSERT INTO " + OracleObjectReference(target.schema_name, target.object_name) + " (" + column_list +
               ") VALUES (" + value_list + ")";
     // RETURNING asks Oracle for the row it actually stored. Echoing back what
     // was sent would be wrong for exactly the cases the clause exists for: a
     // column left to its DEFAULT, a sequence, a trigger.
     std::vector<OracleColumn> returned_columns;
     if (op.return_chunk) {
-        std::string returned_list;
-        std::string into_list;
-        for (auto &column : op.table.GetColumns().Physical()) {
-            const auto position = column.Physical().index;
-            if (position >= columns.size()) {
-                throw InternalException("Oracle RETURNING column %llu is outside the table's Oracle metadata",
-                                        static_cast<uint64_t>(position));
-            }
-            RequireReadableColumn(columns[position]);
-            if (!returned_list.empty()) {
-                returned_list += ", ";
-                into_list += ", ";
-            }
-            returned_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
-            into_list += ":r" + std::to_string(returned_columns.size() + 1);
-            returned_columns.push_back(columns[position]);
-        }
-        sql += " RETURNING " + returned_list + " INTO " + into_list;
+        auto returning = PlanReturning(op.table, columns, "INSERT");
+        sql += returning.clause;
+        returned_columns = std::move(returning.columns);
     }
     auto &insert = planner.Make<OracleInsertOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
                                                       std::move(source_indexes), std::move(bound_columns),
@@ -968,13 +1353,19 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
 }
 
 PhysicalOperator &PlanOracleDelete(ClientContext &, PhysicalPlanGenerator &planner, LogicalDelete &op,
-                                   PhysicalOperator &plan, OracleWriteTarget target) {
+                                   PhysicalOperator &plan, const std::vector<OracleColumn> &columns,
+                                   OracleWriteTarget target) {
+    auto sql = "DELETE FROM " + OracleObjectReference(target.schema_name, target.object_name) + " WHERE ROWID = " +
+               "CHARTOROWID(:1)";
+    std::vector<OracleColumn> returned_columns;
     if (op.return_chunk) {
-        throw NotImplementedException("Oracle DELETE does not support RETURNING yet");
+        // The rows as they were just before Oracle deleted them.
+        auto returning = PlanReturning(op.table, columns, "DELETE");
+        sql += returning.clause + "; :rc := SQL%ROWCOUNT";
+        returned_columns = std::move(returning.columns);
     }
-    const auto sql = "DELETE FROM " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " WHERE ROWID = " +
-                     "CHARTOROWID(:1)";
-    auto &deletion = planner.Make<OracleDeleteOperator>(op.types, op.estimated_cardinality, std::move(target), sql);
+    auto &deletion = planner.Make<OracleDeleteOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
+                                                        std::move(returned_columns));
     deletion.children.push_back(plan);
     return deletion;
 }
@@ -982,9 +1373,6 @@ PhysicalOperator &PlanOracleDelete(ClientContext &, PhysicalPlanGenerator &plann
 PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                    PhysicalOperator &plan, const std::vector<OracleColumn> &columns,
                                    OracleWriteTarget target) {
-    if (op.return_chunk) {
-        throw NotImplementedException("Oracle UPDATE does not support RETURNING yet");
-    }
     if (op.columns.size() != op.expressions.size()) {
         throw InternalException("Oracle UPDATE received %llu columns for %llu expressions",
                                static_cast<uint64_t>(op.columns.size()),
@@ -1013,17 +1401,25 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
         if (op.expressions[index]->GetExpressionType() != ExpressionType::BOUND_REF) {
             throw NotImplementedException("Oracle UPDATE cannot evaluate this SET expression");
         }
-        assignments += ":" + std::to_string(set_columns.size() + 1);
+        assignments += OracleBindExpression(columns[position], set_columns.size() + 1);
         source_indexes.push_back(op.expressions[index]->Cast<BoundReferenceExpression>().Index());
         set_columns.push_back(columns[position]);
     }
     if (assignments.empty()) {
         throw NotImplementedException("Oracle UPDATE needs at least one column to set");
     }
-    const auto sql = "UPDATE " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " SET " + assignments +
-                     " WHERE ROWID = CHARTOROWID(:" + std::to_string(set_columns.size() + 1) + ")";
+    auto sql = "UPDATE " + OracleObjectReference(target.schema_name, target.object_name) + " SET " + assignments +
+               " WHERE ROWID = CHARTOROWID(:" + std::to_string(set_columns.size() + 1) + ")";
+    std::vector<OracleColumn> returned_columns;
+    if (op.return_chunk) {
+        // The rows as Oracle stored them, which a trigger or DEFAULT may have changed.
+        auto returning = PlanReturning(op.table, columns, "UPDATE");
+        sql += returning.clause + "; :rc := SQL%ROWCOUNT";
+        returned_columns = std::move(returning.columns);
+    }
     auto &update = planner.Make<OracleUpdateOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
-                                                      std::move(source_indexes), std::move(set_columns));
+                                                      std::move(source_indexes), std::move(set_columns),
+                                                      std::move(returned_columns));
     update.children.push_back(plan);
     return update;
 }

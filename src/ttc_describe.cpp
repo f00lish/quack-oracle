@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_row_data.hpp"
 
 #include <limits>
 #include <vector>
@@ -135,16 +136,16 @@ OracleColumn DecodeColumnWithScale(ByteReader &reader, uint8_t field_version, bo
         }
     }
     if (field_version >= 24) {
-        reader.ReadUB4();
-        reader.ReadByte();
-        reader.ReadByte();
+        column.vector_dimensions = reader.ReadUB4();
+        column.vector_format = reader.ReadByte();
+        column.vector_flags = reader.ReadByte();
     }
     column.byte_width = column.oracle_type == 23 ? maximum_size : size;
     // The declared maximum, not the size field, is what says whether the column
     // carries bytes at all: NUMBER and DATE report size 0 while still sending a
     // value, and only a zero maximum means nothing is sent. A REF CURSOR is
     // never a ROW_DATA column, so it is excluded rather than reasoned about.
-    column.omitted_from_row_data = maximum_size == 0 && column.oracle_type != 102;
+    column.omitted_from_row_data = maximum_size == 0 && column.oracle_type != 102 && !IsOracleLongType(column.oracle_type);
     if (column.oracle_type == 102) {
         column.byte_width = 4;
     }

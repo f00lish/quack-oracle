@@ -54,6 +54,8 @@ void TnsPacketStream::Send(const TnsPacket &packet) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "outbound TNS packet exceeds configured limit");
     }
     WriteAll(stream, wire.data(), wire.size());
+    bytes_sent += wire.size();
+    awaiting_response = true;
 }
 
 void TnsPacketStream::Send(const std::vector<TnsPacket> &packets) {
@@ -69,6 +71,8 @@ void TnsPacketStream::Send(const std::vector<TnsPacket> &packets) {
         wire.insert(wire.end(), encoded.begin(), encoded.end());
     }
     WriteAll(stream, wire.data(), wire.size());
+    bytes_sent += wire.size();
+    awaiting_response = true;
 }
 
 TnsPacket TnsPacketStream::Receive() {
@@ -89,7 +93,15 @@ TnsPacket TnsPacketStream::Receive() {
     }
     wire.resize(declared_length);
     ReadExact(stream, wire.data() + TNS_PACKET_HEADER_SIZE, declared_length - TNS_PACKET_HEADER_SIZE);
+    bytes_received += wire.size();
+    if (awaiting_response.exchange(false)) {
+        round_trips++;
+    }
     return DecodeTnsPacket(wire, large_length, packet_limit);
+}
+
+TnsPacketStream::Statistics TnsPacketStream::GetStatistics() const {
+    return {bytes_sent.load(), bytes_received.load(), round_trips.load()};
 }
 
 } // namespace oracle_scanner

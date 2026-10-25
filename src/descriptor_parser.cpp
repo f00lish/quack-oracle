@@ -389,8 +389,7 @@ void ParseConnectData(const Node &connect_data, ParsedConnectDescriptor &result)
             continue;
         }
         if (key == "SID") {
-            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
-                                "Oracle descriptor SID is not supported; connect by SERVICE_NAME");
+            continue;
         }
         if (key == "FAILOVER_MODE") {
             // Transparent Application Failover. This client does not replay
@@ -403,7 +402,18 @@ void ParseConnectData(const Node &connect_data, ParsedConnectDescriptor &result)
         throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
                             "Oracle descriptor CONNECT_DATA element " + key + " is not supported");
     }
-    result.service_name = RequiredChild(connect_data, "SERVICE_NAME").value;
+    // One of the two names the database; both would be a descriptor that
+    // contradicts itself.
+    const auto *service = OptionalScalar(connect_data, "SERVICE_NAME");
+    const auto *sid = OptionalScalar(connect_data, "SID");
+    if (service && sid) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor names both SERVICE_NAME and SID");
+    }
+    if (sid) {
+        result.sid = sid->value;
+    } else {
+        result.service_name = RequiredChild(connect_data, "SERVICE_NAME").value;
+    }
     if (const auto *instance = OptionalScalar(connect_data, "INSTANCE_NAME")) {
         result.instance_name = instance->value;
     }
@@ -421,11 +431,6 @@ void ParseConnectData(const Node &connect_data, ParsedConnectDescriptor &result)
 }
 
 void CheckRoot(const Node &root) {
-    if (root.key == "DESCRIPTION_LIST") {
-        throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
-                            "Oracle DESCRIPTION_LIST is not supported; give a single DESCRIPTION with an "
-                            "ADDRESS_LIST instead");
-    }
     if (root.key != "DESCRIPTION" || !root.value.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor root must be DESCRIPTION");
     }
@@ -433,9 +438,79 @@ void CheckRoot(const Node &root) {
 
 } // namespace
 
+static ParsedConnectDescriptor ParseDescription(const Node &root);
+
 ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor) {
     auto root = Parser(descriptor).Parse();
-    CheckRoot(root);
+    if (root.key != "DESCRIPTION_LIST") {
+        CheckRoot(root);
+        return ParseDescription(root);
+    }
+    // A list of descriptions is read as one description whose address lists
+    // are theirs in order, which is how a client with a single connect-data
+    // can use it: every description has to name the same database, or the list
+    // would mean different connections and is refused. A description's own
+    // settings beyond that (its timeouts) are the first one's.
+    if (root.children.empty() || root.children.size() > MAX_CONNECT_ADDRESSES) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DESCRIPTION_LIST has an invalid number of descriptions");
+    }
+    bool list_failover = true;
+    bool list_load_balance = false;
+    ParsedConnectDescriptor merged;
+    bool first = true;
+    for (const auto &child : root.children) {
+        if (child.key == "FAILOVER") {
+            list_failover = ParseSwitch(child);
+            continue;
+        }
+        if (child.key == "LOAD_BALANCE") {
+            list_load_balance = ParseSwitch(child);
+            continue;
+        }
+        if (child.key != "DESCRIPTION" || !child.value.empty()) {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                                "Oracle DESCRIPTION_LIST element " + child.key + " is not supported");
+        }
+        auto part = ParseDescription(child);
+        if (first) {
+            merged = std::move(part);
+            first = false;
+            continue;
+        }
+        if (part.service_name != merged.service_name || part.sid != merged.sid ||
+            part.instance_name != merged.instance_name || part.server_type != merged.server_type ||
+            part.server_cert_dn != merged.server_cert_dn) {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                                "Oracle DESCRIPTION_LIST descriptions that name different databases, instances or "
+                                "certificate DNs are not supported");
+        }
+        merged.endpoints.insert(merged.endpoints.end(), part.endpoints.begin(), part.endpoints.end());
+        merged.address_lists.insert(merged.address_lists.end(), part.address_lists.begin(), part.address_lists.end());
+        if (!merged.retry_count) {
+            merged.retry_count = part.retry_count;
+        }
+        if (!merged.retry_delay_seconds) {
+            merged.retry_delay_seconds = part.retry_delay_seconds;
+        }
+        if (!merged.connect_timeout_seconds) {
+            merged.connect_timeout_seconds = part.connect_timeout_seconds;
+        }
+        if (!merged.transport_connect_timeout_seconds) {
+            merged.transport_connect_timeout_seconds = part.transport_connect_timeout_seconds;
+        }
+    }
+    if (first) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DESCRIPTION_LIST contains no DESCRIPTION");
+    }
+    if (merged.endpoints.size() > MAX_CONNECT_ADDRESSES) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor has an invalid number of addresses");
+    }
+    merged.failover = list_failover;
+    merged.load_balance = list_load_balance;
+    return merged;
+}
+
+static ParsedConnectDescriptor ParseDescription(const Node &root) {
     ParsedConnectDescriptor result;
     // Direct ADDRESS children form one implicit list, placed where the first
     // of them is and governed by the DESCRIPTION's own FAILOVER and
@@ -528,6 +603,7 @@ ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor) {
         config.host = endpoint.host;
         config.port = endpoint.port;
         config.service_name = result.service_name;
+        config.sid = result.sid;
         config.instance_name = result.instance_name;
         config.protocol = endpoint.protocol;
         ValidateConnectionConfig(config);
@@ -667,6 +743,203 @@ std::string FindTnsAliasDescriptor(const std::string &tnsnames, const std::strin
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle TNS alias was not found in wallet");
     }
     return result;
+}
+
+namespace {
+
+[[noreturn]] void EasyConnectError(const std::string &message) {
+    throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle Easy Connect string " + message);
+}
+
+bool IsEasyConnectWordChar(char character, const char *extra) {
+    const auto byte = static_cast<unsigned char>(character);
+    if (std::isalnum(byte)) {
+        return true;
+    }
+    for (const char *cursor = extra; *cursor; cursor++) {
+        if (*cursor == character) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RequireEasyConnectWord(const std::string &value, const char *extra, const char *what) {
+    if (value.empty() || value.size() > 255) {
+        EasyConnectError(std::string("has an empty or oversized ") + what);
+    }
+    for (const auto character : value) {
+        if (!IsEasyConnectWordChar(character, extra)) {
+            EasyConnectError(std::string("has an invalid character in the ") + what);
+        }
+    }
+}
+
+} // namespace
+
+bool IsEasyConnectString(const std::string &text) {
+    if (text.empty() || text[0] == '(') {
+        return false;
+    }
+    return text.find('/') != std::string::npos || text.find(':') != std::string::npos;
+}
+
+std::string EasyConnectToDescriptor(const std::string &input) {
+    if (input.empty() || input.size() > 4096) {
+        EasyConnectError("has an invalid size");
+    }
+    for (const auto character : input) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte <= 0x20 || byte > 0x7e) {
+            EasyConnectError("contains whitespace or a non-ASCII character");
+        }
+    }
+    auto rest = input;
+    std::string protocol = "TCP";
+    const auto scheme_end = rest.find("://");
+    if (scheme_end != std::string::npos) {
+        auto scheme = rest.substr(0, scheme_end);
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                       [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        if (scheme != "tcp" && scheme != "tcps") {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                                "Oracle Easy Connect protocol '" + scheme + "' is unsupported; only tcp and tcps are");
+        }
+        protocol = scheme == "tcps" ? "TCPS" : "TCP";
+        rest = rest.substr(scheme_end + 3);
+    } else if (rest.compare(0, 2, "//") == 0) {
+        rest = rest.substr(2);
+    }
+
+    std::string parameters;
+    const auto question = rest.find('?');
+    if (question != std::string::npos) {
+        parameters = rest.substr(question + 1);
+        rest = rest.substr(0, question);
+    }
+    const auto slash = rest.find('/');
+    if (slash == std::string::npos) {
+        EasyConnectError("names no service (expected host[:port]/service)");
+    }
+    const auto host_part = rest.substr(0, slash);
+    auto service_part = rest.substr(slash + 1);
+    std::string instance;
+    const auto instance_slash = service_part.find('/');
+    if (instance_slash != std::string::npos) {
+        instance = service_part.substr(instance_slash + 1);
+        service_part = service_part.substr(0, instance_slash);
+        RequireEasyConnectWord(instance, "_.-$#", "instance name");
+    }
+    std::string server;
+    const auto colon = service_part.find(':');
+    if (colon != std::string::npos) {
+        server = service_part.substr(colon + 1);
+        service_part = service_part.substr(0, colon);
+        RequireEasyConnectWord(server, "", "server type");
+    }
+    RequireEasyConnectWord(service_part, "_.-$#", "service name");
+
+    std::string addresses;
+    size_t count = 0;
+    size_t start = 0;
+    while (start <= host_part.size()) {
+        auto comma = host_part.find(',', start);
+        if (comma == std::string::npos) {
+            comma = host_part.size();
+        }
+        auto entry = host_part.substr(start, comma - start);
+        start = comma + 1;
+        if (++count > MAX_CONNECT_ADDRESSES) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle Easy Connect string names too many hosts");
+        }
+        std::string host;
+        std::string port = "1521";
+        if (!entry.empty() && entry[0] == '[') {
+            const auto close = entry.find(']');
+            if (close == std::string::npos) {
+                EasyConnectError("has an unterminated IPv6 address");
+            }
+            host = entry.substr(1, close - 1);
+            RequireEasyConnectWord(host, ":.", "IPv6 address");
+            const auto after = entry.substr(close + 1);
+            if (!after.empty()) {
+                if (after[0] != ':') {
+                    EasyConnectError("has text after an IPv6 address");
+                }
+                port = after.substr(1);
+            }
+        } else {
+            const auto port_colon = entry.find(':');
+            host = entry.substr(0, port_colon);
+            if (port_colon != std::string::npos) {
+                port = entry.substr(port_colon + 1);
+            }
+            RequireEasyConnectWord(host, "_.-", "host name");
+        }
+        RequireEasyConnectWord(port, "", "port");
+        for (const auto character : port) {
+            if (!std::isdigit(static_cast<unsigned char>(character))) {
+                EasyConnectError("has a port that is not a number");
+            }
+        }
+        addresses += "(ADDRESS=(PROTOCOL=" + protocol + ")(HOST=" + host + ")(PORT=" + port + "))";
+    }
+
+    // Parameters become the DESCRIPTION-level keys they are in a descriptor, so
+    // everything below is judged by the one parser, not by a second set of rules.
+    std::string description_keys;
+    std::string security;
+    size_t parameter_start = 0;
+    while (!parameters.empty() && parameter_start <= parameters.size()) {
+        auto amp = parameters.find('&', parameter_start);
+        if (amp == std::string::npos) {
+            amp = parameters.size();
+        }
+        const auto pair = parameters.substr(parameter_start, amp - parameter_start);
+        parameter_start = amp + 1;
+        const auto equals = pair.find('=');
+        if (equals == std::string::npos || equals == 0) {
+            EasyConnectError("has a parameter without a value");
+        }
+        auto key = pair.substr(0, equals);
+        auto value = pair.substr(equals + 1);
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+            value = value.substr(1, value.size() - 2);
+        }
+        if (key == "transport_connect_timeout" || key == "connect_timeout" || key == "retry_count" ||
+            key == "retry_delay" || key == "failover" || key == "load_balance" || key == "expire_time" ||
+            key == "sdu") {
+            RequireEasyConnectWord(value, "", "parameter value");
+            std::string upper = key;
+            std::transform(upper.begin(), upper.end(), upper.begin(),
+                           [](unsigned char character) { return static_cast<char>(std::toupper(character)); });
+            description_keys += "(" + upper + "=" + value + ")";
+        } else if (key == "ssl_server_dn_match") {
+            RequireEasyConnectWord(value, "", "parameter value");
+            security += "(SSL_SERVER_DN_MATCH=" + value + ")";
+        } else if (key == "ssl_server_cert_dn") {
+            if (value.empty() || value.size() > 1024 || value.find_first_of("\"()\\%") != std::string::npos) {
+                EasyConnectError("has an unusable ssl_server_cert_dn");
+            }
+            security += "(SSL_SERVER_CERT_DN=\"" + value + "\")";
+        } else {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                                "Oracle Easy Connect parameter '" + key + "' is not supported");
+        }
+    }
+
+    std::string connect_data = "(CONNECT_DATA=(SERVICE_NAME=" + service_part + ")";
+    if (!server.empty()) {
+        connect_data += "(SERVER=" + server + ")";
+    }
+    if (!instance.empty()) {
+        connect_data += "(INSTANCE_NAME=" + instance + ")";
+    }
+    connect_data += ")";
+    return "(DESCRIPTION=" + description_keys + addresses + connect_data +
+           (security.empty() ? std::string() : "(SECURITY=" + security + ")") + ")";
 }
 
 } // namespace oracle_scanner

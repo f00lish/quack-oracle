@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
 #include "oracle_scanner/ttc_row_data.hpp"
 
@@ -84,8 +85,13 @@ TtcCallResponse DecodeTtcCallResponse(const std::vector<uint8_t> &message, const
             offset++;
             result.completed = true;
             break;
+        case TTC_MESSAGE_SERVER_PIGGYBACK:
+            // The server reporting session state it changed; nothing in it is a result.
+            offset += SkippedTtcServerPiggybackBytes(tail.data(), tail.size());
+            break;
         default:
-            throw ProtocolError(ProtocolErrorKind::MALFORMED, "unknown TTC message in PL/SQL response");
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                "unknown TTC message " + std::to_string(tail.front()) + " in PL/SQL response");
         }
     }
     result.bytes_consumed = offset;

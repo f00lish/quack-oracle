@@ -145,7 +145,7 @@ std::string ConnectionTargetKey(const ConnectionConfig &config) {
         result << ']';
     }
     const auto &routing = config.routing;
-    result << '/' << config.service_name << '/' << config.instance_name << '/' << Upper(config.server_type) << '/'
+    result << '/' << config.service_name << "/sid=" << config.sid << '/' << config.instance_name << '/' << Upper(config.server_type) << '/'
            << (routing.failover ? 'F' : 'f') << (routing.load_balance ? 'L' : 'l') << '/' << routing.retry_count << '/'
            << routing.retry_delay_seconds << '/' << routing.connect_budget_seconds << '/'
            << config.connect_timeout_seconds;
@@ -157,9 +157,12 @@ void ValidateConnectionConfig(const ConnectionConfig &config) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle host or TLS name exceeds the supported size");
     }
     ValidateAddresses(config);
-    if (!IsDescriptorAtom(config.service_name)) {
+    if (config.service_name.empty() == config.sid.empty()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle needs exactly one of a service name and a SID");
+    }
+    if (!IsDescriptorAtom(config.service_name.empty() ? config.sid : config.service_name)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,
-                            "Oracle service name is empty or contains descriptor syntax");
+                            "Oracle service name or SID is empty or contains descriptor syntax");
     }
     if (config.connection_id.size() > 128 || config.connection_id.find_first_of("()\0") != std::string::npos) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle connection id contains descriptor syntax");
@@ -195,6 +198,16 @@ static std::string BuildDescriptor(const ConnectionConfig &config, const Connect
     // host, and the connect data names the client identity before the
     // service. A listener answers the descriptor shape it knows, and
     // ojdbc8's is the shape proven against this 11.2.
+    //
+    // The protocol name is written in upper case because the extension's own
+    // descriptor parser (descriptor_parser.cpp) compares it that way, and
+    // ojdbc8 writes it that way too. The listener reads the keyword and its
+    // value case-insensitively, so this is the one spelling that both the
+    // parser and the 19c listener accept.
+    //
+    // The service is named the way the secret asked for it: SERVICE_NAME for
+    // a service, SID for a SID. Upstream v0.6.0 added the SID form; the
+    // 11.2 branch added the ordering above, and the two are independent.
     result << "(DESCRIPTION=(ADDRESS=(PROTOCOL="
            << (address.protocol == TransportProtocol::TCPS ? "TCPS" : "TCP") << ")(PORT=" << address.port << ")(HOST="
            << address.host << "))(CONNECT_DATA=";
@@ -202,7 +215,7 @@ static std::string BuildDescriptor(const ConnectionConfig &config, const Connect
         result << "(CID=(PROGRAM=" << identity.program << ")(HOST=" << identity.machine << ")(USER=" << identity.os_user
                << "))";
     }
-    result << "(SERVICE_NAME=" << config.service_name << ')';
+    result << (config.sid.empty() ? "SERVICE_NAME=" + config.service_name : "SID=" + config.sid) << ')';
     if (!config.instance_name.empty()) {
         result << "(INSTANCE_NAME=" << config.instance_name << ')';
     }

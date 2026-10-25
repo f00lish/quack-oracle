@@ -1,12 +1,23 @@
 #include "oracle_io_deadline.hpp"
+#include <algorithm>
+#include <chrono>
+#include <set>
+#include <unordered_map>
 #include <condition_variable>
 #include <thread>
 #include "oracle_adapter.hpp"
+
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 
 #include "oracle_scanner/auth_crypto.hpp"
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/call_builder.hpp"
 #include "oracle_scanner/descriptor_parser.hpp"
+#include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/sql_statement.hpp"
@@ -19,6 +30,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -277,8 +289,62 @@ struct OracleCloseCallGlobalState final : GlobalTableFunctionState {
 std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const char *function_name);
 std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, const char *function_name);
 
+// The parameter types the attached catalog writes but that have no Oracle
+// counterpart of their own spelling: they go through the one encoder a column
+// write uses, so a value means the same in a query parameter as in an INSERT.
+// Returns false for a type that is not one of them.
+bool ExtraBind(const Value &value, const std::string &name, oracle_scanner::OracleBind &bind) {
+    OracleColumn column;
+    column.name = "parameter " + name;
+    Value effective = value;
+    switch (value.type().id()) {
+    case LogicalTypeId::BOOLEAN:
+        column.oracle_type = 252;
+        break;
+    case LogicalTypeId::INTERVAL: {
+        // Months alone are a year-to-month interval; days and time a day-to-second one.
+        const auto interval = value.GetValue<interval_t>();
+        column.oracle_type = interval.days == 0 && interval.micros == 0 && interval.months != 0 ? 182 : 183;
+        break;
+    }
+    case LogicalTypeId::TIMESTAMP_TZ:
+        // An instant: bound as the TIMESTAMP of its UTC wall time, which the
+        // UTC session turns back into the same instant.
+        column.oracle_type = 231;
+        break;
+    case LogicalTypeId::TIMESTAMP_NS:
+        column.oracle_type = 180;
+        break;
+    case LogicalTypeId::TIMESTAMP_MS:
+    case LogicalTypeId::TIMESTAMP_SEC:
+        column.oracle_type = 180;
+        effective = value.DefaultCastAs(LogicalType::TIMESTAMP);
+        break;
+    case LogicalTypeId::HUGEINT:
+    case LogicalTypeId::UHUGEINT:
+        column.oracle_type = 2;
+        break;
+    default:
+        return false;
+    }
+    bind = OracleBindForColumn(effective, column, name);
+    return true;
+}
+
 std::optional<uint16_t> OracleInputType(LogicalTypeId type) {
     switch (type) {
+    case LogicalTypeId::BOOLEAN:
+        return 252;
+    case LogicalTypeId::INTERVAL:
+        return 183;
+    case LogicalTypeId::TIMESTAMP_TZ:
+    case LogicalTypeId::TIMESTAMP_NS:
+    case LogicalTypeId::TIMESTAMP_MS:
+    case LogicalTypeId::TIMESTAMP_SEC:
+        return 180;
+    case LogicalTypeId::HUGEINT:
+    case LogicalTypeId::UHUGEINT:
+        return 2;
     case LogicalTypeId::VARCHAR:
         return 1;
     case LogicalTypeId::DATE:
@@ -399,6 +465,8 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
                    type == LogicalTypeId::UINTEGER || type == LogicalTypeId::UBIGINT || type == LogicalTypeId::DECIMAL) {
             binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 2, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleNumber(values[index].ToString())});
+        } else if (oracle_scanner::OracleBind extra; ExtraBind(values[index], std::to_string(index + 1), extra)) {
+            binds.push_back(std::move(extra));
         } else {
             throw BinderException("%s parameter %llu has unsupported DuckDB type %s", function_name, index + 1,
                                   values[index].type().ToString());
@@ -483,6 +551,8 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
                                   {year, static_cast<uint8_t>(month), static_cast<uint8_t>(day),
                                    static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(second),
                                   static_cast<uint32_t>(microseconds) * 1000U}, false)});
+        } else if (oracle_scanner::OracleBind extra; ExtraBind(argument, name, extra)) {
+            binds.push_back(std::move(extra));
         } else if (argument.type().IsNumeric()) {
             binds.push_back(oracle_scanner::OracleBind {name, 2, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleNumber(argument.ToString())});
@@ -532,13 +602,23 @@ std::vector<oracle_scanner::OracleBind> CallArguments(const Value &value) {
         // The value encoding is shared with the signature-driven path so the
         // two cannot disagree about what a value means.
         auto encoded = EncodeOracleCallableArgument(type, bind_direction, value_child, name, "oracle_call_named");
-        result.push_back({name, encoded.oracle_type, bind_direction, std::move(encoded.value), encoded.maximum_bytes});
+        result.push_back({name, encoded.oracle_type, bind_direction, std::move(encoded.value), encoded.maximum_bytes,
+                          encoded.character_set_form});
     }
     if (result.empty()) {
         throw BinderException("oracle_call_named requires at least one argument");
     }
     return result;
 }
+
+// Runs the statement to describe it, as oracle_query does, and returns the bind
+// data a scan then reads from. Shared by every function that is a SELECT with
+// a generated or supplied text.
+unique_ptr<FunctionData> BindOracleSelect(ClientContext &context, const std::string &secret_name,
+                                          const std::string &sql,
+                                          const std::function<std::vector<oracle_scanner::OracleBind>()> &make_binds,
+                                          vector<LogicalType> &return_types, vector<Identifier> &names,
+                                          bool transactional);
 
 unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<Identifier> &names,
@@ -548,6 +628,16 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     }
     const auto secret_name = input.inputs[0].GetValue<std::string>();
     const auto sql = input.inputs[1].GetValue<std::string>();
+    return BindOracleSelect(
+        context, secret_name, sql, [&] { return ParameterBinds(input, "oracle_query"); }, return_types, names,
+        transactional);
+}
+
+unique_ptr<FunctionData> BindOracleSelect(ClientContext &context, const std::string &secret_name,
+                                          const std::string &sql,
+                                          const std::function<std::vector<oracle_scanner::OracleBind>()> &make_binds,
+                                          vector<LogicalType> &return_types, vector<Identifier> &names,
+                                          bool transactional) {
     std::string password;
     // The secret is validated before the SQL, as it was before the transactional
     // form shared this bind: a misconfigured secret is reported for what it is.
@@ -555,7 +645,7 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     if (!transactional) {
         config = ConnectionFromSecret(context, secret_name, password);
     }
-    const auto binds = ParameterBinds(input, "oracle_query");
+    const auto binds = make_binds();
     oracle_scanner::ValidateOracleQuery(sql, binds);
     auto result = make_uniq<OracleQueryBindData>();
     result->secret_name = secret_name;
@@ -596,6 +686,7 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     if (result->columns.empty()) {
         throw BinderException("oracle_query received no described Oracle columns");
     }
+    ApplyUnconstrainedNumberSetting(context, result->columns);
     std::unordered_set<std::string> used_names;
     for (idx_t index = 0; index < result->columns.size(); index++) {
         names.push_back(Identifier(OutputName(result->columns[index], index, used_names)));
@@ -617,6 +708,169 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
 unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
     return OracleQueryBindCommon(context, input, return_types, names, false);
+}
+
+// oracle_vector_search: the rows of a table nearest to a query vector, found by
+// Oracle with VECTOR_DISTANCE so a vector index is used when the table has one,
+// and only the k rows come back.
+//
+// A name written without quotes is an Oracle name, so it is read in upper case,
+// as Oracle would read it; a name in double quotes is kept as written.
+std::string VectorSearchIdentifier(const Value &value, const char *what) {
+    if (value.IsNull()) {
+        throw BinderException("oracle_vector_search %s cannot be NULL", what);
+    }
+    auto text = value.GetValue<std::string>();
+    if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+        return text.substr(1, text.size() - 2);
+    }
+    return StringUtil::Upper(text);
+}
+
+struct VectorSearchTarget {
+    std::string owner; // empty: the connected user's
+    std::string name;
+};
+
+VectorSearchTarget VectorSearchTable(const Value &value) {
+    // OWNER.TABLE, each part by the same rule.
+    auto text = value.IsNull() ? std::string() : value.GetValue<std::string>();
+    if (text.empty()) {
+        throw BinderException("oracle_vector_search table cannot be empty");
+    }
+    const auto dot = text.find('.');
+    if (dot != std::string::npos && text.front() != '"') {
+        return {StringUtil::Upper(text.substr(0, dot)),
+                VectorSearchIdentifier(Value(text.substr(dot + 1)), "table")};
+    }
+    return {std::string(), VectorSearchIdentifier(value, "table")};
+}
+
+std::string SqlLiteral(const std::string &text) {
+    std::string result = "'";
+    for (const auto character : text) {
+        result += character == '\'' ? std::string("''") : std::string(1, character);
+    }
+    return result + "'";
+}
+
+// The storage format the column declares (FLOAT32, FLOAT64, INT8 or BINARY), from
+// the dictionary's VECTOR_INFO, or 0 when it cannot be read or says `*`. Oracle
+// will not compare vectors of different formats, so the query vector has to be
+// sent in the column's own.
+uint8_t VectorColumnFormat(const ConnectionConfig &config, const std::string &password, const VectorSearchTarget &table,
+                           const std::string &column) {
+    try {
+        auto session = OpenOracleSession(config, password);
+        const auto view = table.owner.empty() ? "user_tab_cols" : "all_tab_cols";
+        const auto sql = std::string("SELECT vector_info FROM ") + view + " WHERE table_name = " + SqlLiteral(table.name) +
+                         " AND column_name = " + SqlLiteral(column) +
+                         (table.owner.empty() ? std::string() : " AND owner = " + SqlLiteral(table.owner));
+        auto cursor = session->Query(sql, {});
+        std::string info;
+        for (;;) {
+            const auto batch = cursor->Fetch(8);
+            for (const auto &row : batch.rows) {
+                if (!row.empty() && row[0]) {
+                    info.assign(row[0]->begin(), row[0]->end());
+                }
+            }
+            if (batch.exhausted) {
+                break;
+            }
+        }
+        cursor->Close();
+        session->Close();
+        info = StringUtil::Upper(info);
+        if (info.find("FLOAT32") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_FLOAT32;
+        }
+        if (info.find("FLOAT64") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_FLOAT64;
+        }
+        if (info.find("INT8") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_INT8;
+        }
+        if (info.find("BINARY") != std::string::npos) {
+            return oracle_scanner::ORACLE_VECTOR_BINARY;
+        }
+    } catch (const std::exception &) {
+        // A server without VECTOR_INFO has no vector column to search either, and
+        // the search itself then says so in Oracle's words.
+    }
+    return 0;
+}
+
+unique_ptr<FunctionData> OracleVectorSearchBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
+    if (input.inputs[0].IsNull()) {
+        throw BinderException("oracle_vector_search secret cannot be NULL");
+    }
+    const auto secret_name = input.inputs[0].GetValue<std::string>();
+    const auto target = VectorSearchTable(input.inputs[1]);
+    const auto table = (target.owner.empty() ? std::string()
+                                             : KeywordHelper::WriteQuotedAndEscaped(target.owner, '"') + ".") +
+                       KeywordHelper::WriteQuotedAndEscaped(target.name, '"');
+    const auto column_name = VectorSearchIdentifier(input.inputs[2], "column");
+    const auto column = KeywordHelper::WriteQuotedAndEscaped(column_name, '"');
+    const auto &query = input.inputs[3];
+    if (query.IsNull() || (query.type().id() != LogicalTypeId::LIST && query.type().id() != LogicalTypeId::ARRAY)) {
+        throw BinderException("oracle_vector_search query vector must be a list or array of numbers");
+    }
+    int64_t k = 10;
+    std::string metric = "COSINE";
+    bool approximate = true;
+    for (const auto &parameter : input.named_parameters) {
+        const auto &key = static_cast<const std::string &>(parameter.first);
+        if (parameter.second.IsNull()) {
+            throw BinderException("oracle_vector_search %s cannot be NULL", key);
+        }
+        if (key == "k") {
+            k = parameter.second.GetValue<int64_t>();
+        } else if (key == "metric") {
+            metric = StringUtil::Upper(parameter.second.GetValue<std::string>());
+        } else if (key == "approximate") {
+            approximate = parameter.second.GetValue<bool>();
+        }
+    }
+    if (k < 1 || k > 100000) {
+        throw BinderException("oracle_vector_search k must be between 1 and 100000");
+    }
+    // Words, not text from the caller: the metric goes into the statement.
+    static const char *const METRICS[] = {"COSINE", "EUCLIDEAN", "EUCLIDEAN_SQUARED", "DOT", "MANHATTAN", "HAMMING"};
+    bool known = false;
+    for (const auto *candidate : METRICS) {
+        known = known || metric == candidate;
+    }
+    if (!known) {
+        throw BinderException("oracle_vector_search metric must be COSINE, EUCLIDEAN, EUCLIDEAN_SQUARED, DOT, "
+                              "MANHATTAN or HAMMING, not '%s'",
+                              metric);
+    }
+    // The query vector is bound as the image Oracle stores, in the column's own
+    // format: Oracle will not compare vectors of two. When the column does not
+    // say (a `*` format), FLOAT32 if the caller's numbers are FLOAT, else FLOAT64.
+    OracleColumn vector_column;
+    vector_column.name = "query vector";
+    vector_column.oracle_type = 127;
+    const auto element_type = query.type().id() == LogicalTypeId::LIST ? ListType::GetChildType(query.type())
+                                                                       : ArrayType::GetChildType(query.type());
+    std::string password;
+    const auto config = ConnectionFromSecret(context, secret_name, password);
+    vector_column.vector_format = VectorColumnFormat(config, password, target, column_name);
+    if (vector_column.vector_format == 0) {
+        vector_column.vector_format = element_type.id() == LogicalTypeId::FLOAT
+                                          ? oracle_scanner::ORACLE_VECTOR_FLOAT32
+                                          : oracle_scanner::ORACLE_VECTOR_FLOAT64;
+    }
+    std::vector<oracle_scanner::OracleBind> binds {OracleBindForColumn(query, vector_column, "1")};
+    const auto distance = "VECTOR_DISTANCE(t." + column + ", :1, " + metric + ")";
+    // ORDER BY the alias: the expression is the same one, and naming it twice
+    // would make the statement carry the vector twice.
+    const auto sql = "SELECT t.*, " + distance + " AS \"DISTANCE\" FROM " + table + " t ORDER BY \"DISTANCE\" FETCH " +
+                     (approximate ? "APPROX " : "") + "FIRST " + std::to_string(k) + " ROWS ONLY";
+    return BindOracleSelect(
+        context, secret_name, sql, [&] { return binds; }, return_types, names, false);
 }
 
 unique_ptr<FunctionData> OracleTransactionQueryBind(ClientContext &context, TableFunctionBindInput &input,
@@ -1494,6 +1748,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
             result_bind.direction = oracle_scanner::BindDirection::BIND_OUT;
             result_bind.oracle_type = argument.oracle_type;
             result_bind.maximum_bytes = argument.maximum_bytes;
+            result_bind.character_set_form = argument.bind_type_name == "nvarchar" ? 2 : 0;
             return_bind = std::move(result_bind);
             continue;
         }
@@ -1506,7 +1761,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
         auto encoded = EncodeOracleCallableArgument(argument.bind_type_name, argument.direction,
                                                     bind.values[value_index++], argument.name, "oracle_call_auto");
         arguments.push_back({argument.name, encoded.oracle_type, argument.direction, std::move(encoded.value),
-                             encoded.maximum_bytes});
+                             encoded.maximum_bytes, encoded.character_set_form});
     }
     if (value_index != bind.values.size()) {
         throw BinderException("oracle_call_auto: %s takes %llu arguments but %llu values were supplied", bind.callable,
@@ -1546,7 +1801,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
                     throw BinderException("oracle_call_auto return value disagrees with Oracle response");
                 }
                 if (result.outputs[0].value) {
-                    return_row.value = FormatCallScalar(return_bind->oracle_type, *result.outputs[0].value);
+                    return_row.value = FormatCallScalar(return_bind->oracle_type, *result.outputs[0].value, return_bind->character_set_form);
                 }
                 scalar_index = 1;
             }
@@ -1572,7 +1827,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
                 }
                 const auto &output = result.outputs[scalar_index++];
                 if (output.value) {
-                    row.value = FormatCallScalar(argument.oracle_type, *output.value);
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
                 }
             }
             rows.push_back(std::move(row));
@@ -1894,7 +2149,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
             OracleCallNamedRow row;
             row.name = argument.name;
             const auto &value = result.outputs[position++].value;
-            if (value) { row.value = FormatCallScalar(argument.oracle_type, *value); }
+            if (value) { row.value = FormatCallScalar(argument.oracle_type, *value, argument.character_set_form); }
             rows.emplace_back(std::move(row));
         }
         if (position != result.outputs.size()) {
@@ -1921,6 +2176,227 @@ void OracleTransactionCallFunction(ClientContext &, TableFunctionInput &input, D
     }
     output.SetChildCardinality(count);
     state.next_row += count;
+}
+
+// Anonymous PL/SQL blocks. The binds are the same STRUCT(name, direction, type,
+// value) oracle_call_named takes, matched to the block's `:name` placeholders
+// by name; the rows that come back are the OUT and IN OUT ones, in the order
+// the block first mentions them.
+std::vector<oracle_scanner::OracleBind> PlsqlArguments(TableFunctionBindInput &input, const char *function_name) {
+    if (input.inputs.size() < 3 || input.inputs[2].IsNull()) {
+        return {};
+    }
+    const auto &value = input.inputs[2];
+    if (value.type().id() == LogicalTypeId::LIST && ListValue::GetChildren(value).empty()) {
+        return {};
+    }
+    try {
+        return CallArguments(value);
+    } catch (const std::exception &error) {
+        throw BinderException("%s binds are invalid: %s", function_name, error.what());
+    }
+}
+
+// Validates the block and its binds together and returns the binds in the order
+// the block mentions them, which is the order the server returns the outputs in.
+std::vector<oracle_scanner::OracleBind> OrderedPlsqlArguments(const std::string &block,
+                                                              const std::vector<oracle_scanner::OracleBind> &arguments,
+                                                              const char *function_name) {
+    try {
+        oracle_scanner::OracleCallRequest request;
+        request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+        request.block = block;
+        request.arguments = arguments;
+        const auto normalized = oracle_scanner::BuildOracleCallBlock(request);
+        return oracle_scanner::OrderOracleStatementBinds(normalized, arguments, oracle_scanner::OracleBindUse::CALL);
+    } catch (const std::exception &error) {
+        throw BinderException("%s: %s", function_name, error.what());
+    }
+}
+
+struct OraclePlsqlBindData final : TableFunctionData {
+    ConnectionConfig config;
+    std::string password;
+    std::string block;
+    std::vector<oracle_scanner::OracleBind> arguments;
+};
+
+unique_ptr<FunctionData> OraclePlsqlBind(ClientContext &context, TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+        throw BinderException("oracle_plsql secret and block cannot be NULL");
+    }
+    auto result = make_uniq<OraclePlsqlBindData>();
+    result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
+    result->block = input.inputs[1].GetValue<std::string>();
+    result->arguments = OrderedPlsqlArguments(result->block, PlsqlArguments(input, "oracle_plsql"), "oracle_plsql");
+    names = {"name", "value", "cursor_handle"};
+    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OraclePlsqlInit(ClientContext &context, TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OraclePlsqlBindData>();
+    try {
+        auto session = std::shared_ptr<OracleSession>(OpenOracleSession(bind.config, bind.password));
+        oracle_scanner::OracleCallRequest request;
+        request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+        request.block = bind.block;
+        request.arguments = bind.arguments;
+        auto result = session->Call(request);
+        if (!result.implicit_cursors.empty()) {
+            for (auto &cursor : result.explicit_cursors) {
+                cursor->Close();
+            }
+            for (auto &cursor : result.implicit_cursors) {
+                cursor->Close();
+            }
+            throw BinderException("oracle_plsql does not return implicit result sets; bind a REF CURSOR instead");
+        }
+        std::vector<OracleCallNamedRow> rows;
+        std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
+        std::vector<idx_t> cursor_rows;
+        size_t scalar_index = 0;
+        size_t cursor_index = 0;
+        for (const auto &argument : bind.arguments) {
+            if (argument.direction == oracle_scanner::BindDirection::BIND_IN) {
+                continue;
+            }
+            OracleCallNamedRow row;
+            row.name = argument.name;
+            if (argument.oracle_type == oracle_scanner::ORACLE_WIRE_TYPE_CURSOR) {
+                if (cursor_index >= result.explicit_cursors.size()) {
+                    throw BinderException("oracle_plsql cursor output count disagrees with Oracle response");
+                }
+                owned.emplace_back(
+                    std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
+                cursor_rows.push_back(rows.size());
+            } else {
+                if (scalar_index >= result.outputs.size() ||
+                    result.outputs[scalar_index].oracle_type != argument.oracle_type) {
+                    throw BinderException("oracle_plsql scalar output count disagrees with Oracle response");
+                }
+                const auto &output = result.outputs[scalar_index++];
+                if (output.value) {
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
+                }
+            }
+            rows.push_back(std::move(row));
+        }
+        if (scalar_index != result.outputs.size() || cursor_index != result.explicit_cursors.size()) {
+            throw BinderException("oracle_plsql received unexpected Oracle output values");
+        }
+        // Like oracle_execute, the work is the caller's to keep: a block that
+        // succeeded is committed, and one that failed is rolled back with the
+        // session. A block that commits or rolls back itself has already said so.
+        session->Commit();
+        if (!owned.empty()) {
+            const auto handles = CallRegistryFor(context).Register(std::move(owned));
+            for (idx_t index = 0; index < handles.size(); index++) {
+                rows[cursor_rows[index]].cursor_handle = oracle_scanner::FormatCursorHandle(handles[index]);
+            }
+        }
+        return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
+    } catch (const std::exception &error) {
+        throw IOException("oracle_plsql failed: %s", error.what());
+    }
+}
+
+struct OracleTransactionPlsqlBindData final : TableFunctionData {
+    std::string catalog_name;
+    std::string block;
+    std::vector<oracle_scanner::OracleBind> arguments;
+};
+
+unique_ptr<FunctionData> OracleTransactionPlsqlBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
+    if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+        throw BinderException("oracle_plsql_transaction catalog and block cannot be NULL");
+    }
+    auto result = make_uniq<OracleTransactionPlsqlBindData>();
+    result->block = input.inputs[1].GetValue<std::string>();
+    auto arguments = PlsqlArguments(input, "oracle_plsql_transaction");
+    if (arguments.size() > 64) {
+        throw BinderException("oracle_plsql_transaction takes at most 64 binds");
+    }
+    size_t bytes = 0;
+    for (const auto &bind : arguments) {
+        if (bind.oracle_type == oracle_scanner::ORACLE_WIRE_TYPE_CURSOR) {
+            throw BinderException("oracle_plsql_transaction cannot return cursors; use oracle_plsql");
+        }
+        if (bind.value && bind.value->size() > 32767) {
+            throw BinderException("oracle_plsql_transaction scalar value exceeds 32767 bytes");
+        }
+        AddTransactionBindBytes(bytes, bind.name.size());
+        AddTransactionBindBytes(bytes, bind.value ? bind.value->size() : 0);
+        if (bind.direction != oracle_scanner::BindDirection::BIND_IN) {
+            AddTransactionBindBytes(bytes, bind.maximum_bytes);
+        }
+    }
+    result->arguments = OrderedPlsqlArguments(result->block, arguments, "oracle_plsql_transaction");
+    auto target = ResolveOracleWriteTarget(context, input.inputs[0].GetValue<std::string>());
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot run PL/SQL through an attached read-only Oracle catalog");
+    }
+    result->catalog_name = target.catalog_name;
+    names = {"name", "value"};
+    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+    return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OracleTransactionPlsqlInit(ClientContext &context, TableFunctionInitInput &input) {
+    const auto &bind = input.bind_data->Cast<OracleTransactionPlsqlBindData>();
+    auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
+    if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
+        throw TransactionException("Cannot run PL/SQL through an attached read-only Oracle catalog");
+    }
+    OracleCallerInterruptScope interrupt(context);
+    try {
+        auto &session = TransactionSession(context, target);
+        // A block can change package state, NLS or the current schema of the
+        // session itself; the session ends closed rather than reused.
+        TaintTransactionSession(context, target.catalog_name);
+        oracle_scanner::OracleCallRequest request;
+        request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+        request.block = bind.block;
+        request.arguments = bind.arguments;
+        auto result = session.Call(request);
+        if (!result.explicit_cursors.empty() || !result.implicit_cursors.empty()) {
+            for (auto &cursor : result.explicit_cursors) {
+                cursor->Close();
+            }
+            for (auto &cursor : result.implicit_cursors) {
+                cursor->Close();
+            }
+            throw BinderException("oracle_plsql_transaction cannot return cursors");
+        }
+        std::vector<OracleCallNamedRow> rows;
+        size_t position = 0;
+        for (const auto &argument : bind.arguments) {
+            if (argument.direction == oracle_scanner::BindDirection::BIND_IN) {
+                continue;
+            }
+            if (position == result.outputs.size() || result.outputs[position].oracle_type != argument.oracle_type) {
+                throw BinderException("oracle_plsql_transaction output shape mismatch");
+            }
+            OracleCallNamedRow row;
+            row.name = argument.name;
+            const auto &value = result.outputs[position++].value;
+            if (value) {
+                row.value = FormatCallScalar(argument.oracle_type, *value, argument.character_set_form);
+            }
+            rows.emplace_back(std::move(row));
+        }
+        if (position != result.outputs.size()) {
+            throw BinderException("oracle_plsql_transaction has unexpected outputs");
+        }
+        interrupt.Check();
+        return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
+    } catch (const std::exception &error) {
+        interrupt.Stop();
+        PoisonTransactionSession(context, target.catalog_name);
+        ThrowOracleAdapterError("oracle_plsql_transaction failed", error);
+    }
 }
 
 unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context, TableFunctionInitInput &input) {
@@ -1958,7 +2434,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context,
                 }
                 const auto &output = result.outputs[scalar_index++];
                 if (output.value) {
-                    row.value = FormatCallScalar(argument.oracle_type, *output.value);
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
                 }
             }
             rows.push_back(std::move(row));
@@ -2075,7 +2551,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
                 std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
             cursor_rows.push_back(rows.size());
         } else if (result.outputs[0].value) {
-            return_row.value = FormatCallScalar(bind.return_bind.oracle_type, *result.outputs[0].value);
+            return_row.value = FormatCallScalar(bind.return_bind.oracle_type, *result.outputs[0].value, bind.return_bind.character_set_form);
         }
         rows.push_back(std::move(return_row));
         for (const auto &argument : bind.arguments) {
@@ -2096,7 +2572,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
                 }
                 const auto &output = result.outputs[scalar_index++];
                 if (output.value) {
-                    row.value = FormatCallScalar(argument.oracle_type, *output.value);
+                    row.value = FormatCallScalar(argument.oracle_type, *output.value, argument.character_set_form);
                 }
             }
             rows.push_back(std::move(row));
@@ -2170,8 +2646,118 @@ unique_ptr<GlobalTableFunctionState> OracleCursorInit(ClientContext &, TableFunc
 
 } // namespace
 
+// DuckDB hands a scan a system sample only when the scan has said it takes one
+// and there are no filters (a sample is taken before a filter, not after). A
+// percentage maps to the same percentage of Oracle's rows, or of its blocks for
+// a table big enough to have thousands of them: block sampling reads a fraction
+// of the table but takes whole runs of blocks at a time, so on a table of a few
+// hundred thousand rows the same 1% came back as 0 rows in some runs and 3%
+// in others. Row sampling reads every block and sends back only the sample. A row count arrives
+// as the rate DuckDB worked out from the table's estimated size, doubled: block
+// sampling is lumpy, and DuckDB puts a LIMIT of the requested rows on top, so
+// a few too many rows cost nothing and too few would.
+std::string OracleSampleClause(optional_ptr<SampleOptions> options, const std::optional<uint64_t> &estimated_rows) {
+	if (!options || options->method != SampleMethod::SYSTEM_SAMPLE) {
+		return std::string();
+	}
+	double percent;
+	if (options->is_percentage) {
+		percent = options->sample_size.GetValue<double>();
+	} else {
+		if (options->sample_rate < 0) {
+			return std::string();
+		}
+		percent = options->sample_rate * 100.0 * 2.0;
+	}
+	if (percent >= 100.0) {
+		return std::string();
+	}
+	percent = MaxValue<double>(percent, 0.000001);
+	char text[64];
+	std::snprintf(text, sizeof(text), "%.6f", percent);
+	// Sampling by block starts to pay, and its lumpiness to average out, in the
+	// tens of millions of rows.
+	constexpr uint64_t BLOCK_SAMPLING_ROWS = 20000000;
+	const bool by_block = estimated_rows && *estimated_rows >= BLOCK_SAMPLING_ROWS;
+	std::string clause = std::string(by_block ? " SAMPLE BLOCK (" : " SAMPLE (") + text + ")";
+	if (options->repeatable && options->seed.IsValid()) {
+		clause += " SEED (" + std::to_string(static_cast<uint64_t>(options->GetSeed()) % 4294967296ULL) + ")";
+	}
+	return clause;
+}
+
+// Below this many rows (NUM_ROWS) an automatic parallel scan is not tried: the
+// plan costs a few dictionary queries and a connection of its own.
+constexpr uint64_t AUTOMATIC_PARALLEL_MINIMUM_ROWS = 500000;
+
+static bool DeferrableColumn(const OracleColumn &column);
+
+// Runs the statement an AGGREGATE was replaced with. The result columns are
+// the plan's contract (declared when the optimizer rewrote it); Oracle's describe
+// supplies the wire representation and has to map to the same types.
+unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
+                                                         TableFunctionInitInput &input) {
+    OracleSessionHandle session;
+    std::unique_ptr<OracleCursor> cursor;
+    OracleScanOpening opened;
+    try {
+        session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
+        const auto before = session->IoStats();
+        // The marker the optimizer left after each table name becomes the statement's snapshot.
+        auto sql = bind.statement_sql;
+        const auto scn = OracleQuerySnapshot(context, bind);
+        const std::string marker = " /*SCN*/";
+        for (auto at = sql.find(marker); at != std::string::npos; at = sql.find(marker, at)) {
+            const auto replacement = scn.empty() ? std::string() : " AS OF SCN " + scn;
+            sql.replace(at, marker.size(), replacement);
+            at += replacement.size();
+        }
+        cursor = session->Query(sql, {});
+        opened.sql = sql;
+        opened.io = session->IoStats() - before;
+    } catch (const std::exception &error) {
+        session.Poison();
+        throw IOException("Oracle could not aggregate table '%s': %s", bind.object_name, error.what());
+    }
+    auto columns = cursor->Columns();
+    if (columns.size() != bind.columns.size()) {
+        throw IOException("Oracle described %llu columns for an aggregate of %llu", static_cast<uint64_t>(columns.size()),
+                          static_cast<uint64_t>(bind.columns.size()));
+    }
+    for (idx_t index = 0; index < columns.size(); index++) {
+        const auto &declared = bind.columns[index];
+        if (declared.oracle_type != 0) {
+            columns[index].oracle_type = declared.oracle_type;
+        }
+        columns[index].byte_width = declared.byte_width;
+        columns[index].precision = declared.precision;
+        columns[index].scale = declared.scale;
+        columns[index].nullable = declared.nullable;
+        columns[index].unconstrained_number = declared.unconstrained_number;
+        columns[index].unconstrained_precision = declared.unconstrained_precision;
+        columns[index].unconstrained_scale = declared.unconstrained_scale;
+        if (TypeFor(columns[index]) != bind.types[index]) {
+            throw IOException("Oracle aggregate column %llu maps to %s where the plan expects %s",
+                              static_cast<uint64_t>(index + 1), TypeFor(columns[index]).ToString(),
+                              bind.types[index].ToString());
+        }
+    }
+    const auto chunk_columns = columns.size();
+    auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
+                                                   bind.types, std::move(input.column_ids), chunk_columns);
+    state->catalog_name = bind.catalog_name;
+    state->sent_sql = opened.sql;
+    state->metrics.Add(opened.io);
+    state->metrics.sessions = 1;
+    state->last_io = state->session ? state->session->IoStats() : OracleIoStats();
+    return std::move(state);
+}
+
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleQueryBindData>();
+    if (bind.statement_scan) {
+        return OracleAggregateInit(context, bind, input);
+    }
     if (bind.transactional_query) {
         auto target = ResolveOracleWriteTarget(context, bind.catalog_name);
         TransactionSession(context, target);
@@ -2244,81 +2830,459 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     }
     // Counting rows needs no column values, but Oracle needs a select list, so
     // one column is fetched and none is emitted.
+    unique_ptr<Expression> local_filter;
     auto selected = input.column_ids;
     const auto chunk_columns = selected.size();
     if (selected.empty()) {
         selected.push_back(0);
     }
     if (input.filters) {
-        // DuckDB drops a filter from the plan once it hands it over, so a
-        // filter that reaches here has to be translated exactly or refused.
-        bind.where_clause = OracleWhereClause(*input.filters, bind.columns, selected);
+        // DuckDB drops a filter from the plan once it hands it over, so each
+        // one is either translated exactly into the Oracle statement or
+        // applied here to the rows that come back.
+        auto split = SplitOracleFilters(*input.filters, bind.columns, selected);
+        bind.where_clause = std::move(split.where);
+        if (split.local.size() == 1) {
+            local_filter = std::move(split.local[0]);
+        } else if (!split.local.empty()) {
+            local_filter = std::move(split.local[0]);
+            for (idx_t index = 1; index < split.local.size(); index++) {
+                local_filter = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+                                                                     std::move(local_filter), std::move(split.local[index]));
+            }
+        }
     }
+    // A statement's scans read one moment when the user asked for that; set anew on
+    // every run, since a prepared statement keeps its bind data.
+    const auto query_scn = OracleQuerySnapshot(context, bind);
+    bind.sample_clause = OracleSampleClause(input.sample_options.get(), bind.estimated_rows);
+    bind.flashback_scn = bind.sample_clause.empty() ? query_scn : std::string();
+    // A Top-N the optimizer found over this scan is applied by Oracle only when
+    // every filter went to Oracle too: a filter DuckDB applies afterwards would
+    // see the first n rows instead of the first n that pass it.
+    bind.order_clause = (!local_filter && bind.sample_clause.empty()) ? OracleTopNClause(bind) : std::string();
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     std::vector<OracleColumn> columns;
-    OpenProjectedScan(context, bind, selected, session, cursor, columns);
-    std::vector<LogicalType> types;
-    types.reserve(columns.size());
-    for (const auto &column : columns) {
-        types.push_back(TypeFor(column));
+    Value parallel_setting;
+    idx_t sessions = 0;
+    if (!selected.empty() && context.TryGetCurrentSetting("oracle_parallel_scan", parallel_setting) &&
+        !parallel_setting.IsNull()) {
+        const auto requested = parallel_setting.GetValue<int64_t>();
+        if (requested >= 0) {
+            sessions = static_cast<idx_t>(MinValue<int64_t>(64, requested));
+        } else if (bind.estimated_rows && *bind.estimated_rows >= AUTOMATIC_PARALLEL_MINIMUM_ROWS) {
+            // Automatic: a table Oracle's statistics say is big gets as many
+            // sessions as DuckDB has threads, up to eight. The planner still reads
+            // one stream when the extents, the change number or a flashback read
+            // are not to be had.
+            sessions = MinValue<idx_t>(8, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+        }
     }
-    return make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
-                                             std::move(types), std::move(input.column_ids), chunk_columns);
+    auto chunks = PlanParallelAttachedScan(context, bind, selected, sessions);
+    if (!chunks.empty()) {
+        // Described once, with no row read: the chunks all have this shape.
+        OracleScanOpening described;
+        OpenProjectedScan(context, bind, selected, session, cursor, columns, true, &described);
+        cursor->Close();
+        cursor.reset();
+        std::vector<LogicalType> chunk_types;
+        chunk_types.reserve(columns.size());
+        for (const auto &column : columns) {
+            chunk_types.push_back(TypeFor(column));
+        }
+        auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, std::move(columns),
+                                                       std::move(chunk_types), std::move(input.column_ids), chunk_columns);
+        state->local_filter = std::move(local_filter);
+        state->metrics.Add(described.io);
+        state->parallel = true;
+        state->thread_count = MinValue<idx_t>(sessions, chunks.size());
+        state->chunk_sql = std::move(chunks);
+        state->secret_name = bind.secret_name;
+        state->config = bind.config;
+        state->password = bind.password;
+        state->sent_sql = state->chunk_sql.front() + (state->chunk_sql.size() > 1
+                                                          ? " (and " + std::to_string(state->chunk_sql.size() - 1) +
+                                                                " more ROWID ranges)"
+                                                          : std::string());
+        state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
+        return std::move(state);
+    }
+    OracleScanOpening opened;
+    unique_ptr<OracleDeferredColumns> deferred;
+    std::vector<LogicalType> types;
+    Value defer_setting;
+    // The columns DuckDB's own filter never looks at, and that are heavy, are read
+    // for the rows that pass it and not for every row.
+    if (local_filter && bind.sample_clause.empty() && bind.order_clause.empty() &&
+        (!context.TryGetCurrentSetting("oracle_deferred_columns", defer_setting) || defer_setting.IsNull() ||
+         BooleanValue::Get(defer_setting))) {
+        std::set<idx_t> used;
+        auto probe = local_filter->Copy();
+        ExpressionIterator::EnumerateExpression(probe, [&](unique_ptr<Expression> &node) {
+            if (node->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+                used.insert(node->Cast<BoundReferenceExpression>().Index());
+            }
+        });
+        std::vector<idx_t> heavy;
+        for (idx_t position = 0; position < selected.size(); position++) {
+            if (selected[position] < bind.columns.size() && DeferrableColumn(bind.columns[selected[position]]) &&
+                !used.count(position)) {
+                heavy.push_back(position);
+            }
+        }
+        const auto scn = (heavy.empty() || heavy.size() == selected.size()) ? std::string()
+                                                                              : OracleSnapshotOfHeapTable(context, bind);
+        if (!scn.empty()) {
+            std::vector<column_t> light_selected;
+            auto plan = make_uniq<OracleDeferredColumns>();
+            std::string heavy_list;
+            for (idx_t position = 0; position < selected.size(); position++) {
+                if (std::find(heavy.begin(), heavy.end(), position) == heavy.end()) {
+                    light_selected.push_back(selected[position]);
+                    plan->light_vectors.push_back(position);
+                } else {
+                    plan->heavy_vectors.push_back(position);
+                    plan->heavy_columns.push_back(bind.columns[selected[position]]);
+                    heavy_list += ", " + OracleSelectExpression(bind.columns[selected[position]]);
+                }
+            }
+            light_selected.push_back(COLUMN_IDENTIFIER_ROW_ID);
+            plan->heavy_select = std::string(ORACLE_ROWID_EXPRESSION) + heavy_list;
+            plan->source = OracleObjectReference(bind.schema_name, bind.object_name) + " AS OF SCN " + scn;
+            bind.flashback_scn = scn;
+            try {
+                OpenProjectedScan(context, bind, light_selected, session, cursor, columns, false, &opened);
+                for (idx_t position = 0; position < selected.size(); position++) {
+                    const auto light = std::find(plan->light_vectors.begin(), plan->light_vectors.end(), position);
+                    types.push_back(light == plan->light_vectors.end()
+                                        ? MappedType(bind.columns[selected[position]])
+                                        : TypeFor(columns[light - plan->light_vectors.begin()]));
+                }
+                deferred = std::move(plan);
+            } catch (const std::exception &) {
+                // No flashback on the table, or the snapshot is gone: read it whole.
+                bind.flashback_scn = query_scn;
+                cursor.reset();
+                session = OracleSessionHandle();
+                columns.clear();
+                opened = OracleScanOpening();
+                types.clear();
+            }
+        }
+    }
+    if (!deferred) {
+        OpenProjectedScan(context, bind, selected, session, cursor, columns, false, &opened);
+        types.reserve(columns.size());
+        for (const auto &column : columns) {
+            types.push_back(TypeFor(column));
+        }
+    }
+    const auto io_after_open = session ? session->IoStats() : OracleIoStats();
+    auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
+                                                   std::move(types), std::move(input.column_ids), chunk_columns);
+    state->local_filter = std::move(local_filter);
+    state->deferred = std::move(deferred);
+    state->sent_sql = opened.sql;
+    state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
+    state->metrics.Add(opened.io);
+    state->metrics.sessions = 1;
+    state->last_io = io_after_open;
+    return std::move(state);
+}
+
+// What an attached scan reports in EXPLAIN ANALYZE: the statement Oracle was
+// sent, what came back and how much of the time went where. The counts are
+// the scan's own — the rows Oracle returned before any filter DuckDB applies
+// to them, and the bytes and round trips on the connections it used.
+void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
+	if (!input.global_state) {
+		return;
+	}
+	const auto *state = dynamic_cast<const OracleQueryGlobalState *>(input.global_state.get());
+	if (!state) {
+		return;
+	}
+	auto &metrics = input.operator_metrics;
+	const auto &counters = state->metrics;
+	const auto seconds = [](uint64_t nanoseconds) {
+		char text[32];
+		std::snprintf(text, sizeof(text), "%.3f s", static_cast<double>(nanoseconds) / 1e9);
+		return std::string(text);
+	};
+	if (!state->sent_sql.empty()) {
+		metrics.AddExtraInfo("Oracle SQL", state->sent_sql);
+	}
+	metrics.AddExtraInfo("Oracle sessions", std::to_string(counters.sessions.load()));
+	if (state->parallel) {
+		metrics.AddExtraInfo("Oracle ROWID ranges", std::to_string(counters.chunks_read.load()) + " read of " +
+		                                                std::to_string(state->chunk_sql.size()));
+	}
+	metrics.AddExtraInfo("Oracle rows returned", std::to_string(counters.rows_fetched.load()));
+	metrics.AddExtraInfo("Oracle network", StringUtil::BytesToHumanReadableString(counters.bytes_received.load()) +
+	                                           " received, " +
+	                                           StringUtil::BytesToHumanReadableString(counters.bytes_sent.load()) +
+	                                           " sent, " + std::to_string(counters.round_trips.load()) + " round trips");
+	metrics.AddExtraInfo("Oracle fetch time", seconds(counters.fetch_nanoseconds.load()));
+	metrics.AddExtraInfo("Value conversion time", seconds(counters.convert_nanoseconds.load()));
+	if (state->deferred) {
+		metrics.AddExtraInfo("Columns read after the filter", std::to_string(state->deferred->heavy_columns.size()) +
+		                                                         ", for " + std::to_string(counters.deferred_rows.load()) +
+		                                                         " rows");
+	}
+	if (!state->local_filter_text.empty()) {
+		metrics.AddExtraInfo("Filters applied after fetching", state->local_filter_text);
+	}
+	metrics.rows_scanned = counters.rows_fetched.load();
+}
+
+unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                         GlobalTableFunctionState *) {
+    return make_uniq<OracleQueryLocalState>();
+}
+
+static bool DeferrableColumn(const OracleColumn &column) {
+    switch (column.oracle_type) {
+    case 112: // CLOB
+    case 113: // BLOB
+    case 119: // JSON
+    case 127: // VECTOR
+        return true;
+    default:
+        return column.xml;
+    }
+}
+
+std::string RowIdText(const std::optional<std::vector<uint8_t>> &wire) {
+    return wire ? std::string(wire->begin(), wire->end()) : std::string();
+}
+
+// Reads the heavy columns of the rows that passed the filter, by ROWID and at
+// the change number the rows were read at, and writes them into the chunk at the
+// rows' own positions. The rows that did not pass get NULL there; the caller
+// slices them away.
+void FillDeferredColumns(OracleQueryGlobalState &state, DataChunk &output, const oracle_scanner::OracleBatch &batch,
+                         const SelectionVector &selection, idx_t kept) {
+    auto &plan = *state.deferred;
+    const auto rowid_position = plan.light_vectors.size();
+    std::vector<bool> wanted(batch.rows.size(), false);
+    std::unordered_map<std::string, idx_t> row_of;
+    for (idx_t index = 0; index < kept; index++) {
+        const auto row = selection.get_index(index);
+        wanted[row] = true;
+        row_of.emplace(RowIdText(batch.rows[row][rowid_position]), row);
+    }
+    for (idx_t row = 0; row < batch.rows.size(); row++) {
+        if (!wanted[row]) {
+            for (idx_t heavy = 0; heavy < plan.heavy_vectors.size(); heavy++) {
+                WriteOracleValue(output.data[plan.heavy_vectors[heavy]], row, plan.heavy_columns[heavy], std::nullopt);
+            }
+        }
+    }
+    std::vector<std::string> rowids;
+    rowids.reserve(row_of.size());
+    for (const auto &entry : row_of) {
+        rowids.push_back(entry.first);
+    }
+    size_t found = 0;
+    constexpr size_t ROWIDS_PER_STATEMENT = 500;
+    for (size_t first = 0; first < rowids.size(); first += ROWIDS_PER_STATEMENT) {
+        std::string list;
+        const auto last = MinValue<size_t>(rowids.size(), first + ROWIDS_PER_STATEMENT);
+        for (size_t index = first; index < last; index++) {
+            list += (list.empty() ? "" : ", ") + std::string("CHARTOROWID('") + rowids[index] + "')";
+        }
+        const auto sql = "SELECT " + plan.heavy_select + " FROM " + plan.source + " WHERE ROWID IN (" + list + ")";
+        try {
+            auto cursor = state.session->Query(sql, {});
+            auto described = cursor->Columns();
+            if (described.size() != plan.heavy_columns.size() + 1) {
+                throw IOException("Oracle described %llu columns for a deferred read of %llu",
+                                  static_cast<uint64_t>(described.size()),
+                                  static_cast<uint64_t>(plan.heavy_columns.size() + 1));
+            }
+            for (size_t heavy = 0; heavy < plan.heavy_columns.size(); heavy++) {
+                OverlayDictionaryColumn(described[heavy + 1], plan.heavy_columns[heavy]);
+            }
+            for (;;) {
+                const auto fetched = TranslatingOracleErrors("oracle_query could not fetch from Oracle",
+                                                             [&] { return cursor->Fetch(STANDARD_VECTOR_SIZE); });
+                for (const auto &row : fetched.rows) {
+                    const auto at = row_of.find(RowIdText(row[0]));
+                    if (at == row_of.end()) {
+                        throw IOException("Oracle returned a row that was not asked for in a deferred read");
+                    }
+                    for (size_t heavy = 0; heavy < plan.heavy_columns.size(); heavy++) {
+                        TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
+                            WriteOracleValue(output.data[plan.heavy_vectors[heavy]], at->second, described[heavy + 1],
+                                             row[heavy + 1]);
+                            return true;
+                        });
+                    }
+                    found++;
+                }
+                if (fetched.exhausted) {
+                    break;
+                }
+            }
+        } catch (...) {
+            state.session.Poison();
+            throw;
+        }
+    }
+    if (found != rowids.size()) {
+        throw IOException("Oracle did not return %llu of the %llu rows asked for in a deferred read",
+                          static_cast<uint64_t>(rowids.size() - found), static_cast<uint64_t>(rowids.size()));
+    }
+    state.metrics.deferred_rows += found;
 }
 
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleQueryGlobalState>();
+    // A parallel scan reads through the thread's own session and cursor, one
+    // chunk of the table after another.
+    OracleQueryLocalState *local = state.parallel ? &input.local_state->Cast<OracleQueryLocalState>() : nullptr;
     // A transaction's fetch obeys the caller's interrupt like its open does.
     std::unique_ptr<OracleCallerInterruptScope> interrupt;
     if (!state.catalog_name.empty()) {
         interrupt = std::make_unique<OracleCallerInterruptScope>(context);
     }
-    const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
-        try {
-            return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
-        } catch (...) {
-            if (interrupt) {
-                interrupt->Stop();
+    const auto clock_now = [] { return std::chrono::steady_clock::now(); };
+    const auto elapsed = [](std::chrono::steady_clock::time_point since) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+    };
+    for (;;) {
+        if (local && !local->cursor) {
+            const auto chunk = state.next_chunk.fetch_add(1);
+            if (chunk >= state.chunk_sql.size()) {
+                output.SetChildCardinality(0);
+                return;
             }
-            // Same rule as at bind: a failed fetch leaves the channel in a
-            // state this side cannot describe, so the session is not reused.
-            state.session.Poison();
-            if (!state.catalog_name.empty()) {
-                state.cursor.reset();
-                PoisonTransactionSession(context, state.catalog_name);
+            try {
+                if (!local->session) {
+                    local->session = AcquireOracleReadSession(context, state.secret_name, std::string(), state.config,
+                                                              state.password);
+                    state.metrics.sessions++;
+                    local->last_io = local->session->IoStats();
+                }
+                const auto opened_at = clock_now();
+                local->cursor = local->session->Query(state.chunk_sql[chunk], {});
+                state.metrics.fetch_nanoseconds += elapsed(opened_at);
+                state.metrics.chunks_read++;
+                const auto io_now = local->session->IoStats();
+                state.metrics.Add(io_now - local->last_io);
+                local->last_io = io_now;
+            } catch (const std::exception &error) {
+                local->session.Poison();
+                throw IOException("Oracle ATTACH could not open a chunk of the table: %s", error.what());
             }
-            throw;
         }
-    });
-    // Every vector of the chunk has to be written: one left unset is
-    // uninitialized memory that DuckDB reads back in DataChunk::Verify. The
-    // fetched row and the chunk are in the same order, so vector i is column i;
-    // a row can carry one more column than the chunk when nothing is projected
-    // and only the row count is wanted.
-    if (output.ColumnCount() != state.chunk_columns) {
-        throw InternalException("oracle_query output chunk does not match its describe metadata");
+        const auto fetch_started = clock_now();
+        const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
+            if (local) {
+                try {
+                    return local->cursor->Fetch(STANDARD_VECTOR_SIZE);
+                } catch (...) {
+                    local->session.Poison();
+                    throw;
+                }
+            }
+            try {
+                return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
+            } catch (...) {
+                if (interrupt) {
+                    interrupt->Stop();
+                }
+                // Same rule as at bind: a failed fetch leaves the channel in a
+                // state this side cannot describe, so the session is not reused.
+                state.session.Poison();
+                if (!state.catalog_name.empty()) {
+                    state.cursor.reset();
+                    PoisonTransactionSession(context, state.catalog_name);
+                }
+                throw;
+            }
+        });
+        state.metrics.fetch_nanoseconds += elapsed(fetch_started);
+        state.metrics.rows_fetched += batch.rows.size();
+        if (local) {
+            const auto io_now = local->session->IoStats();
+            state.metrics.Add(io_now - local->last_io);
+            local->last_io = io_now;
+        } else if (state.session) {
+            const auto io_now = state.session->IoStats();
+            state.metrics.Add(io_now - state.last_io);
+            state.last_io = io_now;
+        }
+        const auto convert_started = clock_now();
+        // Every vector of the chunk has to be written: one left unset is
+        // uninitialized memory that DuckDB reads back in DataChunk::Verify. The
+        // fetched row and the chunk are in the same order, so vector i is column i;
+        // a row can carry one more column than the chunk when nothing is projected
+        // and only the row count is wanted.
+        if (output.ColumnCount() != state.chunk_columns) {
+            throw InternalException("oracle_query output chunk does not match its describe metadata");
+        }
+        for (idx_t row_index = 0; row_index < batch.rows.size(); row_index++) {
+            const auto &row = batch.rows[row_index];
+            if (row.size() != state.columns.size()) {
+                throw InternalException("oracle_query row has a different column count from its describe metadata");
+            }
+            // A deferred scan fetches only the light columns, then the ROWID.
+            const auto written = state.deferred ? state.deferred->light_vectors.size() : state.chunk_columns;
+            for (idx_t column_index = 0; column_index < written; column_index++) {
+                const auto vector_index = state.deferred ? state.deferred->light_vectors[column_index] : column_index;
+                TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
+                    WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
+                                     row[column_index]);
+                    return true;
+                });
+            }
+        }
+        // SetChildCardinality, not SetCardinality. In DuckDB 2.0 every vector
+        // carries its own size, and SetValue does not advance it; SetCardinality
+        // sets the chunk's count only, leaving each vector at size 0. A consumer
+        // then reads the validity mask by the vector's size and sees no NULL at
+        // all: `col IS NULL` matched every row, and count(col) counted them. The
+        // compiler cannot see that; the adapter suite now does.
+        output.SetChildCardinality(batch.rows.size());
+        state.metrics.convert_nanoseconds += elapsed(convert_started);
+        if (local && batch.exhausted) {
+            local->cursor->Close();
+            local->cursor.reset();
+        }
+        if (state.local_filter && !batch.rows.empty()) {
+            // The filters Oracle was not sent. A chunk they empty is not the end of
+            // the scan — an empty chunk means that — so fetch on until one has rows
+            // or Oracle has no more.
+            ExpressionExecutor executor(context, *state.local_filter);
+            SelectionVector selection(STANDARD_VECTOR_SIZE);
+            const auto kept = executor.SelectExpression(output, selection);
+            if (state.deferred) {
+                const auto deferred_started = clock_now();
+                FillDeferredColumns(state, output, batch, selection, kept);
+                state.metrics.fetch_nanoseconds += elapsed(deferred_started);
+                const auto io_now = state.session->IoStats();
+                state.metrics.Add(io_now - state.last_io);
+                state.last_io = io_now;
+            }
+            if (kept != batch.rows.size()) {
+                output.Slice(selection, kept);
+            }
+            if (kept == 0 && !batch.exhausted) {
+                output.Reset();
+                continue;
+            }
+        }
+        if (local && output.size() == 0) {
+            // A chunk of the table ended with nothing left to hand over; the next
+            // one is read before this thread says it is done.
+            output.Reset();
+            continue;
+        }
+        return;
     }
-    for (idx_t row_index = 0; row_index < batch.rows.size(); row_index++) {
-        const auto &row = batch.rows[row_index];
-        if (row.size() != state.columns.size()) {
-            throw InternalException("oracle_query row has a different column count from its describe metadata");
-        }
-        for (idx_t vector_index = 0; vector_index < state.chunk_columns; vector_index++) {
-            TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
-                WriteOracleValue(output.data[vector_index], row_index, state.columns[vector_index],
-                                 row[vector_index]);
-                return true;
-            });
-        }
-    }
-    // SetChildCardinality, not SetCardinality. In DuckDB 2.0 every vector
-    // carries its own size, and SetValue does not advance it; SetCardinality
-    // sets the chunk's count only, leaving each vector at size 0. A consumer
-    // then reads the validity mask by the vector's size and sees no NULL at
-    // all: `col IS NULL` matched every row, and count(col) counted them. The
-    // compiler cannot see that; the adapter suite now does.
-    output.SetChildCardinality(batch.rows.size());
 }
 
 
@@ -2380,6 +3344,24 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
          "SELECT * FROM oracle_query('demo', 'SELECT :1 AS value FROM dual', [42]);",
          {"oracle", "query"}}));
 
+    {
+        TableFunction vector_search("oracle_vector_search",
+                                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                                    OracleQueryFunction, OracleVectorSearchBind, OracleQueryInit);
+        vector_search.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+            options.Add("k", LogicalType::BIGINT);
+            options.Add("metric", LogicalType::VARCHAR);
+            options.Add("approximate", LogicalType::BOOLEAN);
+        });
+        infos.push_back(DocumentedTableFunctionInfo(
+            std::move(vector_search),
+            {{"secret_name", "table_name", "column_name", "query_vector", "k", "metric", "approximate"},
+             "Returns the k rows of an Oracle 23ai table whose VECTOR column is nearest to the query vector, with their "
+             "distance, ranked by Oracle's VECTOR_DISTANCE so a vector index is used when there is one.",
+             "SELECT * FROM oracle_vector_search('demo', 'DOCS', 'EMBEDDING', [0.1, 0.2, 0.3]::FLOAT[3], k := 5, "
+             "metric := 'COSINE');",
+             {"oracle", "vector"}}));
+    }
     TableFunction transaction_query("oracle_query_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                     OracleQueryFunction, OracleTransactionQueryBind, OracleQueryInit);
     transaction_query.GetSignature().AddArgs("params", LogicalType::ANY);
@@ -2442,6 +3424,33 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
          "exact_counts=false uses native array DML and returns one explicitly aggregate count with NULL row_index.",
          "SELECT * FROM oracle_execute_many_transaction('ora', 'DELETE FROM QUACK_DEMO_LOG WHERE LOG_ID = :id', [{id: 1}]);",
          {"oracle", "transaction"}}));
+    {
+        TableFunction plsql("oracle_plsql", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleCallNamedFunction,
+                            OraclePlsqlBind, OraclePlsqlInit);
+        plsql.GetSignature().AddArgs("binds", LogicalType::ANY);
+        infos.push_back(DocumentedTableFunctionInfo(
+            std::move(plsql),
+            {{"secret_name", "block", "binds"},
+             "Runs one anonymous PL/SQL block (BEGIN ... END; or DECLARE ... END;) on its own session and commits it "
+             "when it succeeds. Binds are STRUCT(name, direction, type, value) matched to the block's :name "
+             "placeholders; the OUT and IN OUT ones come back as rows, a REF CURSOR as a handle for oracle_cursor.",
+             "SELECT * FROM oracle_plsql('demo', 'BEGIN :greeting := ''hello '' || :who; END;', "
+             "[{name:'greeting',direction:'out',type:'varchar',value:NULL::VARCHAR}, "
+             "{name:'who',direction:'in',type:'varchar',value:'world'}]);",
+             {"oracle", "plsql"}}));
+        TableFunction plsql_transaction("oracle_plsql_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                        OracleTransactionCallFunction, OracleTransactionPlsqlBind,
+                                        OracleTransactionPlsqlInit);
+        plsql_transaction.GetSignature().AddArgs("binds", LogicalType::ANY);
+        infos.push_back(DocumentedTableFunctionInfo(
+            std::move(plsql_transaction),
+            {{"catalog_name", "block", "binds"},
+             "Runs one anonymous PL/SQL block on the caller transaction, with no adapter COMMIT. The block must not "
+             "commit, run DDL or use an autonomous transaction; REF CURSOR binds are refused.",
+             "SELECT * FROM oracle_plsql_transaction('ora', 'BEGIN :n := 1 + 1; END;', "
+             "[{name:'n',direction:'out',type:'number',value:NULL::VARCHAR}]);",
+             {"oracle", "transaction"}}));
+    }
     infos.push_back(DocumentedTableFunctionInfo(
         TableFunction("oracle_call_named_transaction", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
             OracleTransactionCallFunction, OracleTransactionCallBind, OracleTransactionCallInit),

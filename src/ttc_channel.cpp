@@ -1,7 +1,9 @@
 #include "oracle_scanner/ttc_channel.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/ttc_piggyback.hpp"
+#include "oracle_scanner/ttc_auth.hpp"
 #include "oracle_scanner/ttc_error.hpp"
+#include "oracle_scanner/ttc_negotiation.hpp"
 
 #include <string>
 
@@ -23,6 +25,22 @@ void TtcChannel::QueueCloseCursor(uint32_t cursor_id) {
     pending_close_cursors.push_back(cursor_id);
 }
 
+void TtcChannel::QueueEndToEndAttributes(const TtcEndToEndAttributes &attributes) {
+    std::lock_guard<std::mutex> lock(outbound_mutex);
+    if (attributes.client_identifier) {
+        pending_end_to_end.client_identifier = attributes.client_identifier;
+    }
+    if (attributes.module) {
+        pending_end_to_end.module = attributes.module;
+    }
+    if (attributes.action) {
+        pending_end_to_end.action = attributes.action;
+    }
+    if (attributes.client_info) {
+        pending_end_to_end.client_info = attributes.client_info;
+    }
+}
+
 size_t TtcChannel::PendingCloseCursorCount() const {
     return pending_close_cursors.size();
 }
@@ -41,6 +59,24 @@ TtcTransactionStatus TtcChannel::ReceiveTransactionStatus(uint8_t server_field_v
         }
     }
     return DecodeTtcTransactionStatus(response);
+}
+
+void TtcChannel::Ping(uint8_t sequence, uint8_t server_field_version) {
+    Send({TTC_MESSAGE_FUNCTION, TTC_FUNCTION_PING, sequence});
+    auto response = Receive();
+    // The report of the attributes just set comes ahead of the acknowledgement.
+    while (!response.empty() && response.front() == TTC_MESSAGE_SERVER_PIGGYBACK) {
+        const auto after = SkipTtcServerPiggyback(response, 0);
+        response.erase(response.begin(), response.begin() + static_cast<std::ptrdiff_t>(after));
+    }
+    if (IsTtcErrorMessage(response)) {
+        const auto error = DecodeTtcErrorPrefix(response, server_field_version);
+        if (error.error_number != 0) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
+                                error.message.empty() ? "Oracle ping failed" : error.message, error.error_number);
+        }
+    }
+    (void)DecodeTtcTransactionStatus(response);
 }
 
 TtcTransactionStatus TtcChannel::Commit(uint8_t sequence, uint8_t server_field_version) {
@@ -70,28 +106,51 @@ void TtcChannel::Cancel() {
     }
 }
 
-void TtcChannel::Send(const std::vector<uint8_t> &message) {
-    if (message.empty()) {
+namespace {
+// From TTC field version 18 every function call and piggyback header carries a
+// token number after the sequence number. This client never uses one, so it is
+// always zero — python-oracledb sends the same single 0x00.
+std::vector<uint8_t> WithHeaderToken(std::vector<uint8_t> message, uint8_t field_version) {
+    if (field_version >= TTC_FIELD_VERSION_HEADER_TOKEN && message.size() >= 3 &&
+        (message[0] == TTC_MESSAGE_FUNCTION || message[0] == TTC_MESSAGE_PIGGYBACK)) {
+        message.insert(message.begin() + 3, 0);
+    }
+    return message;
+}
+} // namespace
+
+void TtcChannel::Send(const std::vector<uint8_t> &request) {
+    if (request.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "empty TTC messages are not valid");
     }
+    const auto message = WithHeaderToken(request, wire_field_version);
     std::lock_guard<std::mutex> lock(outbound_mutex);
     // END_OF_RESPONSE marks Oracle's response boundary; a client request
     // carries no response flag. Setting it here leaves 19c waiting for a
     // valid request terminator after TTIPRO.
     std::vector<uint8_t> outbound;
-    if (!pending_close_cursors.empty()) {
-        outbound = EncodeTtcCloseCursorsPiggyback(next_piggyback_sequence, pending_close_cursors);
-        outbound.insert(outbound.end(), message.begin(), message.end());
-    } else {
-        outbound = message;
+    const bool end_to_end = !pending_end_to_end.Empty();
+    uint8_t piggyback_sequence = next_piggyback_sequence;
+    if (end_to_end) {
+        outbound = WithHeaderToken(EncodeTtcEndToEndPiggyback(piggyback_sequence++, pending_end_to_end),
+                                   wire_field_version);
     }
+    if (!pending_close_cursors.empty()) {
+        const auto close = WithHeaderToken(EncodeTtcCloseCursorsPiggyback(piggyback_sequence++, pending_close_cursors),
+                                           wire_field_version);
+        outbound.insert(outbound.end(), close.begin(), close.end());
+    }
+    outbound.insert(outbound.end(), message.begin(), message.end());
     for (const auto &packet : EncodeTnsDataPackets(outbound, true, negotiated_sdu, 0)) {
         packets.Send(DecodeTnsPacket(packet, true, negotiated_sdu));
     }
     if (!pending_close_cursors.empty()) {
         pending_close_cursors.clear();
-        ++next_piggyback_sequence;
     }
+    if (end_to_end) {
+        pending_end_to_end = TtcEndToEndAttributes();
+    }
+    next_piggyback_sequence = piggyback_sequence;
 }
 
 std::vector<uint8_t> TtcChannel::Receive() {

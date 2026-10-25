@@ -6,6 +6,8 @@
 #define NOMINMAX
 #endif
 
+#include "oracle_scanner/oracle_vector.hpp"
+#include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/io_deadline.hpp"
 #include "oracle_scanner/session.hpp"
@@ -14,6 +16,7 @@
 #include "oracle_scanner_extension.hpp"
 #include "core_functions_extension.hpp"
 #include "oracle_adapter.hpp"
+#include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
 
@@ -33,6 +36,8 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <chrono>
+#include <fstream>
+#include <filesystem>
 #include <thread>
 #include <cassert>
 #include <csignal>
@@ -210,9 +215,17 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
         return false;
     }
     auto object = sql.substr(from_at + 7);
-    const auto object_end = object.find('"');
+    auto object_end = object.find('"');
     if (object_end == std::string::npos) {
         return false;
+    }
+    if (object.compare(object_end, 3, "\".\"") == 0) {
+        // "OWNER"."TABLE": the table is the second name.
+        object = object.substr(object_end + 3);
+        object_end = object.find('"');
+        if (object_end == std::string::npos) {
+            return false;
+        }
     }
     object.erase(object_end);
     const auto table = script.tables.find(object);
@@ -231,7 +244,12 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
             selected.push_back((std::numeric_limits<size_t>::max)());
             result.columns.push_back(Column("rowid", 1));
         } else {
-            const auto name = item.size() >= 2 && item.front() == '"' ? item.substr(1, item.size() - 2) : item;
+            // An XMLTYPE column is selected as XMLSERIALIZE(CONTENT "X" AS CLOB NO INDENT) "X".
+            const std::string serialized = "XMLSERIALIZE(CONTENT ";
+            const auto bare = item.compare(0, serialized.size(), serialized) == 0
+                                  ? item.substr(serialized.size(), item.find(" AS CLOB") - serialized.size())
+                                  : item;
+            const auto name = bare.size() >= 2 && bare.front() == '"' ? bare.substr(1, bare.size() - 2) : bare;
             size_t index = 0;
             for (; index < table->second.columns.size(); index++) {
                 if (table->second.columns[index].name == name) {
@@ -603,9 +621,16 @@ struct TestDatabase {
         // any transport work, so these are placeholders, not credentials.
         Run("CREATE SECRET ora (TYPE oracle, HOST '127.0.0.1', PORT 1521, "
             "SERVICE_NAME 'service', USER 'app_user', PASSWORD 'placeholder');");
+        // The fake answers plain scans; the one test of aggregate pushdown turns it on.
+        Run("SET oracle_aggregate_pushdown = false;");
+        Run("SET oracle_join_pushdown = false;");
     }
 
     std::unique_ptr<MaterializedQueryResult> Query(const std::string &sql) {
+        // ORACLE_TEST_TRACE=1 names each statement before it runs, so a hang says where.
+        if (std::getenv("ORACLE_TEST_TRACE")) {
+            std::cout << "  > " << sql.substr(0, 160) << std::endl;
+        }
         return std::make_unique<MaterializedQueryResult>(con.Query(sql));
     }
 
@@ -693,6 +718,13 @@ void TestWriteOracleValueMatchesValueFor() {
     moment.nanosecond = 123456789;
     auto micro_moment = moment;
     micro_moment.nanosecond = 123456000;
+    auto national_label = Column("n_label", 1);
+    national_label.character_set_form = 2;
+    auto national_fixed = Column("n_fixed", 96);
+    national_fixed.character_set_form = 2;
+    auto interval_column = Column("elapsed", 183, 2, 9);
+    auto local_zone_column = Column("seen_at", 231);
+    local_zone_column.scale = 6;
     const std::vector<std::pair<OracleColumn, std::vector<Wire>>> cases = {
         {Column("id", 2, 10, 0),
          {std::nullopt, Number("0"), Number("-1"), Number("9999999999"), Number("100000000000000000000")}},
@@ -703,6 +735,23 @@ void TestWriteOracleValueMatchesValueFor() {
          {Number("1234567890123456789012345678.0123456789"), Number("-0.0000000001"),
           Number("1234567890123456789012345678901")}},
         {Column("unbounded", 2), {Number("123456789012345678901234567890"), Number("-0.000000000000000000000000000015")}},
+        {national_label,
+         {std::vector<uint8_t> {0x00, 0x68, 0x00, 0xE9, 0x04, 0x1F, 0xD8, 0x3D, 0xDE, 0x00}, std::vector<uint8_t> {},
+          std::vector<uint8_t> {0x00}, std::vector<uint8_t> {0xD8, 0x3D}}},
+        {national_fixed, {std::vector<uint8_t> {0x00, 0x61, 0x00, 0x20}}},
+        {Column("span", 182),
+         {oracle_scanner::EncodeOracleIntervalYearMonth(2, 3), oracle_scanner::EncodeOracleIntervalYearMonth(-5, -11),
+          oracle_scanner::EncodeOracleIntervalYearMonth(200000000, 0)}},
+        {interval_column,
+         {oracle_scanner::EncodeOracleIntervalDaySecond(3, 4, 5, 6, 789012000),
+          oracle_scanner::EncodeOracleIntervalDaySecond(-12, -23, -59, -59, -500000000),
+          oracle_scanner::EncodeOracleIntervalDaySecond(0, 0, 0, 0, 1)}},
+        {Column("legacy", 8), {Text("a long text"), Text(""), std::vector<uint8_t> {0xFF}}},
+        {Column("legacy_raw", 24), {std::vector<uint8_t> {0xDE, 0xAD}}},
+        {Column("address", 11), {std::vector<uint8_t> {0x00, 0x08, 0x35, 0xB4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00}}},
+        {Column("universal", 208),
+         {std::vector<uint8_t> {0x01, 0x00, 0x08, 0x35, 0xB4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00},
+          std::vector<uint8_t> {0x02, 0x04, 0x00, 0x40, 0x89, 0xA1, 0x05, 0x61}}},
         {Column("label", 1), {Text(""), Text("plain"), Text("\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82"),
                               std::vector<uint8_t> {'o', 'k', 0xFF}, std::vector<uint8_t> {0xC3}}},
         {Column("fixed", 96), {Text("ab  ")}},
@@ -715,6 +764,9 @@ void TestWriteOracleValueMatchesValueFor() {
         {timestamp_column, {oracle_scanner::EncodeOracleTimestamp(moment, false)}},
         {Column("ts_us", 180), {oracle_scanner::EncodeOracleTimestamp(micro_moment, false),
                                 oracle_scanner::EncodeOracleTimestamp(moment, false)}},
+        {Column("flag", 252), {std::vector<uint8_t> {1}, std::vector<uint8_t> {0}, std::vector<uint8_t> {}}},
+        {local_zone_column, {oracle_scanner::EncodeOracleTimestamp(micro_moment, false),
+                             oracle_scanner::EncodeOracleTimestamp(moment, false)}},
     };
     const auto store = [](const auto &write) -> std::string {
         try {
@@ -748,8 +800,60 @@ void TestWriteOracleValueMatchesValueFor() {
     }
     // The cases include refusals, so the comparison above covers errors too:
     // an out-of-range BIGINT, two DECIMAL overflows, two strings that are not
-    // UTF-8 and a timestamp finer than its column, each at two rows.
-    CHECK(refusals == 2 * 6);
+    // UTF-8 and a timestamp finer than its column, then an odd and a lone
+    // surrogate UTF-16 value, a year-month span past int32, a day-second span
+    // finer than a microsecond, a LONG that is not UTF-8, a logical UROWID, an
+    // empty BOOLEAN and a local-zone time finer than a microsecond, each at two rows.
+    CHECK(refusals == 2 * 14);
+}
+
+// The types added in 0.6.0 reach SQL as the DuckDB types they map to, with the
+// values Oracle holds. A national column is UTF-16 in the row and comes out
+// UTF-8; an INTERVAL YEAR TO MONTH is months, an INTERVAL DAY TO SECOND is
+// days and microseconds; a ROWID and a UROWID are the text Oracle prints; LONG
+// reads as VARCHAR and LONG RAW as BLOB.
+void TestNewTypesReadThroughSql() {
+	auto script = std::make_shared<FakeScript>();
+	auto national = Column("N_LABEL", 1);
+	national.character_set_form = 2;
+	auto national_fixed = Column("N_FIXED", 96);
+	national_fixed.character_set_form = 2;
+	auto legacy = Column("LEGACY", 8);
+	legacy.character_set_form = 1;
+	script->columns = {national, national_fixed, Column("SPAN", 182),         Column("ELAPSED", 183, 2, 6),
+	                   legacy,   Column("LEGACY_RAW", 24), Column("ADDRESS", 11), Column("UNIVERSAL", 208)};
+	const std::vector<uint8_t> physical = {0x00, 0x08, 0x35, 0xB4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00};
+	auto universal = physical;
+	universal.insert(universal.begin(), 0x01);
+	script->rows = {{std::vector<uint8_t> {0x00, 0x68, 0x00, 0xE9, 0xD8, 0x3D, 0xDE, 0x00},
+	                 std::vector<uint8_t> {0x00, 0x61, 0x00, 0x20, 0x00, 0x20},
+	                 oracle_scanner::EncodeOracleIntervalYearMonth(-5, -11),
+	                 oracle_scanner::EncodeOracleIntervalDaySecond(3, 4, 5, 6, 789012000), Text("long text"),
+	                 std::vector<uint8_t> {0xDE, 0xAD}, physical, universal},
+	                {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+	                 std::nullopt}};
+
+	auto factory = InstallFake(script);
+	TestDatabase database;
+	auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT * FROM app.items')");
+	CHECK(!result->HasError());
+	const std::vector<duckdb::LogicalType> expected_types = {
+	    duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::INTERVAL,
+	    duckdb::LogicalType::INTERVAL, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BLOB,
+	    duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
+	CHECK(result->GetTypes() == expected_types);
+	CHECK(result->GetValue(0, 0).ToString() == "h\xC3\xA9\xF0\x9F\x98\x80");
+	// CHAR is blank-padded, and the padding is part of the value.
+	CHECK(result->GetValue(1, 0).ToString() == "a  ");
+	CHECK(result->GetValue(2, 0) == duckdb::Value::INTERVAL(-71, 0, 0));
+	CHECK(result->GetValue(3, 0) == duckdb::Value::INTERVAL(0, 3, ((4 * 60 + 5) * 60 + 6) * 1000000LL + 789012));
+	CHECK(result->GetValue(4, 0).ToString() == "long text");
+	CHECK(result->GetValue(5, 0).ToString() == "\\xDE\\xAD");
+	CHECK(result->GetValue(6, 0).ToString() == "AACDW0AABAAAImJAAA");
+	CHECK(result->GetValue(7, 0).ToString() == "AACDW0AABAAAImJAAA");
+	for (duckdb::idx_t column = 0; column < 8; column++) {
+		CHECK(result->GetValue(column, 1).IsNull());
+	}
 }
 
 // Projecting a subset of the columns must emit exactly the requested ones, in
@@ -855,6 +959,99 @@ void TestQueryParametersReachTheSessionAsBinds() {
     CHECK(script->query_binds[1][0].value->empty());
 }
 
+// Parameters of the types an attached INSERT can write reach oracle_query and
+// oracle_execute too, through the same encoder, and a NULL of each says what it is.
+void TestParametersOfEveryWritableType() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const auto binds_of = [&](const std::string &list) {
+        const auto before = script->query_binds.size();
+        auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items WHERE a = :1', " +
+                                     list + ")");
+        CHECK(!result->HasError());
+        CHECK(script->query_binds.size() == before + 1);
+        return script->query_binds.back();
+    };
+    CHECK(binds_of("[true]")[0].oracle_type == 252 &&
+          binds_of("[true]")[0].value == std::vector<uint8_t>({1, 1}));
+    CHECK(binds_of("[INTERVAL 3 DAY]")[0].oracle_type == 183);
+    CHECK(binds_of("[INTERVAL 14 MONTH]")[0].oracle_type == 182);
+    // An instant is bound as the TIMESTAMP of its UTC wall time.
+    const auto instant = binds_of("[TIMESTAMPTZ '2026-01-01 10:00:00+02']")[0];
+    CHECK(instant.oracle_type == 180 && instant.value &&
+          oracle_scanner::DecodeOracleTimestamp(*instant.value).hour == 8);
+    CHECK(binds_of("[TIMESTAMP_NS '2026-01-01 10:00:00.123456789']")[0].oracle_type == 180);
+    CHECK(binds_of("[TIMESTAMP_MS '2026-01-01 10:00:00.5']")[0].oracle_type == 180);
+    CHECK(oracle_scanner::DecodeOracleNumber(*binds_of("[170141183460469231731687303715884105727::HUGEINT]")[0].value) ==
+          "170141183460469231731687303715884105727");
+    CHECK(binds_of("[NULL::HUGEINT]")[0].oracle_type == 2 && !binds_of("[NULL::HUGEINT]")[0].value);
+    CHECK(binds_of("[NULL::BOOLEAN]")[0].oracle_type == 252);
+    CHECK(binds_of("[NULL::INTERVAL]")[0].oracle_type == 183);
+    // Named, as well as positional.
+    auto named = database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items WHERE a = :flag', "
+                                "{flag: false})");
+    CHECK(!named->HasError() && script->query_binds.back()[0].oracle_type == 252);
+    // A month beside days has no single Oracle interval type.
+    auto mixed = database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items WHERE a = :1', "
+                                "[INTERVAL '1 month 2 days'])");
+    CHECK(mixed->HasError() && mixed->GetError().find("cannot hold months") != std::string::npos);
+    auto executed = database.Query("SELECT * FROM oracle_execute('ora', 'UPDATE app.items SET a = :1', [true])");
+    CHECK(!executed->HasError() && script->counted_execute_binds.back()[0].oracle_type == 252);
+    std::cout << "parameters cover BOOLEAN, INTERVAL, TIMESTAMPTZ, TIMESTAMP_NS and HUGEINT" << std::endl;
+}
+
+// How NUMBER is held, by declared precision and scale, and what the
+// oracle_unconstrained_number setting does for the ones with none.
+void TestNumberMappings() {
+    const auto number = [](int16_t precision, int16_t scale) {
+        auto column = Column("N", 2, precision, scale);
+        return duckdb::MappedType(column);
+    };
+    CHECK(number(10, 0) == duckdb::LogicalType::BIGINT && number(18, 0) == duckdb::LogicalType::BIGINT);
+    CHECK(number(19, 0) == duckdb::LogicalType::VARCHAR);
+    // Rounded to hundreds: whole numbers, so an integer.
+    CHECK(number(10, -2) == duckdb::LogicalType::BIGINT && number(16, -2) == duckdb::LogicalType::BIGINT);
+    CHECK(number(17, -2) == duckdb::LogicalType::VARCHAR);
+    CHECK(number(5, 2) == duckdb::LogicalType::DECIMAL(5, 2));
+    // More digits after the point than the precision: 0.0012 is NUMBER(2,4).
+    CHECK(number(2, 4) == duckdb::LogicalType::DECIMAL(4, 4));
+    CHECK(number(1, 38) == duckdb::LogicalType::DECIMAL(38, 38) && number(1, 39) == duckdb::LogicalType::VARCHAR);
+    CHECK(number(0, 0) == duckdb::LogicalType::VARCHAR && number(126, -127) == duckdb::LogicalType::VARCHAR);
+
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("total", 2, 0, 0), Column("price", 2, 8, 2)};
+    script->rows = {{Number("1.5"), Number("3.14")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const auto types = [&] {
+        auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT total, price FROM t')");
+        CHECK(!result->HasError());
+        return std::vector<duckdb::LogicalType> {result->GetTypes()[0], result->GetTypes()[1]};
+    };
+    CHECK(types()[0] == duckdb::LogicalType::VARCHAR);
+    database.Run("SET oracle_unconstrained_number = 'double';");
+    CHECK(types()[0] == duckdb::LogicalType::DOUBLE && types()[1] == duckdb::LogicalType::DECIMAL(8, 2));
+    auto doubled = database.Query("SELECT total FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(!doubled->HasError() && doubled->GetValue(0, 0).GetValue<double>() == 1.5);
+    database.Run("SET oracle_unconstrained_number = 'Decimal(38, 9)';");
+    CHECK(types()[0] == duckdb::LogicalType::DECIMAL(38, 9));
+    auto decimal = database.Query("SELECT total FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(!decimal->HasError() && decimal->GetValue(0, 0).ToString() == "1.500000000");
+    database.Run("SET oracle_unconstrained_number = 'varchar';");
+    CHECK(types()[0] == duckdb::LogicalType::VARCHAR);
+    database.Run("SET oracle_unconstrained_number = 'decimal(40,2)';");
+    auto bad = database.Query("SELECT * FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(bad->HasError() && bad->GetError().find("precision <= 38") != std::string::npos);
+    database.Run("SET oracle_unconstrained_number = 'real';");
+    auto unknown = database.Query("SELECT * FROM oracle_query('ora', 'SELECT total, price FROM t')");
+    CHECK(unknown->HasError() && unknown->GetError().find("must be 'varchar', 'double'") != std::string::npos);
+    std::cout << "NUMBER maps by precision and scale, and the unconstrained setting picks a type" << std::endl;
+}
+
 // oracle_execute promises Oracle's own SQL%ROWCOUNT, which is the operation the
 // adapter must call — not the plain Execute whose count comes from the DML
 // response.
@@ -933,30 +1130,24 @@ void TestUnsupportedColumnTypesAreRefusedAtBind() {
     };
 
     // NVARCHAR2 and NCHAR carry the VARCHAR2 and CHAR type codes; only the
-    // character set form separates them, and their values are UTF-16 in the row
-    // itself. NCLOB shares the CLOB type code and is readable, because its
-    // content does not travel in the row at all — it is read through LOB_OP,
-    // which serves AL16UTF16 for a plain CLOB too.
-    for (const uint16_t character_type : {1, 96}) {
-        const auto error = bind_error(character_type, 2);
-        CHECK(error.find("Not implemented Error") != std::string::npos);
-        CHECK(error.find("national character set") != std::string::npos);
-    }
+    // character set form separates them. They are readable now (UTF-16 in the
+    // row, converted), but a national form on any other type is a shape this
+    // version has not seen.
+    const auto national_number = bind_error(2, 2);
+    CHECK(national_number.find("Not implemented Error") != std::string::npos);
+    CHECK(national_number.find("national character set form on Oracle type 2") != std::string::npos);
 
     // BFILE has no read path and is refused by name, unlike the three LOB
     // types beside it.
     CHECK(bind_error(114, 0).find("Oracle type 114") != std::string::npos);
 
-    CHECK(bind_error(182, 0).find("INTERVAL") != std::string::npos);
-    CHECK(bind_error(183, 0).find("INTERVAL") != std::string::npos);
-
-    const auto local_zone = bind_error(231, 0);
-    CHECK(local_zone.find("session time zone") != std::string::npos);
+    // TIMESTAMP WITH LOCAL TIME ZONE and BOOLEAN are readable (see
+    // TestBooleanAndLocalZoneReadThroughSql); the refusals above are what is left.
 
     // Anything with no mapping at all still fails by name rather than falling
     // through to the textual default.
-    const auto unmapped = bind_error(8, 0);
-    CHECK(unmapped.find("Oracle type 8") != std::string::npos);
+    const auto unmapped = bind_error(108, 0);
+    CHECK(unmapped.find("Oracle type 108") != std::string::npos);
 
     // TIMESTAMP WITH TIME ZONE stays readable: the value carries its own
     // offset, so nothing has to be assumed about a session zone.
@@ -968,6 +1159,39 @@ void TestUnsupportedColumnTypesAreRefusedAtBind() {
     auto accepted = database.Query("SELECT * FROM oracle_query('ora', 'SELECT v FROM app.items')");
     CHECK(!accepted->HasError());
     CHECK(accepted->GetValue(0, 0).ToString().find("+02:00") != std::string::npos);
+}
+
+// BOOLEAN (type 252, one byte) and TIMESTAMP WITH LOCAL TIME ZONE (type 231, a
+// wall-clock time in the session's zone, which this client fixes at UTC) read
+// as DuckDB's own types.
+void TestBooleanAndLocalZoneReadThroughSql() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("B", 252), Column("L", 231)};
+    script->columns[1].scale = 6;
+    script->rows = {
+        {std::vector<uint8_t> {1}, oracle_scanner::EncodeOracleTimestamp({2026, 3, 4, 5, 6, 7, 123456000, 0, false}, false)},
+        {std::vector<uint8_t> {0}, oracle_scanner::EncodeOracleTimestamp({1969, 12, 31, 23, 59, 59, 0, 0, false}, false)},
+        {std::nullopt, std::nullopt}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    auto result = database.Query("SELECT b, l, typeof(b), typeof(l) FROM oracle_query('ora', 'SELECT b, l FROM app.items')");
+    CHECK(!result->HasError());
+    CHECK(result->RowCount() == 3);
+    CHECK(result->GetValue(0, 0) == duckdb::Value::BOOLEAN(true) && result->GetValue(0, 1) == duckdb::Value::BOOLEAN(false));
+    CHECK(result->GetValue(0, 2).IsNull());
+    CHECK(result->GetValue(2, 0).ToString() == "BOOLEAN" && result->GetValue(3, 0).ToString() == "TIMESTAMP WITH TIME ZONE");
+    CHECK(result->GetValue(1, 0) == duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(1772600767123456LL)));
+    CHECK(result->GetValue(1, 1) == duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(-1000000LL)));
+
+    // A TIMESTAMP(9) with a finer fraction than a microsecond is reported.
+    auto fine = std::make_shared<FakeScript>();
+    fine->columns = {Column("L", 231)};
+    fine->rows = {{oracle_scanner::EncodeOracleTimestamp({2026, 3, 4, 5, 6, 7, 123456789, 0, false}, false)}};
+    auto fine_factory = InstallFake(fine);
+    TestDatabase fine_database;
+    auto refused = fine_database.Query("SELECT * FROM oracle_query('ora', 'SELECT l FROM app.items')");
+    CHECK(refused->HasError() && refused->GetError().find("sub-microsecond") != std::string::npos);
+    std::cout << "BOOLEAN and local-zone columns read as DuckDB types" << std::endl;
 }
 
 // A LOB column reaches this layer as plain bytes: the session resolves the
@@ -1182,7 +1406,8 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
     conjunction->child_filters.push_back(constant(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1)));
     conjunction->child_filters.push_back(
         constant(duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(0)));
-    CHECK(translate(0, std::move(conjunction)) == "(\"ID\" = 1 AND \"ID\" > 0)");
+    // A top-level AND is taken a conjunct at a time, so the parentheses go.
+    CHECK(translate(0, std::move(conjunction)) == "\"ID\" = 1 AND \"ID\" > 0");
 }
 
 // oracle_execute_many builds one Oracle batch out of the supplied rows, runs it
@@ -1376,7 +1601,92 @@ void TestWriteBindsFollowTheOracleColumnType() {
     // A column this client cannot read is one it cannot reason about writing.
     auto national = Column("N_LABEL", 1);
     national.character_set_form = 2;
-    unsupported(national, duckdb::Value("beta"), "national character set");
+    // A national column is written as UTF-16BE behind the national form.
+    national.character_set_form = 2;
+    const auto national_bind = bind_for(national, duckdb::Value("h\xC3\xA9\xF0\x9F\x98\x80"));
+    CHECK(national_bind.oracle_type == 1 && national_bind.character_set_form == 2);
+    CHECK(national_bind.value == std::vector<uint8_t>({0x00, 0x68, 0x00, 0xE9, 0xD8, 0x3D, 0xDE, 0x00}));
+    CHECK(!bind_for(national, duckdb::Value("")).value.has_value());
+    auto national_fixed_column = Column("N_FIXED", 96);
+    national_fixed_column.character_set_form = 2;
+    CHECK(bind_for(national_fixed_column, duckdb::Value("ab")).character_set_form == 2);
+    CHECK(bind_for(text_column, duckdb::Value("ab")).character_set_form == 0);
+    unsupported(national, duckdb::Value::BIGINT(1), "character column");
+    // A NULL row describes its column exactly as a row with a value does, which
+    // a batch needs because its bind metadata is declared once.
+    CHECK(bind_for(national, duckdb::Value(duckdb::LogicalType::VARCHAR)).character_set_form == 2);
+    CHECK(bind_for(Column("SEEN_AT", 231), duckdb::Value(duckdb::LogicalType::TIMESTAMP_TZ)).oracle_type == 180);
+
+    // LOBs: the content as a VARCHAR2 or RAW bind, empty as NULL, and a limit.
+    const auto clob = Column("DOC", 112);
+    CHECK(bind_for(clob, duckdb::Value("text")).oracle_type == 1);
+    CHECK(bind_for(clob, duckdb::Value("text")).value == std::vector<uint8_t>({'t', 'e', 'x', 't'}));
+    CHECK(!bind_for(clob, duckdb::Value("")).value.has_value() && bind_for(clob, duckdb::Value("")).oracle_type == 1);
+    auto nclob = Column("NDOC", 112);
+    nclob.character_set_form = 2;
+    CHECK(bind_for(nclob, duckdb::Value("h\xC3\xA9")).character_set_form == 0);
+    const auto blob = Column("IMG", 113);
+    CHECK(bind_for(blob, duckdb::Value::BLOB("\x01\x02")).oracle_type == 23);
+    CHECK(bind_for(blob, duckdb::Value(duckdb::LogicalType::BLOB)).oracle_type == 23);
+    unsupported(clob, duckdb::Value::BIGINT(1), "takes VARCHAR");
+    unsupported(blob, duckdb::Value("text"), "takes BLOB");
+    // A LOB bind says it stands for LOB content, in every row including a NULL
+    // one, so the session can send a large value through a temporary LOB and
+    // keep an array DML's bind metadata the same for all rows.
+    CHECK(bind_for(clob, duckdb::Value("text")).lob_content == 112);
+    CHECK(bind_for(clob, duckdb::Value(duckdb::LogicalType::VARCHAR)).lob_content == 112);
+    CHECK(bind_for(clob, duckdb::Value("")).lob_content == 112);
+    CHECK(bind_for(blob, duckdb::Value::BLOB("\x01")).lob_content == 113);
+    CHECK(bind_for(Column("J", 119), duckdb::Value("{}")).lob_content == 112);
+    CHECK(bind_for(Column("N", 1), duckdb::Value("x")).lob_content == 0);
+    // Past the old 16 MiB limit, which the temporary LOB lifted.
+    CHECK(bind_for(clob, duckdb::Value(std::string((16U << 20U) + 1, 'x'))).value->size() == (16U << 20U) + 1);
+
+    // BOOLEAN is the two bytes python-oracledb sends.
+    const auto boolean_column = Column("FLAG", 252);
+    CHECK(bind_for(boolean_column, duckdb::Value::BOOLEAN(true)).value == std::vector<uint8_t>({1, 1}));
+    CHECK(bind_for(boolean_column, duckdb::Value::BOOLEAN(false)).value == std::vector<uint8_t>({1, 0}));
+    CHECK(bind_for(boolean_column, duckdb::Value::BOOLEAN(true)).oracle_type == 252);
+    CHECK(!bind_for(boolean_column, duckdb::Value(duckdb::LogicalType::BOOLEAN)).value.has_value());
+    unsupported(boolean_column, duckdb::Value::BIGINT(1), "takes BOOLEAN");
+
+    // A local-zone column takes a TIMESTAMPTZ, which goes to Oracle as the
+    // TIMESTAMP of its UTC wall time because the session zone is UTC.
+    auto local_zone = Column("SEEN_AT", 231);
+    local_zone.scale = 6;
+    oracle_scanner::OracleDateTime utc_moment;
+    utc_moment.year = 2026;
+    utc_moment.month = 3;
+    utc_moment.day = 4;
+    utc_moment.hour = 5;
+    utc_moment.minute = 6;
+    utc_moment.second = 7;
+    utc_moment.nanosecond = 123456000;
+    const auto local_zone_bind = bind_for(
+        local_zone, duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(1772600767123456LL)));
+    CHECK(local_zone_bind.oracle_type == 180);
+    CHECK(local_zone_bind.value == oracle_scanner::EncodeOracleTimestamp(utc_moment, false));
+    unsupported(local_zone, duckdb::Value("2026-03-04 05:06:07"), "takes TIMESTAMPTZ");
+
+    // Intervals: whole months for YEAR TO MONTH, days and time for DAY TO SECOND.
+    const auto year_month = Column("SPAN", 182);
+    CHECK(bind_for(year_month, duckdb::Value::INTERVAL(27, 0, 0)).value == oracle_scanner::EncodeOracleIntervalYearMonth(2, 3));
+    CHECK(bind_for(year_month, duckdb::Value::INTERVAL(-71, 0, 0)).value ==
+          oracle_scanner::EncodeOracleIntervalYearMonth(-5, -11));
+    unconvertible(year_month, duckdb::Value::INTERVAL(1, 1, 0), "whole months");
+    unsupported(year_month, duckdb::Value("1-2"), "takes INTERVAL");
+    const auto day_second = Column("ELAPSED", 183);
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, 3, 4 * 3600000000LL + 5 * 60000000LL + 6000007LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(3, 4, 5, 6, 7000));
+    // Whole days in the time part move to the day count; a negative span keeps one sign.
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, 1, 25 * 3600000000LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(2, 1, 0, 0, 0));
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, -2, -3600000000LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(-2, -1, 0, 0, 0));
+    CHECK(bind_for(day_second, duckdb::Value::INTERVAL(0, 0, -500000LL)).value ==
+          oracle_scanner::EncodeOracleIntervalDaySecond(0, 0, 0, 0, -500000000));
+    unconvertible(day_second, duckdb::Value::INTERVAL(0, 1, -1000000LL), "opposite signs");
+    unconvertible(day_second, duckdb::Value::INTERVAL(1, 0, 0), "cannot hold months");
     unsupported(Column("WHEN_TZ", 181), duckdb::Value("2024-03-05 06:07:08+02:00"), "TIMESTAMP WITH TIME ZONE");
 
     std::cout << "write binds follow the Oracle column type" << std::endl;
@@ -1698,8 +2008,8 @@ void TestAttachedCatalogAgainstAFakeSession() {
     CHECK(projection_sql.find("SELECT \"LABEL\" FROM \"ITEMS\"") == 0);
     CHECK(projection_sql.find("\"ID\"") == std::string::npos);
 
-    // Filter pushdown is off by default, so nothing reaches Oracle until it is
-    // asked for.
+    // Filter pushdown is on by default; switched off, nothing reaches Oracle.
+    database.Run("SET oracle_filter_pushdown = false;");
     auto unpushed = database.Query("SELECT LABEL FROM ora.main.ITEMS WHERE ID = 1;");
     CHECK(!unpushed->HasError());
     CHECK(script->queries.back().find("WHERE") == std::string::npos);
@@ -1716,6 +2026,803 @@ void TestAttachedCatalogAgainstAFakeSession() {
 // adapter builds, the binds it sends, and the session it sends them on. Until
 // the fake could answer a projection of a scripted table, none of this could be
 // reached without a live Oracle.
+// The dictionary names a column's type in words, and the attached catalog's
+// write and filter paths work from that, not from the describe. Types it did
+// not name used to arrive as "Oracle type 0 has no mapping". These now map, so
+// a national column is bound as one, an interval and a BOOLEAN are written, and
+// what still cannot be written is named for what it is.
+void TestAttachedCatalogNamesTheNewTypes() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("T")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const auto row = [](const char *name, const char *type, const char *scale) {
+        return std::vector<WireValue>{Text("T"), Text(name), Text(type), Number("22"), WireValue(),
+                                       scale ? Number(scale) : WireValue(), Text("Y")};
+    };
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {row("NV", "NVARCHAR2", nullptr), row("NC", "NCHAR", nullptr), row("YM", "INTERVAL YEAR(2) TO MONTH", "0"),
+           row("DS", "INTERVAL DAY(2) TO SECOND(6)", "6"), row("FLAG", "BOOLEAN", nullptr),
+           row("SEEN", "TIMESTAMP(6) WITH LOCAL TIME ZONE", "6"), row("ADDR", "ROWID", nullptr),
+           row("OLD", "LONG", nullptr), row("DOC", "CLOB", nullptr), row("NDOC", "NCLOB", nullptr),
+           row("IMG", "BLOB", nullptr)}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    auto national = Column("NV", 1);
+    national.character_set_form = 2;
+    auto national_fixed = Column("NC", 96);
+    national_fixed.character_set_form = 2;
+    auto national_doc = Column("NDOC", 112);
+    national_doc.character_set_form = 2;
+    script->tables["T"] = {{national, national_fixed, Column("YM", 182), Column("DS", 183), Column("FLAG", 252),
+                            Column("SEEN", 231), Column("ADDR", 11), Column("OLD", 8), Column("DOC", 112),
+                            national_doc, Column("IMG", 113)},
+                           {}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+
+    auto described = database.Query("SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'T' "
+                                    "ORDER BY column_index");
+    CHECK(!described->HasError());
+    const std::vector<std::string> expected_types = {"VARCHAR", "VARCHAR", "INTERVAL", "INTERVAL",
+                                                     "BOOLEAN", "TIMESTAMP WITH TIME ZONE", "VARCHAR", "VARCHAR",
+                                                     "VARCHAR", "VARCHAR", "BLOB"};
+    CHECK(described->RowCount() == expected_types.size());
+    for (duckdb::idx_t index = 0; index < expected_types.size(); index++) {
+        CHECK(described->GetValue(1, index).ToString() == expected_types[index]);
+    }
+
+    database.Run("INSERT INTO ora.main.T (NV, NC, YM, DS, FLAG, SEEN) VALUES ('h\xC3\xA9', 'ab', INTERVAL 14 MONTHS, "
+                 "INTERVAL '2 days 03:04:05', true, TIMESTAMPTZ '2026-03-04 05:06:07+00');");
+    CHECK(script->batch_rows.size() == 1 && script->batch_rows[0].size() == 6);
+    const auto &binds = script->batch_rows[0];
+    CHECK(binds[0].oracle_type == 1 && binds[0].character_set_form == 2);
+    CHECK(binds[0].value == std::vector<uint8_t>({0x00, 0x68, 0x00, 0xE9}));
+    CHECK(binds[1].oracle_type == 96 && binds[1].character_set_form == 2);
+    CHECK(binds[2].oracle_type == 182 && binds[2].value == oracle_scanner::EncodeOracleIntervalYearMonth(1, 2));
+    CHECK(binds[3].oracle_type == 183 && binds[3].value == oracle_scanner::EncodeOracleIntervalDaySecond(2, 3, 4, 5, 0));
+    CHECK(binds[4].oracle_type == 252 && binds[4].value == std::vector<uint8_t>({1, 1}));
+    CHECK(binds[5].oracle_type == 180);
+
+    // A LOB is written as the ordinary bind of its content: VARCHAR2 for a CLOB
+    // or NCLOB, RAW for a BLOB.
+    database.Run("INSERT INTO ora.main.T (DOC, NDOC, IMG) VALUES ('doc', 'ndoc', '\\x01\\x02'::BLOB), (NULL, NULL, NULL), "
+                 "('', '', ''::BLOB);");
+    CHECK(script->batch_rows.size() == 3 && script->batch_rows[0].size() == 3);
+    CHECK(script->batch_rows[0][0].oracle_type == 1 && script->batch_rows[0][0].character_set_form == 0 &&
+          script->batch_rows[0][0].value == std::vector<uint8_t>({'d', 'o', 'c'}));
+    CHECK(script->batch_rows[0][1].oracle_type == 1 && script->batch_rows[0][1].character_set_form == 0);
+    CHECK(script->batch_rows[0][2].oracle_type == 23 && script->batch_rows[0][2].value == std::vector<uint8_t>({1, 2}));
+    for (size_t row = 1; row < 3; row++) {
+        CHECK(script->batch_rows[row][0].oracle_type == 1 && !script->batch_rows[row][0].value.has_value());
+        CHECK(script->batch_rows[row][2].oracle_type == 23 && !script->batch_rows[row][2].value.has_value());
+    }
+    // RETURNING cannot carry a LOB, and says so.
+    auto returning_lob = database.Query("INSERT INTO ora.main.T (DOC) VALUES ('x') RETURNING DOC;");
+    CHECK(returning_lob->HasError() && returning_lob->GetError().find("cannot return the LOB, JSON or VECTOR column") != std::string::npos);
+
+    // What cannot be written is refused by name, not as "type 0".
+    auto refused = database.Query("INSERT INTO ora.main.T (OLD) VALUES ('x');");
+    CHECK(refused->HasError() && refused->GetError().find("Oracle type 8 cannot be written") != std::string::npos);
+    refused = database.Query("INSERT INTO ora.main.T (ADDR) VALUES ('AAAAAAAAAAAAAAAAAA');");
+    CHECK(refused->HasError() && refused->GetError().find("Oracle type 11 cannot be written") != std::string::npos);
+    std::cout << "the attached catalog names national, interval, boolean and local-zone columns" << std::endl;
+}
+
+// JSON and VECTOR through SQL, with no database: the DuckDB types a describe
+// maps to, the values, the catalog that reads a VECTOR's shape from the
+// dictionary, the text they are written as, and an INSERT whose columns the
+// optimizer turns into constants. The images are built here from the layout
+// oson.cpp and oracle_vector.cpp document and the live tests check against a
+// server; the captured ones are in protocol_test.cpp.
+std::vector<uint8_t> VectorImage(uint8_t format, uint32_t dimensions, const std::vector<uint8_t> &elements) {
+    std::vector<uint8_t> image {0xDB, 0x00, 0x00, 0x12, format};
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        image.push_back(static_cast<uint8_t>(dimensions >> shift));
+    }
+    image.insert(image.end(), 8, 0);
+    image.insert(image.end(), elements.begin(), elements.end());
+    return image;
+}
+
+std::vector<uint8_t> Float32Elements(const std::vector<float> &values) {
+    std::vector<uint8_t> result;
+    for (const auto value : values) {
+        const auto sortable = oracle_scanner::EncodeOracleBinaryFloat(value);
+        result.insert(result.end(), sortable.begin(), sortable.end());
+    }
+    return result;
+}
+
+std::vector<uint8_t> Utf8(const std::string &text) {
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+void TestJsonAndVectorColumnsThroughSql() {
+    // A scalar JSON document is the smallest image: header, tree size, then a
+    // string node (its length in the type byte).
+    std::vector<uint8_t> scalar_string {0xff, 0x4a, 0x5a, 0x01, 0x00, 0x16, 0x00, 0x07, 0x06};
+    for (const auto character : std::string("scalar")) {
+        scalar_string.push_back(static_cast<uint8_t>(character));
+    }
+    const std::vector<uint8_t> object_a_is_1 {0xff, 0x4a, 0x5a, 0x01, 0x21, 0x06, 0x01, 0x00, 0x02, 0x00, 0x08, 0x00, 0x00, 0x2c,
+                                              0x00, 0x00, 0x01, 0x61, 0x84, 0x01, 0x01, 0x00, 0x05, 0x21, 0xc1, 0x02};
+
+    // oracle_query: the describe carries the vector's shape.
+    {
+        auto script = std::make_shared<FakeScript>();
+        auto json = Column("J", 119);
+        auto fixed = Column("F", 127);
+        fixed.vector_dimensions = 3;
+        fixed.vector_format = oracle_scanner::ORACLE_VECTOR_FLOAT32;
+        auto open_ended = Column("O", 127);
+        open_ended.vector_flags = oracle_scanner::ORACLE_VECTOR_COLUMN_FLEXIBLE_DIMENSIONS;
+        auto small = Column("S", 127);
+        small.vector_dimensions = 4;
+        small.vector_format = oracle_scanner::ORACLE_VECTOR_INT8;
+        auto packed = Column("B", 127);
+        packed.vector_dimensions = 16;
+        packed.vector_format = oracle_scanner::ORACLE_VECTOR_BINARY;
+        script->columns = {json, fixed, open_ended, small, packed};
+        script->rows = {{object_a_is_1, VectorImage(oracle_scanner::ORACLE_VECTOR_FLOAT32, 3, Float32Elements({1.5F, 2.0F, 3.0F})),
+                         VectorImage(oracle_scanner::ORACLE_VECTOR_FLOAT32, 2, Float32Elements({0.5F, -1.0F})),
+                         VectorImage(oracle_scanner::ORACLE_VECTOR_INT8, 4, {1, 0xFE, 3, 127}),
+                         VectorImage(oracle_scanner::ORACLE_VECTOR_BINARY, 16, {0x05, 0xFF})},
+                        {scalar_string, std::nullopt, std::nullopt, std::nullopt, std::nullopt},
+                        {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT * FROM app.docs')");
+        CHECK(!result->HasError());
+        CHECK(result->GetTypes()[0].IsJSONType());
+        CHECK(result->GetTypes()[1].ToString() == "FLOAT[3]");
+        CHECK(result->GetTypes()[2].ToString() == "DOUBLE[]");
+        CHECK(result->GetTypes()[3].ToString() == "TINYINT[4]");
+        CHECK(result->GetTypes()[4].ToString() == "UTINYINT[2]");
+        CHECK(result->RowCount() == 3);
+        CHECK(result->GetValue(0, 0).ToString() == "{\"a\":1}");
+        CHECK(result->GetValue(1, 0).ToString() == "[1.5, 2.0, 3.0]");
+        CHECK(result->GetValue(2, 0).ToString() == "[0.5, -1.0]");
+        CHECK(result->GetValue(3, 0).ToString() == "[1, -2, 3, 127]");
+        CHECK(result->GetValue(4, 0).ToString() == "[5, 255]");
+        CHECK(result->GetValue(0, 1).ToString() == "\"scalar\"");
+        CHECK(result->GetValue(1, 1).IsNull() && result->GetValue(0, 2).IsNull());
+        // The JSON column is queryable as JSON.
+        auto extracted = database.Query("SELECT json_extract(J, '$.a') FROM oracle_query('ora', 'SELECT * FROM app.docs') WHERE J IS NOT NULL ORDER BY 1");
+        CHECK(!extracted->HasError());
+        // A vector of a different storage format than its column declared is refused, not reinterpreted.
+        script->rows = {{object_a_is_1, VectorImage(oracle_scanner::ORACLE_VECTOR_INT8, 3, {1, 2, 3}), std::nullopt, std::nullopt,
+                         std::nullopt}};
+        auto mismatched = database.Query("SELECT F FROM oracle_query('ora', 'SELECT * FROM app.docs')");
+        CHECK(mismatched->HasError() && mismatched->GetError().find("storage format") != std::string::npos);
+        // A BINARY vector in a column that may hold any format cannot be a list of DOUBLE.
+        script->rows = {{object_a_is_1, std::nullopt, VectorImage(oracle_scanner::ORACLE_VECTOR_BINARY, 8, {1}), std::nullopt,
+                         std::nullopt}};
+        auto binary_in_flexible = database.Query("SELECT O FROM oracle_query('ora', 'SELECT * FROM app.docs')");
+        CHECK(binary_in_flexible->HasError() && binary_in_flexible->GetError().find("BINARY vector") != std::string::npos);
+    }
+
+    // The attached catalog: the dictionary names the types and VECTOR_INFO the shapes.
+    auto script = std::make_shared<FakeScript>();
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("DOCS")}, {Text("PERF")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"vector_info FROM user_tab_columns",
+         {text_columns({"TABLE_NAME", "COLUMN_NAME", "VECTOR_INFO"}),
+          {{Text("DOCS"), Text("EMB"), Text("VECTOR(3,FLOAT32,DENSE)")},
+           {Text("DOCS"), Text("FLEX"), Text("VECTOR(*,*,DENSE)")},
+           {Text("DOCS"), Text("SPARSE"), Text("VECTOR(8,FLOAT64,SPARSE)")},
+           {Text("PERF"), Text("V"), Text("VECTOR(3,FLOAT32,DENSE)")}}}});
+    const auto row = [](const char *name, const char *type, const char *table = "DOCS") {
+        return std::vector<WireValue> {Text(table), Text(name), Text(type), Number("22"), WireValue(), WireValue(), Text("Y")};
+    };
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {row("ID", "NUMBER"), row("DOC", "JSON"), row("EMB", "VECTOR"), row("FLEX", "VECTOR"), row("SPARSE", "VECTOR"),
+           {Text("PERF"), Text("ID"), Text("NUMBER"), Number("22"), Number("9"), Number("0"), Text("N")},
+           row("V", "VECTOR", "PERF"), row("J", "JSON", "PERF")}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {{Text("PERF"), Text("ID")}}}});
+    auto id_column = Column("ID", 2);
+    auto embedding = Column("EMB", 127);
+    auto flex = Column("FLEX", 127);
+    auto sparse = Column("SPARSE", 127);
+    script->tables["DOCS"] = {{id_column, Column("DOC", 119), embedding, flex, sparse}, {}};
+    script->tables["PERF"] = {{Column("ID", 2, 9, 0), embedding, Column("J", 119)}, {}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    auto described = database.Query(
+        "SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'DOCS' ORDER BY column_index");
+    CHECK(!described->HasError() && described->RowCount() == 5);
+    CHECK(described->GetValue(1, 1).ToString() == "JSON");
+    CHECK(described->GetValue(1, 2).ToString() == "FLOAT[3]");
+    CHECK(described->GetValue(1, 3).ToString() == "DOUBLE[]");
+    CHECK(described->GetValue(1, 4).ToString() == "STRUCT(dimensions UINTEGER, indices UINTEGER[], \"values\" DOUBLE[])");
+
+    // JSON is written as its text, which the server converts; a VECTOR as its image.
+    database.Run("INSERT INTO ora.main.DOCS (ID, DOC, EMB, FLEX, SPARSE) VALUES (1, '{\"k\":[1,2]}', [0.1, 2, -3.5], "
+                 "[1.0, 2.0], {'dimensions': 8, 'indices': [1, 6], 'values': [0.5, 4.0]});");
+    CHECK(script->batch_rows.size() == 1 && script->batch_rows[0].size() == 5);
+    const auto &binds = script->batch_rows[0];
+    CHECK(binds[1].oracle_type == 1 && binds[1].value == Utf8("{\"k\":[1,2]}"));
+    // A vector is bound as its image, in the storage format its column has;
+    // a column of any format is written as FLOAT64 and the server converts.
+    const auto written = [&](size_t position) { return oracle_scanner::DecodeOracleVector(*binds[position].value); };
+    CHECK(binds[2].oracle_type == 127 && written(2).format == oracle_scanner::ORACLE_VECTOR_FLOAT32 &&
+          written(2).float32 == std::vector<float>({0.1F, 2.0F, -3.5F}));
+    CHECK(binds[3].oracle_type == 127 && written(3).format == oracle_scanner::ORACLE_VECTOR_FLOAT64 &&
+          written(3).float64 == std::vector<double>({1.0, 2.0}));
+    CHECK(binds[4].oracle_type == 127 && written(4).sparse && written(4).dimensions == 8 &&
+          written(4).indices == std::vector<uint32_t>({1, 6}) && written(4).float64 == std::vector<double>({0.5, 4.0}));
+    // NULL carries the same wire type as a value, as a batch needs.
+    database.Run("INSERT INTO ora.main.DOCS (ID, DOC, EMB) VALUES (2, NULL, NULL), (3, '{}', [1, 2, 3]);");
+    CHECK(script->batch_rows.size() == 2);
+    CHECK(script->batch_rows[0][1].oracle_type == 1 && !script->batch_rows[0][1].value.has_value());
+    CHECK(script->batch_rows[0][2].oracle_type == 127 && !script->batch_rows[0][2].value.has_value());
+
+    // A column the statement names is written whatever the optimizer makes of
+    // the expression that fills it: here two columns are constants the
+    // optimizer folds, and they used to be mistaken for columns left out, so
+    // Oracle received a row of NULLs, or no columns at all.
+    database.Run("INSERT INTO ora.main.PERF (ID, V, J) SELECT i, list_transform(range(3), lambda x: x / 2.0)::FLOAT[3], "
+                 "'{\"folded\":true}'::JSON FROM range(2) t(i);");
+    CHECK(script->batch_rows.size() == 2 && script->batch_rows[0].size() == 3);
+    CHECK(oracle_scanner::DecodeOracleVector(*script->batch_rows[0][1].value).float32 == std::vector<float>({0.0F, 0.5F, 1.0F}));
+    CHECK(script->batch_rows[0][2].value == Utf8("{\"folded\":true}"));
+    database.Run("INSERT INTO ora.main.PERF (ID, V, J) SELECT 10 + i, list_transform(range(3), lambda x: x / 2.0)::FLOAT[3], "
+                 "'{\"folded\":true}'::JSON FROM range(2) t(i);");
+    CHECK(script->batch_rows.size() == 2 && script->batch_rows[0].size() == 3);
+    CHECK(oracle_scanner::DecodeOracleVector(*script->batch_rows[0][1].value).float32 == std::vector<float>({0.0F, 0.5F, 1.0F}));
+    // A column the statement leaves out stays out.
+    database.Run("INSERT INTO ora.main.PERF (ID) SELECT i FROM range(2) t(i);");
+    CHECK(script->batch_rows.size() == 2 && script->batch_rows[0].size() == 1);
+
+    auto returning = database.Query("INSERT INTO ora.main.DOCS (ID) VALUES (4) RETURNING ID;");
+    CHECK(returning->HasError() && returning->GetError().find("cannot return the LOB, JSON or VECTOR column") != std::string::npos);
+
+    auto wrong_shape = database.Query("INSERT INTO ora.main.DOCS (ID, EMB) VALUES (5, [1, 2]);");
+    CHECK(wrong_shape->HasError());
+    // A test of a JSON path is narrowed in Oracle (JSON_VALUE / JSON_EXISTS) and still applied by DuckDB.
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE DOC->>'$.name' = 'abc';")->HasError());
+    CHECK(script->queries.back().find("JSON_VALUE(\"DOC\", '$.name' RETURNING VARCHAR2(4000) NULL ON ERROR) = 'abc'") !=
+          std::string::npos);
+    // A constant that could be a number is not narrowed: Oracle writes numbers its own way.
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE DOC->>'$.name' = '5';")->HasError());
+    CHECK(script->queries.back().find("JSON_VALUE") == std::string::npos);
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE DOC->>'$.a[0]' IS NOT NULL;")->HasError());
+    CHECK(script->queries.back().find("JSON_EXISTS(\"DOC\", '$.a[0]')") != std::string::npos);
+    std::cout << "JSON and VECTOR columns read, write and attach against a fake session" << std::endl;
+}
+
+// With filter pushdown on, a filter Oracle is not sent is applied to the rows
+// that come back rather than refused. The fake answers every WHERE with all the
+// rows, so only the local evaluation can narrow them.
+void TestUntranslatableFiltersRunLocally() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->two_batch_fetch = true;
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("ITEMS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("ITEMS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1)},
+                               {{Number("1"), Text("first")}, {Number("2"), Text("second")}, {Number("3"), Text("third")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    database.Run("SET oracle_filter_pushdown = true;");
+
+    const auto ids = [&](const std::string &where) {
+        auto result = database.Query("SELECT ID FROM ora.main.ITEMS WHERE " + where + " ORDER BY ID;");
+        CHECK(!result->HasError());
+        std::string joined;
+        for (duckdb::idx_t row = 0; row < result->RowCount(); row++) {
+            joined += (joined.empty() ? "" : ",") + result->GetValue(0, row).ToString();
+        }
+        return joined;
+    };
+    // LIKE is not translated: Oracle's LIKE, escape and collation rules differ.
+    CHECK(ids("LABEL LIKE 'sec%'") == "2");
+    CHECK(script->queries.back().find("WHERE") == std::string::npos);
+    // One filter sent and one kept: both hold.
+    CHECK(ids("ID >= 2 AND LABEL LIKE 'th%'") == "3");
+    CHECK(script->queries.back().find("WHERE \"ID\" >= 2") != std::string::npos);
+    // A predicate across two columns.
+    CHECK(ids("ID = 1 OR LABEL = 'third'") == "1,3");
+    // Every row dropped by the local filter in the first batch must not end the scan.
+    CHECK(ids("LABEL LIKE 'zzz%'").empty());
+    std::cout << "filters Oracle is not sent are applied locally" << std::endl;
+}
+
+// A CLOB the local filter never looks at is read for the rows that pass the filter,
+// by ROWID and at the change number the rows were read at.
+void TestHeavyColumnsAreReadAfterTheFilter() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("100")}}}});
+    script->routes.push_back({"iot_type", {text_columns({"IOT_TYPE", "TEMPORARY", "CLUSTER_NAME"}), {{WireValue(), Text("N"), WireValue()}}}});
+    script->routes.push_back({"WHERE ROWID IN", {{Column("rowid", 1), Column("BODY", 112)}, {{Text("AAAROW1"), Text("second body")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("DOCS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("DOCS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("DOCS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")},
+           {Text("DOCS"), Text("BODY"), Text("CLOB"), Number("4000"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["DOCS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1), Column("BODY", 112)},
+                              {{Number("1"), Text("first"), Text("first body")},
+                               {Number("2"), Text("second"), Text("second body")},
+                               {Number("3"), Text("third"), Text("third body")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    // LIKE is a filter Oracle is not sent, so DuckDB applies it, and BODY is not part of it.
+    auto result = database.Query("SELECT ID, BODY FROM ora.main.DOCS WHERE LABEL LIKE 'sec%';");
+    CHECK(!result->HasError() && result->RowCount() == 1);
+    CHECK(result->GetValue(0, 0).ToString() == "2" && result->GetValue(1, 0).ToString() == "second body");
+    bool light = false;
+    bool heavy = false;
+    for (const auto &query : script->queries) {
+        light = light || (query.find("AS OF SCN 100") != std::string::npos && query.find("ROWIDTOCHAR(ROWID)") != std::string::npos &&
+                          query.find("\"BODY\"") == std::string::npos);
+        heavy = heavy || query.find("WHERE ROWID IN (CHARTOROWID('AAAROW1'))") != std::string::npos;
+    }
+    CHECK(light && heavy);
+    // A filter that reads the column is applied to the whole row, which is read at once.
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID FROM ora.main.DOCS WHERE LABEL LIKE 'sec%' AND BODY LIKE 'x%';")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("WHERE ROWID IN") == std::string::npos);
+    }
+    // And the setting turns it off.
+    database.Run("SET oracle_deferred_columns = false;");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID, BODY FROM ora.main.DOCS WHERE LABEL LIKE 'sec%';")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("WHERE ROWID IN") == std::string::npos && query.find("AS OF SCN") == std::string::npos);
+    }
+    // With oracle_consistent_read a statement's scans all read at one change number.
+    database.Run("SET oracle_consistent_read = true;");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT a.ID FROM ora.main.DOCS a JOIN ora.main.DOCS b ON a.LABEL = b.LABEL;")->HasError());
+    size_t pinned = 0;
+    for (const auto &query : script->queries) {
+        pinned += query.find("FROM \"DOCS\" AS OF SCN 100") != std::string::npos ? 1 : 0;
+    }
+    CHECK(pinned == 2);
+    database.Run("SET oracle_consistent_read = false;");
+    std::cout << "heavy columns are read after the filter" << std::endl;
+}
+
+// ATTACH ... (SCHEMA 'x') lists another user's tables through the ALL_ views,
+// qualifies every statement with the owner, and settles the name against
+// ALL_USERS. The connected user's own schema, named or not, stays on USER_.
+void TestAttachToAnotherSchema() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("READER")}}}});
+    script->routes.push_back({"username = 'hr'", {text_columns({"USERNAME"}), {}}});
+    script->routes.push_back({"UPPER(username) = UPPER('hr')", {text_columns({"USERNAME"}), {{Text("HR")}}}});
+    script->routes.push_back({"username = 'HR'", {text_columns({"USERNAME"}), {{Text("HR")}}}});
+    script->routes.push_back({"username = 'READER'", {text_columns({"USERNAME"}), {{Text("READER")}}}});
+    script->routes.push_back({"username = 'NOBODY'", {text_columns({"USERNAME"}), {}}});
+    script->routes.push_back({"UPPER(username) = UPPER('NOBODY')", {text_columns({"USERNAME"}), {}}});
+    script->routes.push_back({"FROM all_tables", {text_columns({"TABLE_NAME"}), {{Text("ITEMS")}}}});
+    script->routes.push_back({"FROM all_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("OWN_TABLE")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM all_tab_columns",
+         {dictionary, {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary, {{Text("OWN_TABLE"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back({"FROM all_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {{Text("ITEMS"), Text("ID")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    script->tables["OWN_TABLE"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+
+    // Written in lower case, resolved to the one user it matches.
+    database.Run("ATTACH 'ora' AS other (TYPE oracle_scanner, SCHEMA 'hr');");
+    auto listed = database.Query("SELECT table_name FROM duckdb_tables() WHERE database_name = 'other';");
+    CHECK(!listed->HasError() && listed->RowCount() == 1 && listed->GetValue(0, 0).ToString() == "ITEMS");
+    CHECK(!database.Query("SELECT * FROM other.main.ITEMS;")->HasError());
+    CHECK(script->queries.back().find("FROM \"HR\".\"ITEMS\"") != std::string::npos);
+    // The owner's key constraint came from ALL_CONSTRAINTS for this owner.
+    auto keys = database.Query("SELECT constraint_type FROM duckdb_constraints() WHERE table_name = 'ITEMS' "
+                               "AND constraint_type = 'PRIMARY KEY';");
+    CHECK(!keys->HasError() && keys->RowCount() == 1);
+    database.Run("INSERT INTO other.main.ITEMS VALUES (5);");
+    CHECK(script->counted_executes.back() == "INSERT INTO \"HR\".\"ITEMS\" (\"ID\") VALUES (:1)");
+    database.Run("UPDATE other.main.ITEMS SET ID = 6;");
+    CHECK(script->counted_executes.back().find("UPDATE \"HR\".\"ITEMS\" SET") == 0);
+    database.Run("DELETE FROM other.main.ITEMS;");
+    CHECK(script->counted_executes.back().find("DELETE FROM \"HR\".\"ITEMS\" WHERE ROWID") == 0);
+
+    // The connected user's own name reads the USER_ views, unqualified.
+    database.Run("ATTACH 'ora' AS own (TYPE oracle_scanner, SCHEMA 'READER');");
+    CHECK(!database.Query("SELECT * FROM own.main.OWN_TABLE;")->HasError());
+    CHECK(script->queries.back().find("FROM \"OWN_TABLE\"") != std::string::npos);
+
+    auto unknown = database.Query("ATTACH 'ora' AS nobody (TYPE oracle_scanner, SCHEMA 'NOBODY');");
+    CHECK(unknown->HasError() && unknown->GetError().find("no schema \"NOBODY\"") != std::string::npos);
+    auto not_text = database.Query("ATTACH 'ora' AS bad (TYPE oracle_scanner, SCHEMA 5);");
+    CHECK(not_text->HasError() && not_text->GetError().find("SCHEMA takes a schema name") != std::string::npos);
+    std::cout << "an attached catalog can read another user's schema" << std::endl;
+}
+
+void TestXmlTypeColumnsAreText() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("DOCS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary,
+          {{Text("DOCS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("DOCS"), Text("BODY"), Text("XMLTYPE"), Number("2000"), std::nullopt, std::nullopt, Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["DOCS"] = {{Column("ID", 2, 10, 0), Column("BODY", 112)}, {{Number("1"), Text("<a/>")}}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+
+    // The column is text on the DuckDB side, and the scan asks Oracle to serialize it.
+    auto described = database.Query("SELECT data_type FROM duckdb_columns() WHERE column_name = 'BODY';");
+    CHECK(!described->HasError() && described->GetValue(0, 0).ToString() == "VARCHAR");
+    // A name typed in lower case finds the one object that matches ignoring case,
+    // and the statement Oracle gets names it as Oracle stores it.
+    auto lower = database.Query("SELECT body FROM o.main.docs;");
+    CHECK(!lower->HasError() && lower->GetValue(0, 0).ToString() == "<a/>");
+    CHECK(script->queries.back().find("FROM \"DOCS\"") != std::string::npos);
+    auto scanned = database.Query("SELECT BODY FROM o.main.DOCS;");
+    CHECK(!scanned->HasError() && scanned->GetValue(0, 0).ToString() == "<a/>");
+    CHECK(script->queries.back().find("XMLSERIALIZE(CONTENT \"BODY\" AS CLOB NO INDENT) \"BODY\"") != std::string::npos);
+    // A write binds the text through XMLPARSE, once per placeholder.
+    database.Run("INSERT INTO o.main.DOCS VALUES (2, '<b/>');");
+    CHECK(script->counted_executes.back() == "INSERT INTO \"DOCS\" (\"ID\", \"BODY\") VALUES (:1, XMLPARSE(DOCUMENT :2))");
+    database.Run("UPDATE o.main.DOCS SET BODY = '<c/>';");
+    CHECK(script->counted_executes.back().find("\"BODY\" = XMLPARSE(DOCUMENT :1)") != std::string::npos);
+    std::cout << "an XMLTYPE column reads and writes as text" << std::endl;
+}
+
+// With Oracle's row count the optimizer puts the attached table on the probe
+// side of a join, and the keys the other side holds reach Oracle: as an IN list
+// when they are few, as ranges of the key otherwise.
+void TestJoinKeysReachOracle() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    // The statistics query comes before the object listing, which matches the same view.
+    script->routes.push_back({"num_distinct IS NOT NULL",
+                              {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("NUM_DISTINCT", 2)},
+                               {{Text("FACTS"), Text("ID"), Number("4000000")}}}});
+    script->routes.push_back({"num_rows IS NOT NULL", {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)},
+                                                       {{Text("FACTS"), Number("5000000")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary, {{Text("FACTS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["FACTS"] = {{Column("ID", 2, 10, 0)}, {{Number("1000")}, {Number("1100")}, {Number("1200")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+
+    // The row count and the column's distinct count reach the optimizer, which sizes the grouping from them.
+    auto estimated = database.Query("EXPLAIN SELECT ID, count(*) FROM o.main.FACTS GROUP BY ID;");
+    CHECK(!estimated->HasError());
+    std::string plan;
+    for (duckdb::idx_t row = 0; row < estimated->RowCount(); row++) {
+        plan += estimated->GetValue(1, row).ToString();
+    }
+    // The scan is 5,000,000 rows, and the grouping is sized below that because
+    // the column is known to hold fewer distinct values.
+    size_t at_scan_size = 0;
+    for (auto position = plan.find("~5,000,000 rows"); position != std::string::npos;
+         position = plan.find("~5,000,000 rows", position + 1)) {
+        at_scan_size++;
+    }
+    CHECK(at_scan_size == 2 && plan.find("~") != std::string::npos);
+    // Five keys: an IN list.
+    auto few = database.Query("SELECT count(*) FROM o.main.FACTS f JOIN (SELECT unnest([1000, 1100, 1200, 9999]) k) v "
+                              "ON f.ID = v.k;");
+    CHECK(!few->HasError() && few->GetValue(0, 0).ToString() == "3");
+    CHECK(script->queries.back().find("WHERE") != std::string::npos &&
+          script->queries.back().find("1000") != std::string::npos);
+    // Many keys: the ranges they fall in, and the answer is the same.
+    auto many = database.Query("SELECT count(*) FROM o.main.FACTS f JOIN (SELECT 1000 + i * 100 AS k FROM range(300) t(i)) v "
+                               "ON f.ID = v.k;");
+    CHECK(!many->HasError() && many->GetValue(0, 0).ToString() == "3");
+    CHECK(script->queries.back().find("WHERE") != std::string::npos &&
+          (script->queries.back().find("BETWEEN") != std::string::npos ||
+           script->queries.back().find("IN (") != std::string::npos));
+    // ORDER BY ... LIMIT over a number is ranked by Oracle, which returns only the first rows; DuckDB's
+    // own TOP_N stays above it. The setting turns it off.
+    auto top = database.Query("SELECT ID FROM o.main.FACTS ORDER BY ID DESC NULLS FIRST LIMIT 5 OFFSET 2;");
+    CHECK(!top->HasError());
+    CHECK(script->queries.back().find("ORDER BY \"ID\" DESC NULLS FIRST FETCH FIRST 7 ROWS ONLY") != std::string::npos);
+    database.Run("SET oracle_top_n_pushdown = false;");
+    CHECK(!database.Query("SELECT ID FROM o.main.FACTS ORDER BY ID DESC LIMIT 5;")->HasError());
+    CHECK(script->queries.back().find("ORDER BY") == std::string::npos);
+    database.Run("SET oracle_top_n_pushdown = true;");
+    // A grouped COUNT/SUM/MIN/MAX is computed by Oracle: the scan runs one GROUP BY statement and its columns
+    // reach the plan in the types the AGGREGATE had (a sum of integers arrives as text and is a HUGEINT).
+    database.Run("SET oracle_aggregate_pushdown = true;");
+    script->routes.insert(script->routes.begin(),
+                          {"GROUP BY", {{Column("C0", 2, 10, 0), Column("C1", 2, 18, 0), Column("C2", 1), Column("C3", 2, 10, 0)},
+                                        {{Number("1000"), Number("2"), Text("2100"), Number("1000")},
+                                         {Number("1100"), Number("1"), Text("1100"), Number("1100")}}}});
+    auto grouped = database.Query("SELECT ID, count(*), sum(ID), min(ID) FROM o.main.FACTS WHERE ID > 5 GROUP BY ID ORDER BY ID;");
+    CHECK(!grouped->HasError() && grouped->RowCount() == 2);
+    CHECK(grouped->GetValue(2, 0).ToString() == "2100" && grouped->GetValue(2, 0).type() == duckdb::LogicalType::HUGEINT &&
+          grouped->GetValue(1, 0).ToString() == "2");
+    CHECK(script->queries.back().find("GROUP BY \"ID\"") != std::string::npos &&
+          script->queries.back().find("SUM(\"ID\")") != std::string::npos &&
+          script->queries.back().find("WHERE \"ID\" > 5") != std::string::npos);
+    // An IN list over Oracle's 1000-entry limit is sent as several lists joined by OR.
+    std::string many_keys = "SELECT ID FROM o.main.FACTS WHERE ID IN (1";
+    for (int key = 3; key < 5000; key += 2) {
+        many_keys += ", " + std::to_string(key);
+    }
+    CHECK(!database.Query(many_keys + ");")->HasError());
+    CHECK(script->queries.back().find("\"ID\" IN (") != std::string::npos &&
+          script->queries.back().find(") OR \"ID\" IN (") != std::string::npos);
+    // An inner join of two attached tables is one statement, each side an inline view with its own filters.
+    database.Run("SET oracle_join_pushdown = true;");
+    script->routes.insert(script->routes.begin(),
+                          {"JOIN (SELECT", {{Column("C0", 2, 10, 0), Column("C1", 2, 10, 0)},
+                                            {{Number("1000"), Number("1100")}, {Number("1100"), Number("1100")}}}});
+    auto joined = database.Query("SELECT a.ID, b.ID FROM o.main.FACTS a JOIN o.main.FACTS b ON a.ID <= b.ID "
+                                 "WHERE a.ID > 5 AND b.ID < 9000 ORDER BY 1, 2;");
+    CHECK(!joined->HasError() && joined->RowCount() == 2 && joined->GetValue(0, 0).ToString() == "1000");
+    CHECK(script->queries.back().find("FROM (SELECT \"ID\" FROM \"FACTS\" WHERE \"ID\" > 5") !=
+              std::string::npos &&
+          script->queries.back().find("a.\"ID\" <= b.\"ID\"") != std::string::npos);
+    database.Run("SET oracle_join_pushdown = false;");
+    // An aggregate with a FILTER is left to DuckDB.
+    CHECK(!database.Query("SELECT count(*) FILTER (WHERE ID > 1050) FROM o.main.FACTS;")->HasError());
+    CHECK(script->queries.back().find("GROUP BY") == std::string::npos);
+    // The rest of this test counts rows the fake serves for plain scans.
+    database.Run("SET oracle_aggregate_pushdown = false;");
+    // EXPLAIN ANALYZE says what was sent to Oracle and what came back.
+    auto analyzed = database.Query("EXPLAIN ANALYZE SELECT ID FROM o.main.FACTS WHERE ID > 1000;");
+    CHECK(!analyzed->HasError());
+    std::string analysis;
+    for (duckdb::idx_t row = 0; row < analyzed->RowCount(); row++) {
+        analysis += analyzed->GetValue(1, row).ToString();
+    }
+    CHECK(analysis.find("Oracle SQL") != std::string::npos && analysis.find("WHERE \"ID\" > 1000") != std::string::npos &&
+          analysis.find("Oracle rows returned") != std::string::npos &&
+          analysis.find("Oracle network") != std::string::npos && analysis.find("Oracle sessions") != std::string::npos);
+    // A system sample of a table is taken by Oracle, not by reading every row. A filter
+    // above the sample stays above it, in DuckDB; a filter below it is part of the scan,
+    // and the sample then stays in DuckDB, after the filter.
+    auto sampled = database.Query("SELECT count(*) FROM o.main.FACTS TABLESAMPLE SYSTEM (10%) REPEATABLE (7);");
+    CHECK(!sampled->HasError());
+    CHECK(script->queries.back().find("FROM \"FACTS\" SAMPLE (10.000000) SEED (7)") != std::string::npos);
+    auto after = database.Query("SELECT count(*) FROM o.main.FACTS TABLESAMPLE SYSTEM (10%) WHERE ID > 0;");
+    CHECK(!after->HasError() && script->queries.back().find("SAMPLE (10.000000)") != std::string::npos &&
+          script->queries.back().find("WHERE") == std::string::npos);
+    auto before = database.Query("SELECT count(*) FROM (SELECT * FROM o.main.FACTS WHERE ID > 0) TABLESAMPLE SYSTEM (10%);");
+    CHECK(!before->HasError() && script->queries.back().find("SAMPLE") == std::string::npos &&
+          script->queries.back().find("WHERE") != std::string::npos);
+    std::cout << "a join's keys reach Oracle as a WHERE clause" << std::endl;
+}
+
+// oracle_vector_search puts nothing from the caller into its statement but
+// identifiers, a number and a word from a fixed list, and refuses the rest.
+void TestVectorSearchArguments() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("ID", 2, 6, 0)};
+    script->rows = {{Number("1")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const auto error_of = [&](const std::string &arguments) {
+        auto result = database.Query("SELECT * FROM oracle_vector_search('ora', " + arguments + ")");
+        CHECK(result->HasError());
+        return result->GetError();
+    };
+    CHECK(error_of("'T', 'E', [1.0], metric := 'x; DROP TABLE t'").find("metric must be COSINE") != std::string::npos);
+    CHECK(error_of("'T', 'E', [1.0], k := 0").find("k must be between 1 and 100000") != std::string::npos);
+    CHECK(error_of("'T', 'E', 5").find("list or array of numbers") != std::string::npos);
+    CHECK(error_of("'', 'E', [1.0]").find("table cannot be empty") != std::string::npos);
+    // Unquoted names are read as Oracle reads them; a quoted one is kept, and quotes inside are doubled.
+    auto quoted = database.Query("SELECT * FROM oracle_vector_search('ora', 'sales.\"MixedCase\"', 'e\"mb', [1.0]::FLOAT[1])");
+    CHECK(!quoted->HasError());
+    CHECK(script->queries.back().find("FROM \"SALES\".\"MixedCase\" t") != std::string::npos);
+    CHECK(script->queries.back().find("t.\"E\"\"MB\"") != std::string::npos);
+    std::cout << "oracle_vector_search refuses what it cannot put in a statement safely" << std::endl;
+}
+
+// With oracle_parallel_scan a big table is read as ROWID ranges cut at extent
+// boundaries, all at one SCN, and every ROWID belongs to exactly one range.
+void TestAttachedScanReadsInRowidRanges() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("424242")}}}});
+    script->routes.push_back({"iot_type", {text_columns({"IOT_TYPE", "TEMPORARY", "CLUSTER_NAME"}),
+                                           {{std::nullopt, Text("N"), std::nullopt}}}});
+    // Ten extents of 1,000 blocks, in ROWID order.
+    std::vector<std::vector<std::optional<std::vector<uint8_t>>>> extents;
+    for (int index = 0; index < 10; index++) {
+        extents.push_back({Text("EXTENT" + std::to_string(index)), Number("1000")});
+    }
+    script->routes.push_back({"dba_extents", {{Column("LOW", 1), Column("BLOCKS", 2)}, extents}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+                                                  Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2),
+                                                  Column("DATA_SCALE", 2), Column("NULLABLE", 1)};
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {dictionary, {{Text("FACTS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["FACTS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+
+    // Automatic, and this table has no row-count statistics: one statement, no ranges.
+    CHECK(!database.Query("SELECT count(*) FROM o.main.FACTS;")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("CHARTOROWID") == std::string::npos);
+    }
+    script->queries.clear();
+
+    database.Run("SET oracle_parallel_scan = 4;");
+    auto result = database.Query("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(!result->HasError());
+    std::vector<std::string> chunks;
+    for (const auto &query : script->queries) {
+        if (query.find("AS OF SCN 424242 WHERE ROWID") != std::string::npos) {
+            chunks.push_back(query);
+        }
+    }
+    // 10,000 blocks over 16 chunks of about 625: each 1,000-block extent is a chunk.
+    CHECK(chunks.size() == 10);
+    std::sort(chunks.begin(), chunks.end());
+    size_t open_below = 0;
+    size_t open_above = 0;
+    for (const auto &chunk : chunks) {
+        const bool has_lower = chunk.find("ROWID >= CHARTOROWID") != std::string::npos;
+        const bool has_upper = chunk.find("ROWID < CHARTOROWID") != std::string::npos;
+        open_below += has_lower ? 0 : 1;
+        open_above += has_upper ? 0 : 1;
+    }
+    CHECK(open_below == 1 && open_above == 1);
+    bool joined = false;
+    for (const auto &chunk : chunks) {
+        joined = joined || chunk.find("ROWID >= CHARTOROWID('EXTENT2') AND ROWID < CHARTOROWID('EXTENT3')") != std::string::npos;
+    }
+    CHECK(joined);
+    // Once the transaction has written, the one session that sees its rows reads, as one stream.
+    database.Run("BEGIN;");
+    database.Run("INSERT INTO o.main.FACTS VALUES (5);");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT count(*) FROM o.main.FACTS;")->HasError());
+    for (const auto &query : script->queries) {
+        CHECK(query.find("AS OF SCN") == std::string::npos);
+    }
+    database.Run("ROLLBACK;");
+    std::cout << "an attached scan can read in ROWID ranges at one SCN" << std::endl;
+}
+
+void TestCallableArgumentsOfTheNewTypes() {
+    using oracle_scanner::BindDirection;
+    const auto encode = [](const char *type, const char *text) {
+        return duckdb::EncodeOracleCallableArgument(type, BindDirection::BIND_IN, duckdb::Value(text), "P", "test");
+    };
+    const auto national = encode("nvarchar", "ab");
+    CHECK(national.oracle_type == 1 && national.character_set_form == 2);
+    CHECK(national.value && *national.value == oracle_scanner::EncodeUtf8ToUtf16Be("ab"));
+    CHECK(encode("boolean", "TRUE").value == std::vector<uint8_t>({1, 1}));
+    CHECK(encode("boolean", "0").value == std::vector<uint8_t>({1, 0}));
+    CHECK(encode("interval_ym", "2 years 3 months").value == oracle_scanner::EncodeOracleIntervalYearMonth(2, 3));
+    CHECK(encode("interval_ds", "1 day 02:03:04").oracle_type == 183);
+    // A local-zone value is bound as the TIMESTAMP of its UTC wall time.
+    const auto local_zone = encode("timestamp_ltz", "2024-03-01 10:00:00+02");
+    CHECK(local_zone.oracle_type == 180 && local_zone.value && local_zone.value->size() == 11);
+    const auto null_out = duckdb::EncodeOracleCallableArgument("nvarchar", BindDirection::BIND_OUT, duckdb::Value(),
+                                                               "P", "test");
+    CHECK(!null_out.value && null_out.character_set_form == 2);
+    bool refused = false;
+    try {
+        encode("boolean", "maybe");
+    } catch (const duckdb::BinderException &error) {
+        refused = std::string(error.what()).find("not a valid BOOLEAN") != std::string::npos;
+    }
+    CHECK(refused);
+    CHECK(duckdb::FormatCallScalar(1, oracle_scanner::EncodeUtf8ToUtf16Be("\xD0\xB0"), 2) == "\xD0\xB0");
+    CHECK(duckdb::FormatCallScalar(252, {1, 1}) == "true");
+    CHECK(duckdb::FormatCallScalar(182, oracle_scanner::EncodeOracleIntervalYearMonth(2, 3)) == "2 years 3 months");
+    std::cout << "callable arguments cover national text, BOOLEAN, intervals and local-zone timestamps" << std::endl;
+}
+
 void TestAttachedWritesAgainstAFakeSession() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -1797,6 +2904,33 @@ void TestAttachedWritesAgainstAFakeSession() {
     CHECK(!database.Query("INSERT INTO ora.main.ITEMS (ID) VALUES (6), (7) RETURNING ID;")->HasError());
     CHECK(script->returning_statements.size() == statements_before + 2);
 
+    // UPDATE and DELETE ... RETURNING: one statement per row, addressed by that
+    // row's ROWID, asking for every column and for the row count, because a row
+    // deleted since the scan read it returns nothing.
+    script->returning_values["r1"] = Number("1");
+    script->returning_values["r2"] = Text("renamed");
+    script->returning_values["rc"] = Number("1");
+    const auto before_update = script->returning_statements.size();
+    auto updated = database.Query("UPDATE ora.main.ITEMS SET LABEL = 'renamed' RETURNING ID, LABEL;");
+    CHECK(!updated->HasError() && updated->RowCount() == 2);
+    CHECK(updated->GetValue(1, 0).ToString() == "renamed");
+    CHECK(script->returning_statements.size() == before_update + 2);
+    CHECK(script->returning_statements.back() ==
+          "UPDATE \"ITEMS\" SET \"LABEL\" = :1, \"ID\" = :2 WHERE ROWID = CHARTOROWID(:3) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2; "
+          ":rc := SQL%ROWCOUNT");
+    const auto before_delete = script->returning_statements.size();
+    auto deleted = database.Query("DELETE FROM ora.main.ITEMS RETURNING ID, LABEL;");
+    CHECK(!deleted->HasError() && deleted->RowCount() == 2);
+    CHECK(script->returning_statements.size() == before_delete + 2);
+    CHECK(script->returning_statements.back() ==
+          "DELETE FROM \"ITEMS\" WHERE ROWID = CHARTOROWID(:1) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2; "
+          ":rc := SQL%ROWCOUNT");
+    // A row that is gone by the time its statement runs is not reported.
+    script->returning_values["rc"] = Number("0");
+    auto gone = database.Query("DELETE FROM ora.main.ITEMS RETURNING ID;");
+    CHECK(!gone->HasError() && gone->RowCount() == 0);
+    script->returning_values.erase("rc");
+
     // Inside a transaction a read of the same catalog goes on the session the
     // write pinned, because Oracle shows uncommitted rows to that session and
     // to no other. The count is the check: a read that opened its own session
@@ -1863,6 +2997,55 @@ void TestFunctionsCanReturnARefCursor() {
     CHECK(script->calls[0].return_bind->direction == oracle_scanner::BindDirection::BIND_OUT);
 
     std::cout << "functions can return a REF CURSOR" << std::endl;
+}
+
+// The shard boundaries are computed without overflow whatever the key range:
+// each shard starts where the one before it ended, the first at the minimum and
+// the last at the maximum, so nothing is lost or read twice.
+void TestParallelScanRangesDoNotOverflow() {
+    struct Case {
+        const char *low;
+        const char *high;
+        int shards;
+    };
+    const Case cases[] = {{"-9223372036854775808", "9223372036854775807", 4},
+                          {"-9223372036854775808", "9223372036854775807", 7},
+                          {"-9000000000000000000", "9000000000000000000", 32},
+                          {"0", "1000000000000000000", 32},
+                          {"5", "5", 4},
+                          {"5", "7", 8},
+                          {"-3", "3", 3}};
+    for (const auto &item : cases) {
+        auto script = std::make_shared<FakeScript>();
+        script->routes.push_back({"get_system_change_number", {{Column("SCN", 2)}, {{Number("1")}}}});
+        script->routes.push_back({"WHERE 1 = 0", {{Column("ID", 2, 18, 0)}, {}}});
+        script->routes.push_back({"MIN(", {{Column("LO", 2), Column("HI", 2), Column("NULLS", 2)},
+                                           {{Number(item.low), Number(item.high), Number("0")}}}});
+        script->tables["ITEMS"] = {{Column("ID", 2, 18, 0)}, {{Number("1")}}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        CHECK(!database.Query("SELECT count(*) FROM oracle_scan_parallel('ora', 'items', 'id', shards => " +
+                              std::to_string(item.shards) + ");")
+                   ->HasError());
+        std::vector<std::pair<long long, long long>> ranges;
+        for (const auto &statement : script->queries) {
+            const auto low_at = statement.find("\"ID\" >= ");
+            const auto high_at = statement.find("\"ID\" <= ");
+            if (statement.find("AS OF SCN") != std::string::npos && low_at != std::string::npos && high_at != std::string::npos) {
+                ranges.emplace_back(std::stoll(statement.substr(low_at + 8)), std::stoll(statement.substr(high_at + 8)));
+            }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        CHECK(!ranges.empty());
+        CHECK(ranges.front().first == std::stoll(item.low) && ranges.back().second == std::stoll(item.high));
+        for (size_t index = 0; index < ranges.size(); index++) {
+            CHECK(ranges[index].first <= ranges[index].second);
+            if (index != 0) {
+                CHECK(ranges[index].first == ranges[index - 1].second + 1);
+            }
+        }
+    }
+    std::cout << "parallel scan ranges cover every key once, at the extremes too" << std::endl;
 }
 
 // Sharding a table by key ranges. The parallelism is the easy half; what this
@@ -1994,8 +3177,9 @@ void TestConnectDescriptorSecretReachesTheSession() {
             "(ADDRESS=(HOST=a.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))'",
             "CONNECT_TIMEOUT disagrees with the CONNECT_DESCRIPTOR TRANSPORT_CONNECT_TIMEOUT");
     refused("CONNECT_DESCRIPTOR '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))"
-            "(CONNECT_DATA=(SERVICE_NAME=svc))))'",
-            "DESCRIPTION_LIST is not supported");
+            "(CONNECT_DATA=(SERVICE_NAME=svc)))(DESCRIPTION=(ADDRESS=(HOST=b)(PORT=1))"
+            "(CONNECT_DATA=(SERVICE_NAME=other))))'",
+            "different databases");
     refused("CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=svc)"
             "(FAILOVER_MODE=(TYPE=select))))'",
             "FAILOVER_MODE (TAF) is not supported");
@@ -2014,6 +3198,147 @@ void TestConnectDescriptorSecretReachesTheSession() {
     CHECK(configs->back().host == "127.0.0.1" && configs->back().routing.address_lists.empty());
 
     std::cout << "connect descriptor secrets reach the session" << std::endl;
+}
+
+// The environment, portably: setenv and unsetenv are POSIX, and MSVC spells them _putenv_s.
+void SetEnvironment(const char *name, const std::string &value) {
+#if defined(_WIN32)
+    CHECK(_putenv_s(name, value.c_str()) == 0);
+#else
+    CHECK(setenv(name, value.c_str(), 1) == 0);
+#endif
+}
+
+void UnsetEnvironment(const char *name) {
+#if defined(_WIN32)
+    CHECK(_putenv_s(name, "") == 0);
+#else
+    CHECK(unsetenv(name) == 0);
+#endif
+}
+
+// DSN and CONFIG_DIR: the python-oracledb spellings of the same three sources.
+void TestDsnSecretReachesTheSession() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto configs = std::make_shared<std::vector<ConnectionConfig>>();
+    oracle_scanner::ScopedOracleSessionFactory factory([script, configs](const ConnectionConfig &config,
+                                                                         const std::string &) {
+        configs->push_back(config);
+        return std::unique_ptr<OracleSession>(new FakeSession(script));
+    });
+    TestDatabase database;
+    const auto query = [&](const std::string &secret_options) {
+        database.Run("CREATE OR REPLACE SECRET dsn_secret (TYPE oracle, USER 'app_user', PASSWORD 'placeholder', " +
+                     secret_options + ");");
+        return database.Query("SELECT * FROM oracle_query('dsn_secret', 'SELECT label FROM app.items')");
+    };
+
+    // Easy Connect, with a list of hosts and routing parameters.
+    CHECK(!query("DSN 'a.example:1521,b.example:1522/sales.example?retry_count=4&transport_connect_timeout=3'")
+               ->HasError());
+    const auto &easy = configs->back();
+    CHECK(easy.host.empty() && easy.service_name == "sales.example" && easy.routing.retry_count == 4 &&
+          easy.connect_timeout_seconds == 3);
+    CHECK(!easy.routing.address_lists.empty() && easy.protocol == oracle_scanner::TransportProtocol::TCP);
+    size_t addresses = 0;
+    for (const auto &list : easy.routing.address_lists) {
+        addresses += list.addresses.size();
+    }
+    CHECK(addresses == 2);
+
+    // A SID names the database the older way, from a secret or a descriptor; a
+    // list of descriptions that name one database is read as its addresses.
+    CHECK(!query("HOST 'h.example', SID 'orcl'")->HasError());
+    CHECK(configs->back().sid == "orcl" && configs->back().service_name.empty());
+    CHECK(!query("DSN '(DESCRIPTION=(ADDRESS=(HOST=a.example)(PORT=1521))(CONNECT_DATA=(SID=orcl2)))'")->HasError());
+    CHECK(configs->back().sid == "orcl2" && configs->back().service_name.empty());
+    CHECK(!query("DSN '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=p.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))"
+                 "(DESCRIPTION=(ADDRESS=(HOST=q.example)(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=svc))))'")
+               ->HasError());
+    CHECK(configs->back().service_name == "svc" && configs->back().routing.address_lists.size() == 2);
+    {
+        // A missing name is a refusal that says so, not an internal error.
+        auto neither = query("HOST 'h.example'");
+        CHECK(neither->HasError() && neither->GetError().find("requires a non-empty service_name") != std::string::npos);
+    }
+    {
+        auto both = query("HOST 'h.example', SERVICE_NAME 'svc', SID 'orcl'");
+        CHECK(both->HasError() && both->GetError().find("both SERVICE_NAME and SID") != std::string::npos);
+    }
+
+    // Session attributes ride on the secret.
+    CHECK(!query("DSN 'a.example/svc', MODULE 'etl', ACTION 'load', CLIENT_IDENTIFIER 'u1', CLIENT_INFO 'run 7'")->HasError());
+    CHECK(configs->back().module == "etl" && configs->back().action == "load" &&
+          configs->back().client_identifier == "u1" && configs->back().client_info == "run 7");
+    {
+        auto too_long = query("DSN 'a.example/svc', ACTION '" + std::string(33, 'x') + "'");
+        CHECK(too_long->HasError() && too_long->GetError().find("ACTION is longer than 32 bytes") != std::string::npos);
+    }
+
+    // tcps:// selects TLS the way a TCPS descriptor does.
+    CHECK(!query("DSN 'tcps://secure.example:2484/svc', TLS_SERVER_NAME 'cert.example'")->HasError());
+    CHECK(configs->back().protocol == oracle_scanner::TransportProtocol::TCPS &&
+          configs->back().tls_server_name == "cert.example");
+
+    // A descriptor works as a DSN too.
+    CHECK(!query("DSN '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=d.example)(PORT=1521))"
+                 "(CONNECT_DATA=(SERVICE_NAME=svc)))'")
+               ->HasError());
+    CHECK(configs->back().service_name == "svc");
+
+    // A bare name is an alias, looked up in CONFIG_DIR: a folder or the file.
+    const auto folder =
+        (std::filesystem::temp_directory_path() /
+         ("oracle_scanner_config_dir_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+            .string();
+    CHECK(std::filesystem::create_directory(folder));
+    const auto tnsnames_path = folder + "/tnsnames.ora";
+    {
+        std::ofstream output(tnsnames_path, std::ios::binary);
+        output << "folder_db = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=f.example)(PORT=1530))"
+                  "(CONNECT_DATA=(SERVICE_NAME=folder.example)))\n";
+    }
+    CHECK(!query("DSN 'folder_db', CONFIG_DIR '" + folder + "'")->HasError());
+    CHECK(configs->back().service_name == "folder.example");
+    CHECK(!query("TNS_ALIAS 'FOLDER_DB', CONFIG_DIR '" + tnsnames_path + "'")->HasError());
+    CHECK(configs->back().routing.address_lists.at(0).addresses.at(0).port == 1530);
+
+    const auto refused = [&](const std::string &secret_options, const std::string &expected) {
+        const auto before = configs->size();
+        auto result = query(secret_options);
+        CHECK(result->HasError());
+        if (result->GetError().find(expected) == std::string::npos) {
+            std::cerr << "unexpected error: " << result->GetError() << "\n";
+            CHECK(false && "wrong error for a refused secret");
+        }
+        CHECK(configs->size() == before);
+    };
+    refused("DSN 'a.example/svc', HOST 'a.example'", "DSN cannot be combined with HOST, PORT, or SERVICE_NAME");
+    refused("DSN 'a.example/svc', TNS_ALIAS 'x', CONFIG_DIR '" + folder + "'",
+            "DSN cannot be combined with TNS_ALIAS or CONNECT_DESCRIPTOR");
+    refused("DSN 'folder_db'", "names an alias, which needs CONFIG_DIR");
+    refused("DSN 'a.example/svc', CONFIG_DIR '" + folder + "'", "CONFIG_DIR is only used to look up");
+    // TNS_ADMIN is where an alias is looked up when nothing else says, and
+    // CONFIG_DIR still wins over it.
+    SetEnvironment("TNS_ADMIN", folder);
+    CHECK(!query("DSN 'folder_db'")->HasError());
+    CHECK(configs->back().service_name == "folder.example");
+    CHECK(!query("TNS_ALIAS 'folder_db'")->HasError());
+    SetEnvironment("TNS_ADMIN", "/nonexistent_oracle_scanner_dir");
+    CHECK(!query("DSN 'folder_db', CONFIG_DIR '" + folder + "'")->HasError());
+    refused("DSN 'folder_db'", "could not be resolved");
+    UnsetEnvironment("TNS_ADMIN");
+    refused("DSN 'missing_alias', CONFIG_DIR '" + folder + "'", "DSN could not be resolved");
+    refused("DSN 'a.example:1521'", "DSN could not be resolved");
+    refused("DSN 'a.example/svc?https_proxy=p'", "is not supported");
+    refused("DSN 'a.example/svc', PROTOCOL 'tcps'", "DSN protocol does not match PROTOCOL 'tcps'");
+    refused("DSN 'a.example/svc', WALLET_FILE '/x'", "require PROTOCOL 'tcps'");
+
+    std::filesystem::remove(tnsnames_path);
+    std::filesystem::remove(folder);
+    std::cout << "DSN and CONFIG_DIR secrets reach the session" << std::endl;
 }
 
 // Failover is for new connections only. A statement whose session fails after
@@ -2190,6 +3515,87 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
                   call.arguments[0].direction == BindDirection::BIND_OUT);
             CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "P_TEXT" &&
                   result.GetValue(1, 0).ToString() == "Quack.");
+        }};
+    cases["oracle_plsql"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["greeting"] = Text("hello world");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::ANONYMOUS_BLOCK && call.qualified_name.empty());
+            CHECK(call.block.find("BEGIN :greeting := 'hello ' || :who; END;") == 0);
+            CHECK(call.arguments.size() == 2 && call.arguments[0].name == "greeting" &&
+                  call.arguments[0].direction == BindDirection::BIND_OUT && call.arguments[1].name == "who" &&
+                  Decoded(call.arguments[1].value) == "world");
+            CHECK(script.commits == 1);
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "greeting" &&
+                  result.GetValue(1, 0).ToString() == "hello world");
+        }};
+    cases["oracle_plsql_transaction"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            script.call_echo_outputs = true;
+            script.call_output_values["n"] = Number("2");
+        },
+        {"ATTACH 'demo' AS ora (TYPE oracle_scanner);"},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::ANONYMOUS_BLOCK && call.block == "BEGIN :n := 1 + 1; END;");
+            CHECK(call.arguments.size() == 1 && call.arguments[0].name == "n");
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "n" &&
+                  result.GetValue(1, 0).ToString() == "2");
+        }};
+    const auto snapshot_setup = [](FakeScript &script) {
+        script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+        script.routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("4242")}}}});
+        script.routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("QUACK_DEMO_DEPARTMENTS")}}}});
+        script.routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+        script.routes.push_back(
+            {"FROM user_tab_columns",
+             {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+               Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+              {{Text("QUACK_DEMO_DEPARTMENTS"), Text("DEPARTMENT_ID"), Text("NUMBER"), Number("22"), Number("6"), Number("0"), Text("Y")}}}});
+        script.routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+        script.tables["QUACK_DEMO_DEPARTMENTS"] = {{Column("DEPARTMENT_ID", 2, 6, 0)}, {{Number("20")}, {Number("30")}, {Number("40")}}};
+    };
+    const std::string snapshot_attach = "ATTACH 'demo' AS ora (TYPE oracle_scanner);";
+    const std::string snapshot_made =
+        "SELECT * FROM oracle_snapshot('ora', 'departments_snapshot', 'SELECT * FROM ora.main.QUACK_DEMO_DEPARTMENTS WHERE department_id > 10');";
+    cases["oracle_snapshot"] = {snapshot_setup, {snapshot_attach},
+                                [](FakeScript &script, MaterializedQueryResult &result) {
+                                    CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "departments_snapshot" &&
+                                          result.GetValue(1, 0).ToString() == "3" && result.GetValue(2, 0).ToString() == "4242");
+                                    // The table was read at the change number the snapshot recorded.
+                                    bool pinned = false;
+                                    for (const auto &query : script.queries) {
+                                        pinned = pinned || query.find("FROM \"QUACK_DEMO_DEPARTMENTS\" AS OF SCN 4242") != std::string::npos;
+                                    }
+                                    CHECK(pinned);
+                                }};
+    cases["oracle_snapshot_refresh"] = {snapshot_setup, {snapshot_attach, snapshot_made},
+                                        [](FakeScript &, MaterializedQueryResult &result) {
+                                            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "departments_snapshot");
+                                        }};
+    cases["oracle_snapshots"] = {snapshot_setup, {snapshot_attach, snapshot_made},
+                                 [](FakeScript &, MaterializedQueryResult &result) {
+                                     CHECK(result.RowCount() == 1 && result.GetValue(1, 0).ToString() == "departments_snapshot" &&
+                                           result.GetValue(2, 0).ToString() == "ora" && result.GetValue(3, 0).ToString() == "4242");
+                                 }};
+    cases["oracle_vector_search"] = {
+        [](FakeScript &script) {
+            script.columns = {Column("ID", 2, 6, 0), Column("DISTANCE", 101)};
+            script.rows = {{Number("7"), std::nullopt}};
+        },
+        {},
+        [](FakeScript &script, MaterializedQueryResult &) {
+            CHECK(!script.queries.empty());
+            const auto &sql = script.queries.back();
+            CHECK(sql == "SELECT t.*, VECTOR_DISTANCE(t.\"EMBEDDING\", :1, COSINE) AS \"DISTANCE\" FROM \"DOCS\" t "
+                         "ORDER BY \"DISTANCE\" FETCH APPROX FIRST 5 ROWS ONLY");
+            const auto &binds = script.query_binds.back();
+            CHECK(binds.size() == 1 && binds[0].oracle_type == 127 && binds[0].value && !binds[0].value->empty());
         }};
     cases["oracle_execute"] = {[](FakeScript &script) { script.affected_rows = 1; },
                                {},
@@ -2441,7 +3847,7 @@ void TestFunctionExamplesRun() {
     auto cases = FunctionExampleCases();
     // The same set on both sides: a function added without an executable
     // example, or a case left for a function that is gone, fails here.
-    CHECK(examples.size() == cases.size() && examples.size() == 29);
+    CHECK(examples.size() == cases.size() && examples.size() == 35);
     for (const auto &example : examples) {
         const auto found = cases.find(example.first);
         if (found == cases.end()) {
@@ -2509,7 +3915,7 @@ void TestFunctionExamplesRun() {
 // bare RegisterFunction overloads set. Loading the extension twice would not
 // show it — DuckDB may skip the second load — and registering the same
 // signature again fails under either mode, so the infos the extension
-// registers are inspected directly, all twenty-nine of them.
+// registers are inspected directly, all thirty-two of them.
 void TestDocumentedRegistrationsAlterOnConflict() {
     std::vector<std::string> names;
     const auto check = [&](const duckdb::CreateFunctionInfo &info, const duckdb::Identifier &name) {
@@ -2527,7 +3933,10 @@ void TestDocumentedRegistrationsAlterOnConflict() {
     }
     const auto parallel = duckdb::OracleParallelScanFunctionInfo();
     check(parallel, parallel.functions.name);
-    CHECK(names.size() == 29);
+    for (const auto &info : duckdb::OracleSnapshotFunctionInfos()) {
+        check(info, info.functions.name);
+    }
+    CHECK(names.size() == 35);
 
     // And what that mode means on a database that already has the functions:
     // an extra overload under an existing name is added to it, where
@@ -3141,6 +4550,8 @@ int main() {
     TestInterruptReachesEveryTransactionPath();
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
+    TestNewTypesReadThroughSql();
+    TestBooleanAndLocalZoneReadThroughSql();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();
     TestUnsupportedColumnTypesAreRefusedAtBind();
@@ -3152,6 +4563,8 @@ int main() {
     TestCursorHandlesAreConsumedOnce();
     TestQueryParametersReachTheSessionAsBinds();
     TestExecuteUsesTheCountedOperation();
+    TestParametersOfEveryWritableType();
+    TestNumberMappings();
     TestExecuteRefusesAnExplicitTransaction();
     TestValidationRunsBeforeAnySession();
     TestUnknownSecretIsRejected();
@@ -3159,12 +4572,24 @@ int main() {
     TestReadSessionsArePooledPerConnection();
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedWritesAgainstAFakeSession();
+    TestAttachedCatalogNamesTheNewTypes();
+    TestAttachToAnotherSchema();
+    TestUntranslatableFiltersRunLocally();
+    TestJsonAndVectorColumnsThroughSql();
+    TestXmlTypeColumnsAreText();
+    TestJoinKeysReachOracle();
+    TestHeavyColumnsAreReadAfterTheFilter();
+    TestAttachedScanReadsInRowidRanges();
+    TestCallableArgumentsOfTheNewTypes();
+    TestVectorSearchArguments();
     TestParallelScanShardsOneSnapshot();
+    TestParallelScanRangesDoNotOverflow();
     TestWriteBindsFollowTheOracleColumnType();
     TestCallableSignatureResolution();
     TestAutomaticCallBindsFromTheSignature();
     TestFunctionsCanReturnARefCursor();
     TestConnectDescriptorSecretReachesTheSession();
+    TestDsnSecretReachesTheSession();
     TestFailedStatementIsNotReplayed();
     TestFunctionExamplesRun();
     TestDocumentedRegistrationsAlterOnConflict();

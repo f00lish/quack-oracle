@@ -249,18 +249,32 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         if (!select_list.empty()) {
             select_list += ", ";
         }
-        select_list += KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
+        select_list += OracleSelectExpression(column);
     }
 
     // Ranges are half-open except the last, which closes on the maximum, so
     // every key belongs to exactly one shard.
-    const auto span = static_cast<uint64_t>(high - low) + 1;
-    if (static_cast<uint64_t>(shards) > span) {
-        shards = static_cast<idx_t>(span);
+    // The key count is span + 1, which is 2^64 for the whole int64 range, so it
+    // is kept as span (count - 1) and every step is done in unsigned
+    // arithmetic, where wrapping is defined and nothing overflows: the signed
+    // difference high - low can exceed INT64_MAX, and count * shard can exceed
+    // UINT64_MAX for keys near 10^18.
+    const auto span = static_cast<uint64_t>(high) - static_cast<uint64_t>(low);
+    if (span < static_cast<uint64_t>(shards) - 1) {
+        shards = static_cast<idx_t>(span + 1);
     }
+    // count / shards and count % shards, with count = span + 1.
+    uint64_t quotient = span / shards;
+    uint64_t remainder = span % shards + 1;
+    if (remainder >= shards) {
+        quotient++;
+        remainder -= shards;
+    }
+    // Where shard i starts: floor(count * i / shards), as a distance from low.
+    const auto offset = [&](idx_t shard) { return quotient * shard + remainder * shard / shards; };
     for (idx_t shard = 0; shard < shards; shard++) {
-        const auto begin = low + static_cast<int64_t>(span * shard / shards);
-        const auto end = low + static_cast<int64_t>(span * (shard + 1) / shards) - 1;
+        const auto begin = static_cast<int64_t>(static_cast<uint64_t>(low) + offset(shard));
+        const auto end = static_cast<int64_t>(static_cast<uint64_t>(low) + offset(shard + 1) - 1);
         auto predicate = key + " >= " + std::to_string(begin) + " AND " + key + " <= " + std::to_string(end);
         result->shard_sql.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + predicate);
     }
@@ -270,6 +284,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         result->shard_sql.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + key + " IS NULL");
     }
 
+    ApplyUnconstrainedNumberSetting(context, result->columns);
     std::unordered_set<std::string> used_names;
     for (idx_t index = 0; index < result->columns.size(); index++) {
         names.push_back(Identifier(OutputName(result->columns[index], index, used_names)));
@@ -330,10 +345,10 @@ void OracleParallelFunction(ClientContext &context, TableFunctionInput &input, D
                                   static_cast<uint64_t>(row.size()), static_cast<uint64_t>(bind.columns.size()));
             }
             for (idx_t column_index = 0; column_index < bind.columns.size(); column_index++) {
-                output.data[column_index].SetValue(row_index,
-                                TranslatingOracleErrors("oracle_scan_parallel could not convert an Oracle value", [&] {
-                                    return ValueFor(bind.columns[column_index], row[column_index]);
-                                }));
+                TranslatingOracleErrors("oracle_scan_parallel could not convert an Oracle value", [&] {
+                    WriteOracleValue(output.data[column_index], row_index, bind.columns[column_index], row[column_index]);
+                    return 0;
+                });
             }
         }
         output.SetChildCardinality(batch.rows.size());

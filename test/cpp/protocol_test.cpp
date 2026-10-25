@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -54,8 +55,12 @@
 #include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/ttc_transaction.hpp"
 #include "oracle_scanner/native_session.hpp"
+#include "oracle_scanner/oracle_vector.hpp"
+#include "oracle_scanner/oson.hpp"
+#include "oracle_scanner/ttc_define.hpp"
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
+#include "oracle_scanner/temp_lob.hpp"
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include "oracle_scanner/lob_prefetch_reader.hpp"
 #include "oracle_scanner/io_deadline_binding.hpp"
@@ -67,6 +72,7 @@
 #include "oracle_scanner/ttc_io_vector.hpp"
 #include "oracle_scanner/ttc_out_binds.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
+#include "oracle_scanner/ttc_data_types_template.hpp"
 #include "oracle_scanner/ttc_statement_channel.hpp"
 #include "oracle_scanner/ttc_row_data.hpp"
 #include "oracle_scanner/ttc_negotiation.hpp"
@@ -94,6 +100,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -580,6 +587,10 @@ static void TestPacketStream() {
     stream.output.clear();
     packets.Send(std::vector<TnsPacket> {{TnsPacketType::DATA, 0, {0, 0, 1}}, {TnsPacketType::DATA, 0, {0, 0, 2}}});
     CHECK(stream.output.size() == 22);
+    // What crossed the connection is counted; a round trip needs a response read after a request, which
+    // this stream, read before it is written, does not have.
+    const auto traffic = packets.GetStatistics();
+    CHECK(traffic.bytes_received == wire.size() && traffic.bytes_sent == 11 + 22 && traffic.round_trips == 0);
 
     wire.pop_back();
     FragmentedStream truncated(wire);
@@ -3180,7 +3191,7 @@ static void TestProcedureCallBuilder() {
     OracleBind return_bind {"return_value", 0, BindDirection::BIND_OUT, std::nullopt};
     CHECK(BuildOracleFunctionCallBlock("app.billing.invoice_total", return_bind, arguments) ==
            "BEGIN :return_value := app.billing.invoice_total(p_id => :p_id, p_result => :p_result); END;");
-    OracleCallRequest function_request {OracleCallableKind::FUNCTION, "app.answer", return_bind, {}, {}};
+    OracleCallRequest function_request {OracleCallableKind::FUNCTION, "app.answer", return_bind, {}, {}, {}};
     CHECK(BuildOracleCallBlock(function_request) == "BEGIN :return_value := app.answer; END;");
     function_request.return_bind.reset();
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { BuildOracleCallBlock(function_request); });
@@ -3433,7 +3444,7 @@ static void TestValidatedSession() {
     session.Query("select * from invoices where id = :id", binds);
     session.Execute("delete from invoices where id = :id", binds);
     session.ExecuteBatch("update invoices set id = :id", {binds});
-    OracleCallRequest call {OracleCallableKind::PROCEDURE, "app.ping", std::nullopt, {}, {}};
+    OracleCallRequest call {OracleCallableKind::PROCEDURE, "app.ping", std::nullopt, {}, {}, {}};
     session.Call(call);
     CHECK(inner->queries == 1 && inner->executes == 1 && inner->batches == 1 && inner->calls == 1);
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { session.Execute("select * from invoices where id = :id", binds); });
@@ -5033,10 +5044,13 @@ static void TestDescriptorRoutingParameters() {
 
     // What would silently change meaning is refused by name.
     const std::vector<std::string> unsupported {
-        "(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s))))",
+        "(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))"
+        "(DESCRIPTION=(ADDRESS=(HOST=b)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=other))))",
+        "(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))"
+        "(DESCRIPTION=(ADDRESS=(HOST=b)(PORT=1))(CONNECT_DATA=(SID=s))))",
+        "(DESCRIPTION_LIST=(MYSTERY=1)(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s))))",
         "(DESCRIPTION=(SOURCE_ROUTE=on)(ADDRESS=(HOST=a)(PORT=1))(ADDRESS=(HOST=b)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(FAILOVER_MODE=(TYPE=select)(METHOD=basic))))",
-        "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SID=orcl)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(SERVER=pooled)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1)(HTTPS_PROXY=proxy))(CONNECT_DATA=(SERVICE_NAME=s)))",
         "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(UR=A)))",
@@ -5047,6 +5061,22 @@ static void TestDescriptorRoutingParameters() {
     for (const auto &descriptor : unsupported) {
         ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)ParseConnectDescriptor(descriptor); });
     }
+    // A SID names the database the older way; a descriptor has one of the two.
+    const auto by_sid = ParseConnectDescriptor("(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SID=orcl)))");
+    CHECK(by_sid.sid == "orcl" && by_sid.service_name.empty());
+    ExpectError(ProtocolErrorKind::MALFORMED, [] {
+        (void)ParseConnectDescriptor("(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SID=a)(SERVICE_NAME=b)))");
+    });
+    // A list of descriptions that name one database is read as their addresses in order.
+    const auto listed = ParseConnectDescriptor(
+        "(DESCRIPTION_LIST=(FAILOVER=on)(LOAD_BALANCE=off)"
+        "(DESCRIPTION=(CONNECT_TIMEOUT=7)(ADDRESS_LIST=(ADDRESS=(HOST=a)(PORT=1))(ADDRESS=(HOST=b)(PORT=2)))"
+        "(CONNECT_DATA=(SERVICE_NAME=s)))"
+        "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=c)(PORT=3))(CONNECT_DATA=(SERVICE_NAME=s))))");
+    CHECK(listed.service_name == "s" && listed.endpoints.size() == 3 && listed.address_lists.size() == 2 &&
+          listed.endpoints[2].host == "c" && listed.endpoints[2].port == 3 && *listed.connect_timeout_seconds == 7);
+    CHECK(listed.failover && !listed.load_balance);
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ParseConnectDescriptor("(DESCRIPTION_LIST=)"); });
     const std::vector<std::string> malformed {
         "(DESCRIPTION=(FAILOVER=on)(FAILOVER=off)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
         "(DESCRIPTION=(FAILOVER=maybe)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
@@ -6922,9 +6952,117 @@ static void TestSsoWallet() {
     }
     CHECK(ReadWalletIdentityPem(sso_file_path, false) == pem);
 
+    // A wallet folder, as python-oracledb's wallet_location names one.
+    const auto folder = base + "_folder";
+    CHECK(std::filesystem::create_directory(folder));
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletIdentityPem(folder, false); });
+    {
+        std::ofstream output(folder + "/cwallet.sso", std::ios::binary);
+        CHECK(output);
+        output.write(wallet.data(), static_cast<std::streamsize>(wallet.size()));
+    }
+    CHECK(ReadWalletIdentityPem(folder, false) == pem);
+    CHECK(ReadWalletIdentityPem(folder, true) == pem);
+    {
+        std::ofstream output(folder + "/ewallet.pem", std::ios::binary);
+        output << plain_pem;
+    }
+    CHECK(ReadWalletIdentityPem(folder, false) == pem);
+    CHECK(ReadWalletIdentityPem(folder, true) == plain_pem);
+    std::remove((folder + "/cwallet.sso").c_str());
+    std::remove((folder + "/ewallet.pem").c_str());
+    std::filesystem::remove(folder);
+
     std::remove(sso_only_path.c_str());
     std::remove(both_path.c_str());
     std::remove(sso_file_path.c_str());
+}
+
+// Easy Connect strings and tnsnames.ora from a folder: the two ways a
+// python-oracledb DSN reaches a connection without a wallet ZIP.
+static void TestEasyConnectAndTnsNamesFolder() {
+    const auto describe = [](const std::string &text) { return ParseConnectDescriptor(EasyConnectToDescriptor(text)); };
+
+    auto one = describe("db.example.com/sales.example.com");
+    CHECK(one.endpoints.size() == 1 && one.endpoints[0].host == "db.example.com" && one.endpoints[0].port == 1521 &&
+          one.endpoints[0].protocol == TransportProtocol::TCP && one.service_name == "sales.example.com");
+    one = describe("//db.example.com:1530/sales");
+    CHECK(one.endpoints[0].port == 1530 && one.service_name == "sales");
+    one = describe("tcps://db.example.com:2484/sales");
+    CHECK(one.endpoints[0].protocol == TransportProtocol::TCPS && one.endpoints[0].port == 2484);
+    one = describe("TCP://db/sales:shared/inst1");
+    CHECK(one.server_type == "shared" || one.server_type == "SHARED");
+    CHECK(one.instance_name == "inst1");
+    one = describe("[::1]:1522/sales");
+    CHECK(one.endpoints[0].host == "::1" && one.endpoints[0].port == 1522);
+
+    const auto many = describe("a.example:1521,b.example:1522,c.example/svc?failover=off&load_balance=on&"
+                               "retry_count=3&retry_delay=2&transport_connect_timeout=5&connect_timeout=40");
+    CHECK(many.endpoints.size() == 3 && many.endpoints[1].host == "b.example" && many.endpoints[1].port == 1522 &&
+          many.endpoints[2].port == 1521);
+    CHECK(!many.failover && many.load_balance);
+    CHECK(many.retry_count && *many.retry_count == 3 && many.retry_delay_seconds && *many.retry_delay_seconds == 2);
+    CHECK(many.transport_connect_timeout_seconds && *many.transport_connect_timeout_seconds == 5);
+    CHECK(many.connect_timeout_seconds && *many.connect_timeout_seconds == 40);
+
+    const auto dn = describe("tcps://db.example/svc?ssl_server_cert_dn=\"CN=db.example,O=Corp\"&ssl_server_dn_match=on");
+    CHECK(dn.server_cert_dn == "CN=db.example,O=Corp");
+
+    CHECK(IsEasyConnectString("host/service") && IsEasyConnectString("host:1521") &&
+          IsEasyConnectString("tcps://host/service"));
+    CHECK(!IsEasyConnectString("(DESCRIPTION=)") && !IsEasyConnectString("mydb_high") && !IsEasyConnectString(""));
+
+    // Refused by name, never dropped.
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db.example:1521"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db.example/"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db.example/svc name"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db(x)/svc"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db:port/svc"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db/svc?retry_count"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EasyConnectToDescriptor("db/svc?ssl_server_cert_dn=a)(b"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { (void)EasyConnectToDescriptor("http://db/svc"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { (void)EasyConnectToDescriptor("db/svc?https_proxy=p"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { (void)EasyConnectToDescriptor("db/svc?wallet_location=/x"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED,
+                [&] { (void)describe("db/svc:pooled"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED,
+                [&] { (void)ParseConnectDescriptor(EasyConnectToDescriptor("db/svc?connect_timeout=250ms")); });
+    std::string too_many;
+    for (size_t index = 0; index < 17; index++) {
+        too_many += (index ? ",h" : "h") + std::to_string(index);
+    }
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)EasyConnectToDescriptor(too_many + "/svc"); });
+
+    // tnsnames.ora from a folder, from the file itself, and from a ZIP.
+    const auto base = TemporaryDirectory() + "/oracle_scanner_tnsnames_" +
+                      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string tnsnames =
+        "# comment\nfolder_db = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=f.example)(PORT=1521))"
+        "(CONNECT_DATA=(SERVICE_NAME=folder.example)))\n";
+    CHECK(std::filesystem::create_directory(base));
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { (void)ReadTnsNamesSource(base); });
+    {
+        std::ofstream output(base + "/tnsnames.ora", std::ios::binary);
+        output << tnsnames;
+    }
+    CHECK(ReadTnsNamesSource(base) == tnsnames);
+    CHECK(ReadTnsNamesSource(base + "/tnsnames.ora") == tnsnames);
+    const auto parsed = ParseConnectDescriptor(FindTnsAliasDescriptor(ReadTnsNamesSource(base), "FOLDER_DB"));
+    CHECK(parsed.endpoints.size() == 1 && parsed.endpoints[0].host == "f.example" && parsed.service_name == "folder.example");
+    {
+        std::ofstream output(base + "/nul.ora", std::ios::binary);
+        output << tnsnames << '\0';
+    }
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadTnsNamesSource(base + "/nul.ora"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ReadTnsNamesSource(std::string()); });
+    const auto zip_path = base + "/wallet.zip";
+    WriteWalletArchiveForTest(zip_path, {{"tnsnames.ora", tnsnames}});
+    CHECK(ReadTnsNamesSource(zip_path) == tnsnames);
+    std::remove((base + "/tnsnames.ora").c_str());
+    std::remove((base + "/nul.ora").c_str());
+    std::remove(zip_path.c_str());
+    std::filesystem::remove(base);
+    std::cout << "easy connect and tnsnames folder ok" << std::endl;
 }
 
 // Bounded LOB prefetch: materializing a prefetched value and sizing a fetch
@@ -7767,6 +7905,1630 @@ static void TestLobOperationObeysTheDeadlineMidResponse() {
     CHECK(server.Requests(raw) == 1);
 }
 
+// BOOLEAN, TIMESTAMP WITH LOCAL TIME ZONE, and the binds that write national
+// text, intervals and BOOLEAN. Recorded from Free 23ai (the server's values)
+// and from python-oracledb 4.0.1 Thin against Free (its bind metadata and
+// values); PROVENANCE.md lists them with hashes.
+//
+// boolean_value_bytes: the values a 23ai server sends for type 252, TRUE then
+//     FALSE, to a client advertising TTC field version 17.
+// ltz_value_bytes: a TIMESTAMP(6) WITH LOCAL TIME ZONE, 2026-03-04
+//     05:06:07.123456, read from a session whose time zone is +00:00.
+// python_*_bind: the bind metadata and value python-oracledb sent for an
+//     NCHAR 'ab', an NVARCHAR2 N'Zq<e acute><CJK>', a BOOLEAN TRUE and an
+//     INTERVAL DAY TO SECOND '3 4:5:6.000007'. Each starts at the bind's type
+//     byte and ends with its value; its buffer size is python's own, which is
+//     larger than the value, so the test swaps in this client's.
+static void TestBooleanLocalZoneAndWrites() {
+    const std::vector<uint8_t> boolean_value_bytes {0x01, 0x00};
+    const std::vector<uint8_t> ltz_value_bytes {0x78, 0x7e, 0x03, 0x04, 0x06, 0x07, 0x08, 0x07, 0x5b, 0xca, 0x00};
+    const std::vector<uint8_t> python_nchar_bind {
+        0x60, 0x01, 0x00, 0x00, 0x02, 0x1f, 0x40, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x02, 0x00, 0x00,
+        0x07, 0x04, 0x00, 0x61, 0x00, 0x62
+    };
+    const std::vector<uint8_t> python_nvarchar_bind {
+        0x01, 0x01, 0x00, 0x00, 0x02, 0x3e, 0x80, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x02, 0x00, 0x00,
+        0x07, 0x08, 0x00, 0x5a, 0x00, 0x71, 0x00, 0xe9, 0x4e, 0x2d
+    };
+    const std::vector<uint8_t> python_boolean_bind {
+        0xfc, 0x01, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x01, 0x01
+    };
+    const std::vector<uint8_t> python_interval_ds_bind {
+        0xb7, 0x01, 0x00, 0x00, 0x01, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x0b, 0x80, 0x00,
+        0x00, 0x03, 0x40, 0x41, 0x42, 0x80, 0x00, 0x1b, 0x58
+    };
+
+    // Reading: the last byte says which, and the LTZ value is an ordinary
+    // TIMESTAMP with no offset, which the UTC session makes an instant.
+    CHECK(boolean_value_bytes[0] == 1 && boolean_value_bytes[1] == 0);
+    const auto ltz = DecodeOracleTimestamp(ltz_value_bytes);
+    CHECK(!ltz.has_offset && ltz.year == 2026 && ltz.month == 3 && ltz.day == 4 && ltz.hour == 5 &&
+          ltz.minute == 6 && ltz.second == 7 && ltz.nanosecond == 123456000);
+
+    // Writing: this client's bind must be the captured one, byte for byte,
+    // except where python sized its buffer for a larger value than it sent.
+    const auto encode_tail = [](OracleBind bind, size_t tail_size) {
+        TtcExecuteBindsRequest request;
+        request.sql = "INSERT INTO T VALUES (:1)";
+        request.binds = {std::move(bind)};
+        request.ttc_field_version = 17;
+        const auto encoded = EncodeTtcExecuteBindsRequest(request);
+        return std::vector<uint8_t>(encoded.end() - static_cast<std::ptrdiff_t>(tail_size), encoded.end());
+    };
+    const auto with_size = [](std::vector<uint8_t> captured, size_t python_size_bytes, uint32_t size) {
+        ByteWriter writer;
+        writer.WriteUB4(size);
+        const auto replacement = writer.Take();
+        captured.erase(captured.begin() + 4, captured.begin() + 4 + static_cast<std::ptrdiff_t>(python_size_bytes));
+        captured.insert(captured.begin() + 4, replacement.begin(), replacement.end());
+        return captured;
+    };
+    OracleBind nchar;
+    nchar.oracle_type = 96;
+    nchar.character_set_form = 2;
+    nchar.value = std::vector<uint8_t> {0x00, 0x61, 0x00, 0x62};
+    auto expected = with_size(python_nchar_bind, 3, 4);
+    CHECK(encode_tail(nchar, expected.size()) == expected);
+
+    OracleBind nvarchar;
+    nvarchar.oracle_type = 1;
+    nvarchar.character_set_form = 2;
+    nvarchar.value = EncodeUtf8ToUtf16Be("Zq\xc3\xa9\xe4\xb8\xad");
+    CHECK(nvarchar.value && *nvarchar.value == std::vector<uint8_t>(python_nvarchar_bind.end() - 8, python_nvarchar_bind.end()));
+    expected = with_size(python_nvarchar_bind, 3, 8);
+    CHECK(encode_tail(nvarchar, expected.size()) == expected);
+
+    OracleBind boolean;
+    boolean.oracle_type = 252;
+    boolean.value = std::vector<uint8_t> {1, 1};
+    expected = with_size(python_boolean_bind, 2, 2);
+    CHECK(encode_tail(boolean, expected.size()) == expected);
+
+    OracleBind interval;
+    interval.oracle_type = 183;
+    interval.value = EncodeOracleIntervalDaySecond(3, 4, 5, 6, 7000);
+    CHECK(*interval.value == std::vector<uint8_t>(python_interval_ds_bind.end() - 11, python_interval_ds_bind.end()));
+    expected = with_size(python_interval_ds_bind, 2, 11);
+    CHECK(encode_tail(interval, expected.size()) == expected);
+
+    // A long bind's value follows every short bind's in the row, though its
+    // metadata keeps its place. python_long_bind_row is python-oracledb's
+    // insert of (id, clob, nclob) = (42, 40000 characters, 'abc'): three binds'
+    // metadata, then the row, cut after the first chunk header of the CLOB.
+    const std::vector<uint8_t> python_long_bind_row {
+        0x02, 0x01, 0x00, 0x00, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x02, 0x71, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00,
+        0x07, 0x02, 0xc1, 0x2a, 0x03, 0x61, 0x62, 0x63, 0xfe, 0x02, 0x7f, 0xff
+    };
+    {
+        const std::string clob_text(40000, 'y');
+        TtcExecuteBindsRequest request;
+        request.sql = "INSERT INTO T VALUES (:1, :2, :3)";
+        request.ttc_field_version = 17;
+        OracleBind id;
+        id.oracle_type = 2;
+        id.value = std::vector<uint8_t> {0xc1, 0x2a};
+        OracleBind clob;
+        clob.oracle_type = 1;
+        clob.value = std::vector<uint8_t>(clob_text.begin(), clob_text.end());
+        OracleBind nclob;
+        nclob.oracle_type = 1;
+        nclob.value = std::vector<uint8_t> {'a', 'b', 'c'};
+        request.binds = {id, clob, nclob};
+        const auto encoded = EncodeTtcExecuteBindsRequest(request);
+
+        // Rebuild python's bytes with this client's buffer sizes, then require the
+        // request to end with them: the same metadata, the short values, then the
+        // long one, which here chunks at 32768 where python chunks at 32767.
+        ByteReader captured(python_long_bind_row);
+        ByteWriter expected;
+        const std::vector<uint32_t> sizes {2, 40000, 3};
+        const std::vector<size_t> fixed_tail {8, 10, 10};
+        for (size_t index = 0; index < 3; index++) {
+            for (int step = 0; step < 4; step++) {
+                expected.WriteByte(captured.ReadByte());
+            }
+            (void)captured.ReadUB4();
+            expected.WriteUB4(sizes[index]);
+            for (size_t step = 0; step < fixed_tail[index]; step++) {
+                expected.WriteByte(captured.ReadByte());
+            }
+        }
+        for (int step = 0; step < 8; step++) { // the marker, id, and the short NCLOB
+            expected.WriteByte(captured.ReadByte());
+        }
+        auto want = expected.Take();
+        want.push_back(0xfe);
+        want.insert(want.end(), {0x02, 0x80, 0x00}); // this client's first chunk header: 32768
+        const auto found = std::search(encoded.begin(), encoded.end(), want.begin(), want.end());
+        CHECK(found != encoded.end());
+        // Nothing but the CLOB's two chunks (32768 and 7232 bytes, each behind
+        // its length) and the closing zero follows.
+        CHECK(static_cast<size_t>(encoded.end() - found) == want.size() + 32768 + 3 + 7232 + 1);
+    }
+
+    // The default form of a character bind is untouched.
+    OracleBind plain;
+    plain.oracle_type = 1;
+    plain.value = std::vector<uint8_t> {'a'};
+    CHECK(encode_tail(plain, 19).at(13) == 1 && encode_tail(plain, 19).at(0) == 1);
+
+    // UTF-8 to UTF-16BE: BMP, a surrogate pair, and every malformed shape.
+    CHECK(EncodeUtf8ToUtf16Be("") == std::vector<uint8_t>());
+    CHECK(EncodeUtf8ToUtf16Be("\xf0\x9f\x98\x80") == (std::vector<uint8_t> {0xd8, 0x3d, 0xde, 0x00}));
+    CHECK(DecodeUtf16BeToUtf8(EncodeUtf8ToUtf16Be("h\xc3\xa9llo \xd0\x9f \xf0\x9f\x98\x80")).size() == 14);
+    for (const char *bad : {"\x80", "\xc0\x80", "\xc3", "\xe0\x80\x80", "\xed\xa0\x80", "\xf4\x90\x80\x80",
+                            "\xf8\x88\x80\x80\x80", "\xe4\xb8", "a\xff"}) {
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)EncodeUtf8ToUtf16Be(bad); });
+    }
+    std::mt19937 random(7);
+    for (int round = 0; round < 5000; round++) {
+        std::string text;
+        for (int count = random() % 6; count > 0; count--) {
+            uint32_t code_point = random() % 3 == 0 ? 0x10000 + random() % 0x100000 : random() % 0xD000;
+            if (code_point == 0) {
+                code_point = 1;
+            }
+            if (code_point < 0x80) {
+                text += static_cast<char>(code_point);
+            } else if (code_point < 0x800) {
+                text += static_cast<char>(0xC0 | (code_point >> 6));
+                text += static_cast<char>(0x80 | (code_point & 0x3F));
+            } else if (code_point < 0x10000) {
+                text += static_cast<char>(0xE0 | (code_point >> 12));
+                text += static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+                text += static_cast<char>(0x80 | (code_point & 0x3F));
+            } else {
+                text += static_cast<char>(0xF0 | (code_point >> 18));
+                text += static_cast<char>(0x80 | ((code_point >> 12) & 0x3F));
+                text += static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+                text += static_cast<char>(0x80 | (code_point & 0x3F));
+            }
+        }
+        const auto round_trip = DecodeUtf16BeToUtf8(EncodeUtf8ToUtf16Be(text));
+        CHECK(std::string(round_trip.begin(), round_trip.end()) == text);
+    }
+
+    // The data-types request advertises ORACLE_CLIENT_TTC_FIELD_VERSION and is otherwise the
+    // recorded template, byte for byte.
+    const auto request = BuildTtcDataTypesRequest(TtcNegotiationOptions());
+    CHECK(request.size() == ORACLE_19C_TTC_DATA_TYPES_TEMPLATE.size());
+    CHECK(request.at(TTC_DATA_TYPES_CAPABILITIES_OFFSET + TTC_CAPABILITY_FIELD_VERSION_INDEX) ==
+          ORACLE_CLIENT_TTC_FIELD_VERSION);
+    size_t differing = 0;
+    for (size_t index = 0; index < request.size(); index++) {
+        differing += request[index] != ORACLE_19C_TTC_DATA_TYPES_TEMPLATE[index] ? 1 : 0;
+    }
+    CHECK(differing == 1);
+    std::cout << "boolean, local zone and write binds ok" << std::endl;
+}
+
+// What the types added in 0.6.0 look like on the wire. Every byte sequence
+// below was recorded from Oracle 19c, and the INTERVAL, NVARCHAR2 and ROWID
+// values read the same from Free 23ai; PROVENANCE.md lists them with hashes.
+//
+// interval_ym_value_bytes: INTERVAL YEAR TO MONTH '2-3', '-5-11', '0-0'.
+// interval_ds_value_bytes: INTERVAL DAY TO SECOND '3 04:05:06.789012345',
+//     '-12 23:59:59.5', '0 0:0:0'.
+// nvarchar_value_bytes: N'héllo Привет 😀' as NVARCHAR2, UTF-16BE, ending in a
+//     surrogate pair.
+// The *_fetch sets are the ROW_DATA and end of call of
+// `SELECT id, <column> FROM <table>`, with the describe left out. A LONG
+// carries an indicator and a return code behind its value, and a NULL LONG
+// carries -1 and 1405 (ORA-01405), which is what `81 01 ... 05 7d` is.
+// long_middle_fetch is `SELECT a, l, b` over rows (1,'xy','p'), (2,NULL,'q'),
+// (3,'z',NULL), with the third row behind a BIT_VECTOR.
+static void TestNewTypeValues() {
+    const std::vector<uint8_t> plain_rowid_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0x0e, 0x03, 0x08, 0x35, 0xb4, 0x01, 0x01, 0x00, 0x02, 0x89, 0x89, 0x00, 0x07, 0x02,
+        0xc1, 0x03, 0x00, 0x08, 0x01, 0x06, 0x04, 0x01, 0xf2, 0x0e, 0x9b, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0xa0, 0x9a, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x19,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x02
+    };
+
+    const std::vector<uint8_t> physical_urowid_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0x01, 0x0d, 0x0d, 0x01, 0x00, 0x08, 0x35, 0xb4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89,
+        0x00, 0x00, 0x07, 0x02, 0xc1, 0x03, 0x00, 0x08, 0x01, 0x06, 0x04, 0x01, 0xf2, 0x0f, 0x18, 0x01, 0x01, 0x01,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0xa0, 0x9f, 0x01, 0x02, 0x00, 0x00, 0x00,
+        0x01, 0x02, 0x01, 0x19, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02
+    };
+
+    const std::vector<uint8_t> logical_urowid_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0x01, 0x0d, 0x0d, 0x02, 0x04, 0x00, 0x40, 0x89, 0xa1, 0x05, 0x61, 0x6c, 0x70, 0x68,
+        0x61, 0xfe, 0x07, 0x02, 0xc1, 0x03, 0x01, 0x09, 0x09, 0x02, 0x04, 0x00, 0x40, 0x89, 0xa1, 0x01, 0x62, 0xfe,
+        0x08, 0x01, 0x06, 0x04, 0x01, 0xf2, 0x0f, 0xa5, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x01, 0x01, 0x02, 0x69, 0xe5, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x19, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x02
+    };
+
+    const std::vector<uint8_t> long_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0xfe, 0x01, 0x05, 0x73, 0x68, 0x6f, 0x72, 0x74, 0x00, 0x00, 0x00, 0x07, 0x02, 0xc1,
+        0x03, 0x00, 0x81, 0x01, 0x02, 0x05, 0x7d, 0x04, 0x01, 0x01, 0x02, 0xa0, 0xa4, 0x01, 0x02, 0x02, 0x05, 0x7b,
+        0x00, 0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0x7b, 0x01, 0x02, 0x19, 0x4f, 0x52, 0x41, 0x2d, 0x30,
+        0x31, 0x34, 0x30, 0x33, 0x3a, 0x20, 0x6e, 0x6f, 0x20, 0x64, 0x61, 0x74, 0x61, 0x20, 0x66, 0x6f, 0x75, 0x6e,
+        0x64, 0x0a
+    };
+
+    const std::vector<uint8_t> long_raw_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0xfe, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02,
+        0xa0, 0xa9, 0x01, 0x01, 0x02, 0x05, 0x7b, 0x00, 0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0x7b, 0x01,
+        0x01, 0x19, 0x4f, 0x52, 0x41, 0x2d, 0x30, 0x31, 0x34, 0x30, 0x33, 0x3a, 0x20, 0x6e, 0x6f, 0x20, 0x64, 0x61,
+        0x74, 0x61, 0x20, 0x66, 0x6f, 0x75, 0x6e, 0x64, 0x0a
+    };
+
+    const std::vector<uint8_t> long_middle_fetch {
+        0x07, 0x02, 0xc1, 0x02, 0xfe, 0x01, 0x02, 0x78, 0x79, 0x00, 0x00, 0x00, 0x01, 0x70, 0x07, 0x02, 0xc1, 0x03,
+        0x00, 0x81, 0x01, 0x02, 0x05, 0x7d, 0x01, 0x71, 0x15, 0x01, 0x03, 0x07, 0x07, 0x02, 0xc1, 0x04, 0xfe, 0x01,
+        0x01, 0x7a, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0xa1, 0x64, 0x01, 0x03, 0x02, 0x05, 0x7b, 0x00,
+        0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x05, 0x7b, 0x01, 0x03, 0x19, 0x4f, 0x52, 0x41, 0x2d, 0x30, 0x31,
+        0x34, 0x30, 0x33, 0x3a, 0x20, 0x6e, 0x6f, 0x20, 0x64, 0x61, 0x74, 0x61, 0x20, 0x66, 0x6f, 0x75, 0x6e, 0x64,
+        0x0a
+    };
+
+    const std::vector<uint8_t> interval_ym_value_bytes {
+        0x80, 0x00, 0x00, 0x02, 0x3f, 0x7f, 0xff, 0xff, 0xfb, 0x31, 0x80, 0x00, 0x00, 0x00, 0x3c
+    };
+    const std::vector<uint8_t> interval_ds_value_bytes {
+        0x80, 0x00, 0x00, 0x03, 0x40, 0x41, 0x42, 0xaf, 0x07, 0x5f, 0x79, 0x7f, 0xff, 0xff, 0xf4, 0x25, 0x01, 0x01,
+        0x62, 0x32, 0x9b, 0x00, 0x80, 0x00, 0x00, 0x00, 0x3c, 0x3c, 0x3c, 0x80, 0x00, 0x00, 0x00
+    };
+    const std::vector<uint8_t> nvarchar_value_bytes {
+        0x00, 0x68, 0x00, 0xe9, 0x00, 0x6c, 0x00, 0x6c, 0x00, 0x6f, 0x00, 0x20, 0x04, 0x1f, 0x04, 0x40, 0x04, 0x38,
+        0x04, 0x32, 0x04, 0x35, 0x04, 0x42, 0x00, 0x20, 0xd8, 0x3d, 0xde, 0x00
+    };
+
+    // INTERVAL YEAR TO MONTH.
+    const std::vector<int64_t> expected_months = {27, -71, 0};
+    for (size_t index = 0; index < 3; index++) {
+        const std::vector<uint8_t> wire(interval_ym_value_bytes.begin() + 5 * static_cast<std::ptrdiff_t>(index),
+                                        interval_ym_value_bytes.begin() + 5 * static_cast<std::ptrdiff_t>(index + 1));
+        CHECK(DecodeOracleIntervalYearMonth(wire).months == expected_months[index]);
+    }
+    CHECK(EncodeOracleIntervalYearMonth(2, 3) ==
+          std::vector<uint8_t>(interval_ym_value_bytes.begin(), interval_ym_value_bytes.begin() + 5));
+    CHECK(EncodeOracleIntervalYearMonth(-5, -11) ==
+          std::vector<uint8_t>(interval_ym_value_bytes.begin() + 5, interval_ym_value_bytes.begin() + 10));
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeOracleIntervalYearMonth({0x80, 0, 0, 2}); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeOracleIntervalYearMonth({0x80, 0, 0, 2, 0x3f, 0}); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeOracleIntervalYearMonth({0x80, 0, 0, 2, 0x4c}); });
+
+    // INTERVAL DAY TO SECOND.
+    const auto day_second = [&](size_t index) {
+        return std::vector<uint8_t>(interval_ds_value_bytes.begin() + 11 * static_cast<std::ptrdiff_t>(index),
+                                    interval_ds_value_bytes.begin() + 11 * static_cast<std::ptrdiff_t>(index + 1));
+    };
+    const auto first = DecodeOracleIntervalDaySecond(day_second(0));
+    CHECK(first.days == 3 && first.nanoseconds == ((4 * 60 + 5) * 60 + 6) * 1000000000LL + 789012345);
+    const auto second = DecodeOracleIntervalDaySecond(day_second(1));
+    CHECK(second.days == -12 && second.nanoseconds == -(((23 * 60 + 59) * 60 + 59) * 1000000000LL + 500000000));
+    const auto zero = DecodeOracleIntervalDaySecond(day_second(2));
+    CHECK(zero.days == 0 && zero.nanoseconds == 0);
+    CHECK(EncodeOracleIntervalDaySecond(3, 4, 5, 6, 789012345) == day_second(0));
+    CHECK(EncodeOracleIntervalDaySecond(-12, -23, -59, -59, -500000000) == day_second(1));
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond({0x80, 0, 0, 3}); });
+    auto bad_hour = day_second(0);
+    bad_hour[4] = 60 + 24;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond(bad_hour); });
+    auto bad_fraction = day_second(0);
+    bad_fraction[7] = 0xc0;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond(bad_fraction); });
+    // Every value an Oracle interval can hold survives encode and decode.
+    std::mt19937_64 random(20261022);
+    for (int round = 0; round < 20000; round++) {
+        const auto sign = (random() & 1U) ? 1 : -1;
+        const auto days = sign * static_cast<int32_t>(random() % 1000000000U);
+        const auto hours = sign * static_cast<int32_t>(random() % 24U);
+        const auto minutes = sign * static_cast<int32_t>(random() % 60U);
+        const auto seconds = sign * static_cast<int32_t>(random() % 60U);
+        const auto nanoseconds = sign * static_cast<int32_t>(random() % 1000000000U);
+        const auto decoded = DecodeOracleIntervalDaySecond(EncodeOracleIntervalDaySecond(days, hours, minutes, seconds, nanoseconds));
+        CHECK(decoded.days == days);
+        CHECK(decoded.nanoseconds == ((static_cast<int64_t>(hours) * 60 + minutes) * 60 + seconds) * 1000000000LL + nanoseconds);
+        const auto years = sign * static_cast<int32_t>(random() % 1000000000U);
+        const auto months = sign * static_cast<int32_t>(random() % 12U);
+        CHECK(DecodeOracleIntervalYearMonth(EncodeOracleIntervalYearMonth(years, months)).months ==
+              static_cast<int64_t>(years) * 12 + months);
+    }
+
+    // NVARCHAR2 travels as UTF-16BE.
+    const auto utf8 = DecodeUtf16BeToUtf8(nvarchar_value_bytes);
+    CHECK(std::string(utf8.begin(), utf8.end()) == "h\xc3\xa9llo \xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xf0\x9f\x98\x80");
+
+    // ROWID text, against what ROWIDTOCHAR returned for the same rows.
+    const std::vector<uint8_t> physical = {0x00, 0x08, 0x35, 0xb4, 0x00, 0x01, 0x00, 0x00, 0x89, 0x89, 0x00, 0x00};
+    CHECK(TryDecodeOracleRowid(physical).value() == "AACDW0AABAAAImJAAA");
+    auto with_code = physical;
+    with_code.insert(with_code.begin(), 0x01);
+    CHECK(TryDecodeOracleRowid(with_code).value() == "AACDW0AABAAAImJAAA");
+    with_code[0] = 0x02;
+    CHECK(!TryDecodeOracleRowid(with_code));
+    CHECK(!TryDecodeOracleRowid({}) && !TryDecodeOracleRowid(std::vector<uint8_t>(11, 0)));
+    CHECK(TryDecodeOracleRowid(std::vector<uint8_t>(12, 0)).value() == "AAAAAAAAAAAAAAAAAA");
+    CHECK(TryDecodeOracleRowid(std::vector<uint8_t>(12, 0xff)).value() == "D/////P//D/////P//");
+
+    // ROW_DATA framed as a ROWID, a UROWID and a LONG.
+    OracleColumn id;
+    id.name = "ID";
+    id.oracle_type = 2;
+    id.precision = 5;
+    const auto column = [](const char *name, uint16_t type) {
+        OracleColumn result;
+        result.name = name;
+        result.oracle_type = type;
+        result.character_set_form = type == 8 ? 1 : 0;
+        return result;
+    };
+    const auto rowid = DecodeTtcFetchResponse(plain_rowid_fetch, {id, column("R", 11)}, 12);
+    CHECK(rowid.rows.size() == 2 && rowid.rows[0][1] && rowid.rows[0][1]->size() == 12 && !rowid.rows[1][1]);
+    CHECK(TryDecodeOracleRowid(*rowid.rows[0][1]).value() == "AACDW0AABAAAImJAAA");
+
+    const auto urowid = DecodeTtcFetchResponse(physical_urowid_fetch, {id, column("U", 208)}, 12);
+    CHECK(urowid.rows.size() == 2 && urowid.rows[0][1] && urowid.rows[0][1]->size() == 13 && !urowid.rows[1][1]);
+    CHECK(TryDecodeOracleRowid(*urowid.rows[0][1]).value() == "AACDW0AABAAAImJAAA");
+
+    // An index-organized table's UROWID is logical: it frames the same way and
+    // is not decoded.
+    const auto logical = DecodeTtcFetchResponse(logical_urowid_fetch, {id, column("U", 208)}, 12);
+    CHECK(logical.rows.size() == 2 && logical.rows[0][1] && (*logical.rows[0][1])[0] == 2 && logical.rows[1][1]);
+    CHECK(!TryDecodeOracleRowid(*logical.rows[0][1]));
+
+    const auto text = DecodeTtcFetchResponse(long_fetch, {id, column("L", 8)}, 12);
+    CHECK(text.rows.size() == 2 && text.rows[0][1] && !text.rows[1][1]);
+    CHECK(std::string(text.rows[0][1]->begin(), text.rows[0][1]->end()) == "short");
+    const auto raw = DecodeTtcFetchResponse(long_raw_fetch, {id, column("L", 24)}, 12);
+    CHECK(raw.rows.size() == 1 && raw.rows[0][1].value() == std::vector<uint8_t>({0xde, 0xad, 0xbe, 0xef}));
+
+    OracleColumn a = id;
+    a.name = "A";
+    OracleColumn b = column("B", 1);
+    b.character_set_form = 1;
+    const std::vector<OracleColumn> middle_columns = {a, column("L", 8), b};
+    const auto middle = DecodeTtcFetchResponse(long_middle_fetch, middle_columns, 12);
+    CHECK(middle.rows.size() == 3 && middle.used_row_continuation);
+    CHECK(std::string(middle.rows[0][1]->begin(), middle.rows[0][1]->end()) == "xy" && middle.rows[0][2].value()[0] == 'p');
+    CHECK(!middle.rows[1][1] && middle.rows[1][2].value()[0] == 'q');
+    CHECK(std::string(middle.rows[2][1]->begin(), middle.rows[2][1]->end()) == "z" && !middle.rows[2][2]);
+
+    // A response cut anywhere, and fed in pieces, decodes to the same rows.
+    const std::vector<std::pair<const std::vector<uint8_t> *, std::vector<OracleColumn>>> cases = {
+        {&plain_rowid_fetch, {id, column("R", 11)}},
+        {&physical_urowid_fetch, {id, column("U", 208)}},
+        {&logical_urowid_fetch, {id, column("U", 208)}},
+        {&long_fetch, {id, column("L", 8)}},
+        {&long_raw_fetch, {id, column("L", 24)}},
+        {&long_middle_fetch, middle_columns}};
+    for (const auto &entry : cases) {
+        const auto &bytes = *entry.first;
+        const auto expected = DecodeTtcFetchResponse(bytes, entry.second, 12);
+        for (size_t step = 1; step <= 7; step++) {
+            TtcFetchResponseDecoder decoder(entry.second, 12, std::nullopt);
+            for (size_t size = (std::min)(step, bytes.size());; size = (std::min)(size + step, bytes.size())) {
+                const std::vector<uint8_t> received(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
+                try {
+                    decoder.Decode(received);
+                } catch (const ProtocolError &error) {
+                    CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+                }
+                if (size == bytes.size()) {
+                    break;
+                }
+            }
+            CHECK(decoder.Take().rows == expected.rows);
+        }
+        // Every prefix is either a whole message sequence or reported as cut.
+        for (size_t size = 1; size < bytes.size(); size++) {
+            const std::vector<uint8_t> cut(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
+            try {
+                (void)DecodeTtcFetchResponse(cut, entry.second, 12);
+            } catch (const ProtocolError &error) {
+                CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED || error.Kind() == ProtocolErrorKind::MALFORMED);
+            }
+        }
+    }
+
+    // Bounds: a UROWID that states a size its bytes do not, or an absurd one,
+    // and a LONG whose indicator is wider than any integer.
+    const std::vector<TtcColumnFraming> urowid_only = {TtcColumnFraming::UROWID};
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 1, 5, 2, 1, 2}, urowid_only); });
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                [&] { DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 2, 0x7f, 0xff}, urowid_only); });
+    const std::vector<TtcColumnFraming> long_only = {TtcColumnFraming::LONG};
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 0, 0x85, 1, 2, 3, 4, 5, 0}, long_only); });
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] {
+        DecodeTtcRowDataPrefix(std::vector<uint8_t> {7, 0xfe, 1, 9, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0}, long_only, 8);
+    });
+}
+
+
+
+// JSON and VECTOR: the images a 23ai server stores them in, decoded to JSON
+// text and to typed elements, and the define-and-fetch that brings them with
+// their rows. Every byte sequence below was captured from Free 23ai (see
+// PROVENANCE.md); the expectations are the documents and vectors that were
+// inserted, not what this decoder printed.
+static void TestJsonAndVectorImages() {
+    // Free 23ai, a JSON column holding {"a":{"b":[1,2,{"c":"x"}]}}
+    const std::vector<uint8_t> oson_nested_object {
+        0xff, 0x4a, 0x5a, 0x01, 0x21, 0x06, 0x03, 0x00, 0x06, 0x00, 0x1f, 0x00,
+        0x00, 0x2c, 0x52, 0xe5, 0x00, 0x00, 0x00, 0x04, 0x00, 0x02, 0x01, 0x61,
+        0x01, 0x62, 0x01, 0x63, 0x84, 0x01, 0x01, 0x00, 0x05, 0x84, 0x01, 0x03,
+        0x00, 0x0a, 0xc0, 0x03, 0x00, 0x12, 0x00, 0x15, 0x00, 0x18, 0x21, 0xc1,
+        0x02, 0x21, 0xc1, 0x03, 0x84, 0x01, 0x02, 0x00, 0x1d, 0x01, 0x78,
+    };
+
+    // Free 23ai, a JSON column holding [{"a":1,"b":2},{"a":3,"b":4},{"b":5,"a":6}]
+    const std::vector<uint8_t> oson_shared_fields {
+        0xff, 0x4a, 0x5a, 0x01, 0x21, 0x06, 0x02, 0x00, 0x04, 0x00, 0x31, 0x00,
+        0x01, 0x2c, 0xe5, 0x00, 0x00, 0x00, 0x02, 0x01, 0x61, 0x01, 0x62, 0xc0,
+        0x03, 0x00, 0x08, 0x00, 0x16, 0x00, 0x23, 0x86, 0x02, 0x01, 0x02, 0x00,
+        0x10, 0x00, 0x13, 0x21, 0xc1, 0x02, 0x21, 0xc1, 0x03, 0x9c, 0x00, 0x08,
+        0x00, 0x1d, 0x00, 0x20, 0x21, 0xc1, 0x04, 0x21, 0xc1, 0x05, 0x84, 0x02,
+        0x02, 0x01, 0x00, 0x2b, 0x00, 0x2e, 0x21, 0xc1, 0x06, 0x21, 0xc1, 0x07,
+    };
+
+    // Free 23ai, a JSON column holding [null x 256]
+    const std::vector<uint8_t> oson_u16_count {
+        0xff, 0x4a, 0x5a, 0x01, 0x60, 0x26, 0x00, 0x00, 0x00, 0x02, 0x07, 0x02,
+        0x03, 0xc8, 0x01, 0x00, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02, 0x06,
+        0x01, 0x00, 0x00, 0x30,
+    };
+
+    // Free 23ai, a JSON column holding strings, escapes, numbers, booleans and a null
+    const std::vector<uint8_t> oson_text_and_numbers {
+        0xff, 0x4a, 0x5a, 0x01, 0x21, 0x06, 0x06, 0x00, 0x16, 0x00, 0x3b, 0x00,
+        0x00, 0x06, 0x31, 0x99, 0xa3, 0xad, 0xb9, 0x00, 0x00, 0x00, 0x0a, 0x00,
+        0x0e, 0x00, 0x0c, 0x00, 0x10, 0x00, 0x12, 0x09, 0xc3, 0xa9, 0xe2, 0x82,
+        0xac, 0xf0, 0x9f, 0x98, 0x80, 0x01, 0x6e, 0x01, 0x74, 0x01, 0x66, 0x01,
+        0x7a, 0x03, 0x62, 0x69, 0x67, 0x84, 0x06, 0x01, 0x02, 0x04, 0x03, 0x05,
+        0x06, 0x00, 0x14, 0x00, 0x21, 0x00, 0x26, 0x00, 0x27, 0x00, 0x28, 0x00,
+        0x29, 0x0c, 0xc3, 0xa9, 0xe2, 0x82, 0xac, 0xf0, 0x9f, 0x98, 0x80, 0x0a,
+        0x01, 0x22, 0x23, 0x3e, 0x59, 0x33, 0x66, 0x31, 0x32, 0x30, 0x34, 0x10,
+        0xcf, 0x0d, 0x23, 0x39, 0x4f, 0x5b, 0x0d, 0x23, 0x39, 0x4f, 0x5b, 0x0d,
+        0x23, 0x39, 0x4f, 0x5b,
+    };
+
+    // Free 23ai, a JSON column holding json_object() over a TIMESTAMP, DATE, BINARY_DOUBLE, BINARY_FLOAT, RAW, two intervals and a TIMESTAMP WITH TIME ZONE
+    const std::vector<uint8_t> oson_native_scalars {
+        0xff, 0x4a, 0x5a, 0x01, 0x31, 0x06, 0x08, 0x00, 0x16, 0x00, 0x00, 0x00,
+        0x62, 0x00, 0x00, 0x00, 0x13, 0x15, 0x39, 0x70, 0x73, 0x9b, 0xdb, 0x00,
+        0x10, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x08, 0x00, 0x00, 0x00, 0x03, 0x00,
+        0x13, 0x00, 0x0d, 0x02, 0x74, 0x73, 0x01, 0x64, 0x02, 0x62, 0x64, 0x02,
+        0x62, 0x66, 0x01, 0x72, 0x02, 0x79, 0x6d, 0x02, 0x64, 0x73, 0x02, 0x74,
+        0x7a, 0x84, 0x08, 0x05, 0x06, 0x02, 0x04, 0x03, 0x08, 0x01, 0x07, 0x00,
+        0x1a, 0x00, 0x26, 0x00, 0x2e, 0x00, 0x37, 0x00, 0x3c, 0x00, 0x42, 0x00,
+        0x48, 0x00, 0x54, 0x39, 0x78, 0x78, 0x01, 0x02, 0x04, 0x05, 0x06, 0x07,
+        0x5b, 0xca, 0x00, 0x3c, 0x78, 0x78, 0x01, 0x02, 0x01, 0x01, 0x01, 0x36,
+        0xbf, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xbd, 0xcc, 0xcc,
+        0xcd, 0x3a, 0x00, 0x03, 0xaa, 0xbb, 0xcc, 0x3d, 0x80, 0x00, 0x00, 0x01,
+        0x3e, 0x3e, 0x80, 0x00, 0x00, 0x01, 0x3e, 0x3f, 0x40, 0x9d, 0xcd, 0x65,
+        0x00, 0x7c, 0x78, 0x78, 0x01, 0x02, 0x01, 0x05, 0x06, 0x1d, 0xcd, 0x65,
+        0x00, 0x17, 0x3c,
+    };
+
+    // Free 23ai, a JSON column holding a 256-byte field name and a short one
+    const std::vector<uint8_t> oson_long_field_name {
+        0xff, 0x4a, 0x5a, 0x03, 0x21, 0x06, 0x01, 0x00, 0x02, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x02, 0x00, 0x0e, 0x00, 0x00, 0x2c,
+        0x00, 0x00, 0x01, 0x61, 0xc5, 0xba, 0x00, 0x00, 0x01, 0x00, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b, 0x6b,
+        0x6b, 0x6b, 0x84, 0x02, 0x02, 0x01, 0x00, 0x08, 0x00, 0x0b, 0x21, 0xc1,
+        0x02, 0x21, 0xc1, 0x03,
+    };
+
+    // Free 23ai, a JSON column holding json_object() over a dense FLOAT32 and a sparse FLOAT32 VECTOR
+    const std::vector<uint8_t> oson_embedded_vectors {
+        0xff, 0x4a, 0x5a, 0x01, 0x21, 0x06, 0x02, 0x00, 0x04, 0x00, 0x54, 0x00,
+        0x00, 0x82, 0xc9, 0x00, 0x02, 0x00, 0x00, 0x01, 0x76, 0x01, 0x73, 0x84,
+        0x02, 0x02, 0x01, 0x00, 0x08, 0x00, 0x2b, 0x7b, 0x01, 0x00, 0x00, 0x00,
+        0x1d, 0xdb, 0x00, 0x00, 0x16, 0x02, 0x00, 0x00, 0x00, 0x03, 0xc0, 0x0f,
+        0x3d, 0xb2, 0x17, 0x4e, 0x74, 0x68, 0xbf, 0xc0, 0x00, 0x00, 0xc0, 0x00,
+        0x00, 0x00, 0x3f, 0xbf, 0xff, 0xff, 0x7b, 0x01, 0x00, 0x00, 0x00, 0x23,
+        0xdb, 0x02, 0x00, 0x32, 0x02, 0x00, 0x00, 0x00, 0x05, 0xc0, 0x07, 0x52,
+        0xe5, 0x0d, 0xb3, 0xa3, 0xa2, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x03, 0xbf, 0xc0, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00,
+    };
+
+    // Free 23ai, VECTOR(3,FLOAT32) [1.5, 2, 3]
+    const std::vector<uint8_t> vector_float32_value {
+        0xdb, 0x00, 0x00, 0x12, 0x02, 0x00, 0x00, 0x00, 0x03, 0xc0, 0x0f, 0x3d,
+        0xb2, 0x17, 0x4e, 0x74, 0x68, 0xbf, 0xc0, 0x00, 0x00, 0xc0, 0x00, 0x00,
+        0x00, 0xc0, 0x40, 0x00, 0x00,
+    };
+
+    // Free 23ai, VECTOR(4,INT8) [1, 2, 3, 4]
+    const std::vector<uint8_t> vector_int8_value {
+        0xdb, 0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x04, 0xc0, 0x15, 0xe8,
+        0xad, 0xd2, 0x36, 0xa5, 0x8f, 0x01, 0x02, 0x03, 0x04,
+    };
+
+    // Free 23ai, VECTOR(8,BINARY) [5]
+    const std::vector<uint8_t> vector_binary_value {
+        0xdb, 0x01, 0x00, 0x10, 0x05, 0x00, 0x00, 0x00, 0x08, 0x80, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+    };
+
+    // Free 23ai, VECTOR(3,FLOAT64) [1.5, -2, 0.1]
+    const std::vector<uint8_t> vector_float64_value {
+        0xdb, 0x00, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00, 0x03, 0xc0, 0x04, 0x04,
+        0x18, 0x28, 0x2a, 0xe9, 0xe0, 0xbf, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xbf, 0xb9, 0x99,
+        0x99, 0x99, 0x99, 0x99, 0x9a,
+    };
+
+    // Free 23ai, VECTOR(5,FLOAT32,SPARSE) [5,[1,3],[1.5,2.5]]
+    const std::vector<uint8_t> vector_sparse_value {
+        0xdb, 0x02, 0x00, 0x32, 0x02, 0x00, 0x00, 0x00, 0x05, 0xc0, 0x07, 0x52,
+        0xe5, 0x0d, 0xb3, 0xa3, 0xa2, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x03, 0xbf, 0xc0, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00,
+    };
+
+    // python-oracledb 4.0.1 Thin against Free 23ai, sequence 4, the define-and-fetch it sends for 'select id, j from QO_J' (a NUMBER and a JSON column) once the describe has come back: cursor 2, two rows, JSON asked for 32 MiB of prefix
+    const std::vector<uint8_t> python_inline_define_json {
+        0x03, 0x5e, 0x04, 0x00, 0x02, 0x80, 0x10, 0x01, 0x02, 0x00, 0x00, 0x01,
+        0x01, 0x0d, 0x00, 0x00, 0x00, 0x01, 0x02, 0x04, 0x7f, 0xff, 0xff, 0xff,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x01,
+        0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x01, 0x00,
+        0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    // the same client's define for a 23-column query: NUMBER, VARCHAR2, CHAR, DATE, the TIMESTAMP family, RAW, BINARY_FLOAT/DOUBLE, NVARCHAR2, NCHAR, BOOLEAN, the intervals, CLOB, BLOB, NCLOB, JSON and VECTOR
+    const std::vector<uint8_t> python_inline_define_mixed {
+        0x03, 0x5e, 0x04, 0x00, 0x02, 0x80, 0x10, 0x01, 0x02, 0x00, 0x00, 0x01,
+        0x01, 0x0d, 0x00, 0x00, 0x00, 0x01, 0x02, 0x04, 0x7f, 0xff, 0xff, 0xff,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x17, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x01,
+        0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00,
+        0x00, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x01, 0x00, 0x00, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x50, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x03, 0x69, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x02, 0x3e, 0x80,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00, 0x60, 0x01,
+        0x00, 0x00, 0x01, 0x14, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01,
+        0x00, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xb4, 0x01, 0x00, 0x00, 0x01, 0x0b, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb5, 0x01, 0x00, 0x00, 0x01, 0x0d,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe7, 0x01, 0x00, 0x00,
+        0x01, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x01,
+        0x00, 0x00, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x64, 0x01, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x65, 0x01, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x28, 0x00, 0x00,
+        0x00, 0x00, 0x02, 0x03, 0x69, 0x02, 0x00, 0x00, 0x60, 0x01, 0x00, 0x00,
+        0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x02, 0x00, 0x00,
+        0xfc, 0x01, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xb6, 0x01, 0x00, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xb7, 0x01, 0x00, 0x00, 0x01, 0x0b, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x00, 0x00, 0x01, 0x70,
+        0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01,
+        0x00, 0x00, 0x71, 0x01, 0x00, 0x00, 0x01, 0x70, 0x00, 0x04, 0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x00, 0x00,
+        0x01, 0x70, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03,
+        0x69, 0x02, 0x00, 0x00, 0x77, 0x01, 0x00, 0x00, 0x04, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x01, 0x00, 0x00, 0x04, 0x00, 0x10,
+        0x00, 0x00, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x10, 0x00, 0x00, 0x00,
+    };
+
+    // the server's answer to it: two rows, the first with every column set, the second NULL but for its first column
+    const std::vector<uint8_t> python_inline_rows_mixed {
+        0x06, 0x22, 0x01, 0x17, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x07, 0x02,
+        0xc1, 0x02, 0x02, 0xc1, 0x03, 0x03, 0xc1, 0x04, 0x33, 0x03, 0x61, 0x62,
+        0x63, 0x04, 0x6c, 0x6f, 0x6e, 0x67, 0x05, 0x78, 0x79, 0x20, 0x20, 0x20,
+        0x07, 0x78, 0x78, 0x01, 0x02, 0x01, 0x01, 0x01, 0x0b, 0x78, 0x78, 0x01,
+        0x02, 0x04, 0x05, 0x06, 0x07, 0x5b, 0xca, 0x00, 0x0d, 0x78, 0x78, 0x01,
+        0x02, 0x01, 0x05, 0x06, 0x1d, 0xcd, 0x65, 0x00, 0x17, 0x3c, 0x07, 0x78,
+        0x78, 0x01, 0x01, 0x18, 0x05, 0x06, 0x02, 0xaa, 0xbb, 0x04, 0xbf, 0xc0,
+        0x00, 0x00, 0x08, 0xc0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x6e, 0x00, 0x76, 0x08, 0x00, 0x6e, 0x00, 0x63, 0x00, 0x20, 0x00,
+        0x20, 0x02, 0x01, 0x01, 0x05, 0x80, 0x00, 0x00, 0x01, 0x3e, 0x0b, 0x80,
+        0x00, 0x00, 0x01, 0x3e, 0x3f, 0x40, 0x9d, 0xcd, 0x65, 0x00, 0x01, 0x72,
+        0x01, 0x04, 0x02, 0x1f, 0x7c, 0x72, 0x00, 0x70, 0x00, 0x02, 0x02, 0x0c,
+        0x82, 0x80, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 0xd0,
+        0x46, 0x81, 0x00, 0x0b, 0xf4, 0xfd, 0x00, 0x0b, 0xf4, 0xfc, 0x00, 0x13,
+        0x00, 0x13, 0x03, 0x69, 0x01, 0x00, 0xd1, 0x1a, 0x01, 0x00, 0x08, 0x00,
+        0x00, 0x02, 0x6a, 0xdb, 0x19, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x00, 0x22,
+        0x00, 0x00, 0x00, 0x01, 0x03, 0x6c, 0x41, 0xbc, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x0b, 0xf4, 0xfc, 0x06, 0x00, 0xa0, 0x5f, 0x00, 0x00,
+        0x01, 0x72, 0x01, 0x01, 0x02, 0x1f, 0x7c, 0x72, 0x00, 0x70, 0x00, 0x02,
+        0x01, 0x0c, 0x02, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x04, 0xd0, 0x46, 0x82, 0x00, 0x0b, 0xf4, 0xff, 0x00, 0x0b, 0xf4, 0xfc,
+        0x00, 0x14, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x02, 0x6a, 0xdb, 0x19, 0x4f, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01,
+        0x00, 0x22, 0x00, 0x00, 0x00, 0x01, 0x03, 0x6c, 0x41, 0xbc, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0xf4, 0xfc, 0x06, 0x00, 0xa0, 0x5f,
+        0x00, 0x00, 0x01, 0x72, 0x01, 0x05, 0x02, 0x1f, 0x7c, 0x72, 0x00, 0x70,
+        0x00, 0x02, 0x04, 0x4c, 0x02, 0x80, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x04, 0xd0, 0x46, 0x83, 0x00, 0x0b, 0xf5, 0x01, 0x00, 0x0b,
+        0xf4, 0xfc, 0x00, 0x15, 0x00, 0x15, 0x07, 0xd0, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x6a, 0xdb, 0x19, 0x4f, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xec, 0x1e,
+        0xab, 0xb1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef,
+        0x00, 0x01, 0x00, 0x22, 0x00, 0x00, 0x00, 0x01, 0x03, 0x6c, 0x41, 0xbc,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0xf4, 0xfc, 0x06, 0x00,
+        0xa0, 0x5f, 0x00, 0x00, 0x01, 0x28, 0x01, 0x1a, 0x02, 0x7f, 0x58, 0x1a,
+        0xff, 0x4a, 0x5a, 0x01, 0x21, 0x06, 0x01, 0x00, 0x02, 0x00, 0x08, 0x00,
+        0x00, 0x2c, 0x00, 0x00, 0x01, 0x61, 0x84, 0x01, 0x01, 0x00, 0x05, 0x21,
+        0xc1, 0x02, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x28, 0x01, 0x1d, 0x02,
+        0x7f, 0x58, 0x1d, 0xdb, 0x00, 0x00, 0x12, 0x02, 0x00, 0x00, 0x00, 0x03,
+        0xc0, 0x0d, 0xee, 0xea, 0x11, 0x68, 0x3f, 0x49, 0xbf, 0x80, 0x00, 0x00,
+        0xc0, 0x00, 0x00, 0x00, 0xc0, 0x40, 0x00, 0x00, 0x28, 0x00, 0x26, 0x00,
+        0x04, 0x61, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x07, 0x02, 0xc1, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x08, 0x01, 0x06, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0x37, 0xaf, 0x01, 0x02,
+        0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x03, 0x00, 0x1d,
+    };
+
+    // OSON -> JSON text.
+    CHECK(DecodeOsonToJson(oson_nested_object) == R"({"a":{"b":[1,2,{"c":"x"}]}})");
+    // Objects with the same fields share one list of field numbers.
+    CHECK(DecodeOsonToJson(oson_shared_fields) == R"([{"a":1,"b":2},{"a":3,"b":4},{"b":5,"a":6}])");
+    {
+        std::string nulls = "[null";
+        for (int index = 1; index < 256; index++) {
+            nulls += ",null";
+        }
+        CHECK(DecodeOsonToJson(oson_u16_count) == nulls + "]");
+    }
+    CHECK(DecodeOsonToJson(oson_text_and_numbers) ==
+          "{\"\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\":\"\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\\n\\u0001\\\"\","
+          "\"n\":-12.5,\"t\":true,\"f\":false,\"z\":null,\"big\":123456789012345678901234567890}");
+    CHECK(DecodeOsonToJson(oson_native_scalars) ==
+          R"({"ts":"2020-01-02T03:04:05.123456","d":"2020-01-02T00:00:00","bd":1.5,"bf":0.1,)"
+          R"("r":"AABBCC","ym":"P1Y2M","ds":"P1DT2H3M4.500000S","tz":"2020-01-02T03:04:05.500000+03:00"})");
+    // A field name over 255 bytes puts the image in the version that has room for it.
+    CHECK(oson_long_field_name[3] == 3);
+    CHECK(DecodeOsonToJson(oson_long_field_name) == "{\"" + std::string(256, 'k') + "\":1,\"a\":2}");
+    // A vector inside a document prints the way the server prints it.
+    CHECK(DecodeOsonToJson(oson_embedded_vectors) == R"({"v":[1.5,2,-3],"s":[5,[1,3],[1.5,2.5]]})");
+
+    // Damage is reported, never read past: every prefix of an image is
+    // refused, and an image with one byte changed either decodes to something
+    // or is refused, but does not run off the end.
+    for (const auto *image : {&oson_nested_object, &oson_shared_fields, &oson_native_scalars, &oson_long_field_name,
+                              &oson_embedded_vectors}) {
+        for (size_t length = 0; length < image->size(); length++) {
+            bool refused = false;
+            try {
+                (void)DecodeOsonToJson(image->data(), length);
+            } catch (const ProtocolError &) {
+                refused = true;
+            }
+            CHECK(refused);
+        }
+        for (size_t position = 0; position < image->size(); position++) {
+            auto damaged = *image;
+            damaged[position] ^= 0xFF;
+            try {
+                (void)DecodeOsonToJson(damaged);
+            } catch (const ProtocolError &) {
+            }
+        }
+    }
+    auto bad_magic = oson_nested_object;
+    bad_magic[0] = 0;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOsonToJson(bad_magic); });
+    auto unknown_version = oson_nested_object;
+    unknown_version[3] = 9;
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { DecodeOsonToJson(unknown_version); });
+    OsonLimits tiny;
+    tiny.maximum_output_bytes = 8;
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { DecodeOsonToJson(oson_nested_object, tiny); });
+    OsonLimits shallow;
+    shallow.maximum_depth = 2;
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { DecodeOsonToJson(oson_nested_object, shallow); });
+    // An array whose only child is itself would recurse for ever.
+    const std::vector<uint8_t> loop {0xff, 0x4a, 0x5a, 0x01, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00,
+                                     0x04, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00};
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { DecodeOsonToJson(loop); });
+
+    // VECTOR images.
+    const auto float32 = DecodeOracleVector(vector_float32_value);
+    CHECK(float32.format == ORACLE_VECTOR_FLOAT32 && float32.dimensions == 3 && !float32.sparse);
+    CHECK(float32.float32 == std::vector<float>({1.5F, 2.0F, 3.0F}));
+    const auto float64 = DecodeOracleVector(vector_float64_value);
+    CHECK(float64.format == ORACLE_VECTOR_FLOAT64 && float64.float64 == std::vector<double>({1.5, -2.0, 0.1}));
+    const auto int8 = DecodeOracleVector(vector_int8_value);
+    CHECK(int8.format == ORACLE_VECTOR_INT8 && int8.int8 == std::vector<int8_t>({1, 2, 3, 4}));
+    const auto binary = DecodeOracleVector(vector_binary_value);
+    CHECK(binary.format == ORACLE_VECTOR_BINARY && binary.dimensions == 8 && binary.binary == std::vector<uint8_t>({5}));
+    const auto sparse = DecodeOracleVector(vector_sparse_value);
+    CHECK(sparse.sparse && sparse.dimensions == 5 && sparse.indices == std::vector<uint32_t>({1, 3}) &&
+          sparse.float32 == std::vector<float>({1.5F, 2.5F}));
+    for (const auto *image : {&vector_float32_value, &vector_float64_value, &vector_int8_value, &vector_binary_value,
+                              &vector_sparse_value}) {
+        for (size_t length = 0; length < image->size(); length++) {
+            bool refused = false;
+            try {
+                (void)DecodeOracleVector(image->data(), length);
+            } catch (const ProtocolError &) {
+                refused = true;
+            }
+            CHECK(refused);
+        }
+        auto longer = *image;
+        longer.push_back(0);
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleVector(longer); });
+    }
+    auto not_a_vector = vector_float32_value;
+    not_a_vector[0] = 0;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleVector(not_a_vector); });
+    auto unknown_format = vector_float32_value;
+    unknown_format[4] = 9;
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { DecodeOracleVector(unknown_format); });
+
+    // The columns the mixed query describes.
+    const auto column = [](const char *name, uint16_t type, uint32_t width = 0, uint8_t form = 0) {
+        OracleColumn result;
+        result.name = name;
+        result.oracle_type = type;
+        result.byte_width = width;
+        result.character_set_form = form;
+        return result;
+    };
+    std::vector<OracleColumn> mixed = {
+        column("N", 2),        column("N2", 2),          column("N3", 2),       column("V", 1, 20, 1),
+        column("V2", 1, 4000, 1), column("C", 96, 5, 1), column("D", 12),       column("TS", 180),
+        column("TSTZ", 181),   column("LTZ", 231),       column("R", 23, 16),   column("BF", 100),
+        column("BD", 101),     column("NV", 1, 10, 2),   column("NC", 96, 4, 2), column("B", 252),
+        column("IYM", 182),    column("IDS", 183),       column("CL", 112, 0, 1), column("BL", 113),
+        column("NL", 112, 0, 2), column("J", 119),       column("VEC", 127)};
+    mixed.back().vector_dimensions = 3;
+    mixed.back().vector_format = ORACLE_VECTOR_FLOAT32;
+    CHECK(SupportsInlineLobDefine(mixed, 24));
+    CHECK(!SupportsInlineLobDefine(mixed, 12));
+    {
+        auto without_json = mixed;
+        without_json.erase(without_json.begin() + 21, without_json.end());
+        CHECK(!SupportsInlineLobDefine(without_json, 24));
+        auto with_rowid = mixed;
+        with_rowid.push_back(column("RID", 11));
+        CHECK(!SupportsInlineLobDefine(with_rowid, 24));
+    }
+
+    // The define-and-fetch is the one python-oracledb sends: a header, then
+    // one record per column. python asks for more of a JSON or VECTOR value
+    // than this client does, so those two records are compared by their
+    // fields; every byte before them is the captured one.
+    const auto with_token = [](std::vector<uint8_t> message) {
+        message.insert(message.begin() + 3, 0);
+        return message;
+    };
+    const auto ours = with_token(EncodeInlineLobDefine(4, 2, mixed, 2));
+    {
+        ByteWriter record;
+        record.WriteByte(119).WriteByte(1).WriteByte(0).WriteByte(0).WriteUB4(INLINE_LOB_PREFIX_BYTES).WriteUB4(0);
+        record.WriteUB8(0x02000000).WriteUB4(0).WriteUB2(0).WriteUB2(0).WriteByte(0);
+        record.WriteUB4(INLINE_LOB_PREFIX_BYTES).WriteUB4(0);
+        record.WriteByte(127).WriteByte(1).WriteByte(0).WriteByte(0).WriteUB4(INLINE_LOB_PREFIX_BYTES).WriteUB4(0);
+        record.WriteUB8(0x02000000).WriteUB4(0).WriteUB2(0).WriteUB2(0).WriteByte(0);
+        record.WriteUB4(INLINE_LOB_PREFIX_BYTES).WriteUB4(0);
+        const auto tail = record.Take();
+        CHECK(ours.size() > tail.size());
+        CHECK(std::vector<uint8_t>(ours.end() - static_cast<std::ptrdiff_t>(tail.size()), ours.end()) == tail);
+        const auto head_size = ours.size() - tail.size();
+        CHECK(std::vector<uint8_t>(ours.begin(), ours.begin() + static_cast<std::ptrdiff_t>(head_size)) ==
+              std::vector<uint8_t>(python_inline_define_mixed.begin(),
+                                   python_inline_define_mixed.begin() + static_cast<std::ptrdiff_t>(head_size)));
+    }
+    {
+        // The two-column JSON query: the same header, the NUMBER record, then the JSON one.
+        std::vector<OracleColumn> pair = {column("ID", 2), column("J", 119)};
+        const auto pair_ours = with_token(EncodeInlineLobDefine(4, 2, pair, 2));
+        const size_t json_record = python_inline_define_json.size() - 25;
+        CHECK(std::equal(pair_ours.begin(), pair_ours.begin() + static_cast<std::ptrdiff_t>(json_record),
+                         python_inline_define_json.begin()));
+    }
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeInlineLobDefine(0, 2, mixed, 2); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeInlineLobDefine(4, 0, mixed, 2); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeInlineLobDefine(4, 2, mixed, 0); });
+    // Two columns that may each send a prefix bound the response sooner than one.
+    CHECK(InlineLobRows(mixed, 2048) == 96 && InlineLobRows(mixed, 5) == 5 && InlineLobRows(mixed, 1) == 1);
+    CHECK(InlineLobRows({column("ID", 2), column("J", 119)}, 2048) == 128);
+
+    // The rows that answer it carry JSON and VECTOR with their first bytes, a
+    // CLOB, BLOB and NCLOB with only a size, and a locator after each.
+    for (auto &described : mixed) {
+        described.inline_lob_cells = IsOracleLocatorType(described.oracle_type);
+    }
+    const auto answered = DecodeTtcFetchResponse(python_inline_rows_mixed, mixed, 24);
+    CHECK(answered.rows.size() == 2);
+    const auto &first = answered.rows[0];
+    CHECK(first.size() == mixed.size());
+    CHECK(first[3] && std::string(first[3]->begin(), first[3]->end()) == "abc");
+    CHECK(first[15] && first[15]->back() == 1);
+    const auto clob = DecodeTtcInlineLob(*first[18]);
+    CHECK(clob.total == 4 && clob.prefix.empty() && clob.locator.size() == 114);
+    const auto blob = DecodeTtcInlineLob(*first[19]);
+    CHECK(blob.total == 1 && blob.prefix.empty() && !blob.locator.empty());
+    const auto nclob = DecodeTtcInlineLob(*first[20]);
+    CHECK(nclob.total == 5 && nclob.prefix.empty());
+    const auto json = DecodeTtcInlineLob(*first[21]);
+    CHECK(json.prefix.size() == json.total && json.locator.size() == 40);
+    CHECK(DecodeOsonToJson(json.prefix) == R"({"a":1})");
+    const auto vector = DecodeTtcInlineLob(*first[22]);
+    CHECK(vector.prefix.size() == vector.total);
+    CHECK(DecodeOracleVector(vector.prefix).float32 == std::vector<float>({1.0F, 2.0F, 3.0F}));
+    // The second row has a value for N and NULL for everything else.
+    CHECK(answered.rows[1][0].has_value());
+    for (size_t index = 1; index < answered.rows[1].size(); index++) {
+        CHECK(!answered.rows[1][index]);
+    }
+    // Two rows were asked for and two came, so the cursor is not at its end.
+    CHECK(answered.completed && !answered.exhausted);
+    // The same bytes read without the flag are not a row: cells framed one way
+    // cannot be read the other, and the decoder says so.
+    {
+        auto unflagged = mixed;
+        for (auto &described : unflagged) {
+            described.inline_lob_cells = false;
+        }
+        bool refused = false;
+        try {
+            (void)DecodeTtcFetchResponse(python_inline_rows_mixed, unflagged, 24);
+        } catch (const ProtocolError &) {
+            refused = true;
+        }
+        CHECK(refused);
+    }
+    std::cout << "JSON and VECTOR images decode; the define matches python-oracledb's" << std::endl;
+}
+
+// From TTC field version 18 every function call and piggyback header has a
+// token number after its sequence number; this client never uses one.
+static void TestRequestHeadersCarryATokenFromFieldVersion18() {
+    const auto send_with = [](uint8_t field_version) {
+        FragmentedStream stream({}, 3);
+        TnsPacketStream packets(stream, true, 64);
+        TtcChannel channel(packets, 64);
+        channel.SetWireFieldVersion(field_version);
+        channel.QueueCloseCursor(42);
+        channel.Send(EncodeTtcFetchRequest({7, 42, 10}));
+        FragmentedStream sent_stream(stream.output, 3);
+        TnsPacketStream sent_packets(sent_stream, true, 64);
+        std::vector<uint8_t> sent;
+        while (sent_stream.read_offset < sent_stream.input.size()) {
+            const auto packet = sent_packets.Receive();
+            sent.insert(sent.end(), packet.payload.begin() + 2, packet.payload.end());
+        }
+        return sent;
+    };
+    const auto plain = send_with(17);
+    const auto tokened = send_with(18);
+    CHECK(tokened.size() == plain.size() + 2);
+    // piggyback: type, function, sequence, [token], the rest
+    CHECK(plain[0] == TTC_MESSAGE_PIGGYBACK && tokened[0] == TTC_MESSAGE_PIGGYBACK);
+    CHECK(tokened[3] == 0);
+    CHECK(std::vector<uint8_t>(tokened.begin() + 4, tokened.begin() + 8) ==
+          std::vector<uint8_t>(plain.begin() + 3, plain.begin() + 7));
+    // the fetch after it: type, function, sequence, [token], the rest
+    const std::vector<uint8_t> plain_fetch(plain.begin() + 8, plain.end());
+    const std::vector<uint8_t> tokened_fetch(tokened.begin() + 9, tokened.end());
+    CHECK(plain_fetch[0] == TTC_MESSAGE_FUNCTION && tokened_fetch[0] == TTC_MESSAGE_FUNCTION);
+    CHECK(tokened_fetch[3] == 0);
+    CHECK(std::vector<uint8_t>(tokened_fetch.begin() + 4, tokened_fetch.end()) ==
+          std::vector<uint8_t>(plain_fetch.begin() + 3, plain_fetch.end()));
+    std::cout << "request headers carry a token from field version 18" << std::endl;
+}
+
+// A value past what an ordinary bind carries is written into a temporary LOB,
+// and the statement binds its locator. Every request here is checked against
+// python-oracledb Thin 4.0.1 creating, writing and releasing temporary LOBs and
+// inserting them (see PROVENANCE.md).
+static void TestTemporaryLobsMatchPython() {
+    const std::vector<uint8_t> python_lob_create_temp_clob {
+        0x03, 0x60, 0x03, 0x00, 0x01, 0x01, 0x28, 0x00, 0x01, 0x0a, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x02, 0x01, 0x10, 0x00, 0x00, 0x01, 0x01, 0x01, 0x70,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x03, 0x69,
+    };
+    const std::vector<uint8_t> python_lob_create_temp_blob {
+        0x03, 0x60, 0x05, 0x00, 0x01, 0x01, 0x28, 0x00, 0x01, 0x0a, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x02, 0x01, 0x10, 0x00, 0x00, 0x00, 0x01, 0x71, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03,
+        0x69,
+    };
+    const std::vector<uint8_t> python_lob_create_temp_response {
+        0x08, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03, 0x00, 0x02, 0xe9,
+        0xb9, 0x00, 0x00, 0x00, 0xdf, 0x00, 0x00, 0x00, 0x01, 0x03, 0x69, 0x00,
+        0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x03, 0x69, 0x20, 0x04, 0x01, 0x01,
+        0x02, 0x97, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d,
+    };
+    const std::vector<uint8_t> python_lob_write_clob_request {
+        0x03, 0x60, 0x04, 0x00, 0x01, 0x01, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03,
+        0x00, 0x02, 0xe9, 0xb9, 0x00, 0x00, 0x00, 0xdf, 0x00, 0x00, 0x00, 0x01,
+        0x03, 0x69, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e,
+        0xab, 0xb1, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0e, 0xc8, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+        0x00, 0x78, 0x00, 0x78, 0x00, 0x78,
+    };
+    const std::vector<uint8_t> python_lob_write_response {
+        0x08, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03, 0x00, 0x02, 0xe9,
+        0xb9, 0x00, 0x00, 0x00, 0xdf, 0x00, 0x00, 0x00, 0x01, 0x03, 0x69, 0x00,
+        0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 0x01, 0x01, 0x02, 0x97, 0x13, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x1d,
+    };
+    const std::vector<uint8_t> python_lob_free_piggyback {
+        0x11, 0x60, 0x09, 0x00, 0x01, 0x01, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x08, 0x01, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08,
+        0x80, 0x03, 0x00, 0x02, 0x31, 0x31, 0x00, 0x00, 0x00, 0x39, 0x00, 0x00,
+        0x00, 0x01, 0x03, 0x69, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0xec, 0x1e, 0xab, 0xb1, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x26,
+        0x00, 0x01, 0x81, 0x08, 0x00, 0x03, 0x00, 0x01, 0x31, 0x31, 0x00, 0x00,
+        0x00, 0x39, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00,
+    };
+    const std::vector<uint8_t> python_lob_locator_binds {
+        0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x01, 0x16, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x01, 0x00, 0x00, 0x01,
+        0x70, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69,
+        0x01, 0x00, 0x00, 0x71, 0x01, 0x00, 0x00, 0x01, 0x70, 0x00, 0x04, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0xc1,
+        0x4e, 0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x01, 0x82, 0x08, 0x80, 0x03,
+        0x00, 0x02, 0x31, 0x31, 0x00, 0x00, 0x00, 0x39, 0x00, 0x00, 0x00, 0x01,
+        0x03, 0x69, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e,
+        0xab, 0xb1, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x28, 0x28, 0x00,
+        0x26, 0x00, 0x01, 0x81, 0x08, 0x00, 0x03, 0x00, 0x01, 0x31, 0x31, 0x00,
+        0x00, 0x00, 0x39, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0xec, 0x1e, 0xab, 0xb1, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00,
+    };
+
+    // python writes a token byte after the sequence number; this client's
+    // channel adds it when it sends, so the encoders leave it out.
+    const auto without_token = [](std::vector<uint8_t> bytes) {
+        bytes.erase(bytes.begin() + 3);
+        return bytes;
+    };
+    CHECK(EncodeTtcCreateTempLob(3, TtcTempLobKind::CLOB) == without_token(python_lob_create_temp_clob));
+    CHECK(EncodeTtcCreateTempLob(5, TtcTempLobKind::BLOB) == without_token(python_lob_create_temp_blob));
+
+    const std::vector<uint8_t> created_locator(python_lob_create_temp_response.begin() + 1,
+                                               python_lob_create_temp_response.begin() + 41);
+    CHECK(DecodeCompleteTtcLocatorCall(python_lob_create_temp_response, 1, true, 27) == created_locator);
+    // The reply must be whole: half of it is a request for more, not a locator.
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] {
+        (void)DecodeCompleteTtcLocatorCall(std::vector<uint8_t>(python_lob_create_temp_response.begin(),
+                                                                python_lob_create_temp_response.begin() + 60),
+                                           1, true, 27);
+    });
+
+    const std::vector<uint8_t> locator(python_lob_write_clob_request.begin() + 28, python_lob_write_clob_request.begin() + 68);
+    std::vector<uint8_t> hundred_x;
+    for (size_t index = 0; index < 100; index++) {
+        hundred_x.push_back(0x00);
+        hundred_x.push_back('x');
+    }
+    CHECK(EncodeTtcWriteLob(4, locator, 1, hundred_x) == without_token(python_lob_write_clob_request));
+    const std::vector<uint8_t> written_locator(python_lob_write_response.begin() + 1, python_lob_write_response.begin() + 41);
+    CHECK(DecodeCompleteTtcLocatorCall(python_lob_write_response, 1, false, 27) == written_locator);
+
+    // Releasing two at once: python sends the same body in a piggyback.
+    const std::vector<uint8_t> first_free(python_lob_free_piggyback.end() - 80, python_lob_free_piggyback.end() - 40);
+    const std::vector<uint8_t> second_free(python_lob_free_piggyback.end() - 40, python_lob_free_piggyback.end());
+    const auto release = EncodeTtcFreeTempLobs(9, {first_free, second_free});
+    // python writes the operation code 0x80111 as four bytes with a leading
+    // zero; this client writes the shortest form, which is the same number.
+    std::vector<uint8_t> piggyback_body(python_lob_free_piggyback.begin() + 4, python_lob_free_piggyback.end());
+    const std::vector<uint8_t> wide_operation {0x04, 0x00, 0x08, 0x01, 0x11};
+    const auto operation_at = std::search(piggyback_body.begin(), piggyback_body.end(), wide_operation.begin(),
+                                          wide_operation.end());
+    CHECK(operation_at != piggyback_body.end());
+    const auto narrowed_at =
+        piggyback_body.erase(operation_at, operation_at + static_cast<std::ptrdiff_t>(wide_operation.size()));
+    piggyback_body.insert(narrowed_at, {0x03, 0x08, 0x01, 0x11});
+    CHECK(release[1] == python_lob_free_piggyback[1] && release[2] == python_lob_free_piggyback[2]);
+    CHECK(std::vector<uint8_t>(release.begin() + 3, release.end()) == piggyback_body);
+
+    // An INSERT of (id, CLOB, BLOB) binding the two locators.
+    const auto &binds_tail = python_lob_locator_binds;
+    const std::vector<uint8_t> clob_locator(binds_tail.end() - 83, binds_tail.end() - 43);
+    const std::vector<uint8_t> blob_locator(binds_tail.end() - 40, binds_tail.end());
+    OracleBind id_bind;
+    id_bind.oracle_type = 2;
+    id_bind.value = EncodeOracleNumber("77");
+    id_bind.maximum_bytes = 22;
+    OracleBind clob_bind;
+    clob_bind.oracle_type = 112;
+    clob_bind.value = clob_locator;
+    OracleBind blob_bind;
+    blob_bind.oracle_type = 113;
+    blob_bind.value = blob_locator;
+    TtcExecuteBindsRequest request;
+    request.sql = "insert into bl values (:1, :2, :3)";
+    request.binds = {id_bind, clob_bind, blob_bind};
+    request.ttc_field_version = 24;
+    const auto encoded = EncodeTtcExecuteBindsRequest(request);
+    CHECK(encoded.size() >= binds_tail.size());
+    CHECK(std::vector<uint8_t>(encoded.end() - static_cast<std::ptrdiff_t>(binds_tail.size()), encoded.end()) == binds_tail);
+
+    // A locator is exactly 40 bytes.
+    clob_bind.value = std::vector<uint8_t>(39, 0);
+    request.binds = {id_bind, clob_bind, blob_bind};
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)EncodeTtcExecuteBindsRequest(request); });
+    std::cout << "temporary LOB requests match python-oracledb's" << std::endl;
+}
+
+namespace {
+
+// Stands in for the server: hands out locators that change with every write,
+// as a real one does, and remembers what it was asked.
+class ScriptedLobWriter final : public TemporaryLobWriter {
+public:
+    std::vector<uint8_t> Create(TtcTempLobKind kind) override {
+        kinds.push_back(kind);
+        std::vector<uint8_t> locator(40, 0);
+        locator[0] = static_cast<uint8_t>(kinds.size());
+        return locator;
+    }
+    std::vector<uint8_t> Write(const std::vector<uint8_t> &locator, uint64_t offset,
+                               const std::vector<uint8_t> &data) override {
+        if (fail_write_after != 0 && writes.size() + 1 >= fail_write_after) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "scripted write failure");
+        }
+        writes.push_back({locator[0], offset, data.size()});
+        auto updated = locator;
+        updated[1]++;
+        return updated;
+    }
+    void Free(const std::vector<std::vector<uint8_t>> &locators) override {
+        if (fail_free) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "scripted free failure");
+        }
+        freed.insert(freed.end(), locators.begin(), locators.end());
+    }
+
+    struct WriteCall {
+        uint8_t owner;
+        uint64_t offset;
+        size_t size;
+    };
+    std::vector<TtcTempLobKind> kinds;
+    std::vector<WriteCall> writes;
+    std::vector<std::vector<uint8_t>> freed;
+    size_t fail_write_after = 0;
+    bool fail_free = false;
+};
+
+OracleBind LobContentBind(uint8_t kind, std::optional<std::vector<uint8_t>> value) {
+    OracleBind bind;
+    bind.name = "1";
+    bind.oracle_type = kind == 113 ? 23 : 1;
+    bind.value = std::move(value);
+    bind.lob_content = kind;
+    return bind;
+}
+
+} // namespace
+
+// What goes through a temporary LOB, in what pieces, and what is released.
+static void TestTemporaryLobScope() {
+    const size_t big = TEMP_LOB_THRESHOLD_BYTES + 1;
+    {
+        // Under the threshold nothing changes: the ordinary bind is the proven form.
+        std::vector<OracleBind> binds {LobContentBind(112, std::vector<uint8_t>(TEMP_LOB_THRESHOLD_BYTES, 'a'))};
+        CHECK(!TemporaryLobScope::Needed(binds));
+    }
+    {
+        // A CLOB is written as UTF-16: offsets count UTF-16 units, so a character
+        // outside the BMP moves the offset by two, and pieces never split a character.
+        std::string text;
+        while (text.size() <= big) {
+            text += "ð";
+        }
+        std::vector<OracleBind> binds {LobContentBind(112, std::vector<uint8_t>(text.begin(), text.end()))};
+        CHECK(TemporaryLobScope::Needed(binds));
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        scope.Convert(binds);
+        CHECK(binds[0].oracle_type == 112 && binds[0].lob_content == 0 && binds[0].value && binds[0].value->size() == 40);
+        CHECK(writer.kinds.size() == 1 && writer.kinds[0] == TtcTempLobKind::CLOB);
+        CHECK(writer.writes.size() >= 4);
+        uint64_t expected_offset = 1;
+        size_t total_bytes = 0;
+        for (const auto &call : writer.writes) {
+            CHECK(call.offset == expected_offset);
+            CHECK(call.size % 4 == 0 && call.size <= TEMP_LOB_WRITE_CHUNK_BYTES * 2);
+            expected_offset += call.size / 2;
+            total_bytes += call.size;
+        }
+        CHECK(total_bytes == text.size()); // 4 UTF-8 bytes become 4 UTF-16 bytes
+        // The locator the bind carries is the one the last write returned.
+        CHECK((*binds[0].value)[1] == writer.writes.size());
+        CHECK(writer.freed.empty());
+        scope.Release();
+        CHECK(writer.freed.size() == 1);
+        scope.Release();
+        CHECK(writer.freed.size() == 1);
+    }
+    {
+        // A BLOB's offsets are bytes.
+        std::vector<OracleBind> binds {LobContentBind(113, std::vector<uint8_t>(big, 0x5a))};
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        scope.Convert(binds);
+        CHECK(binds[0].oracle_type == 113 && writer.kinds[0] == TtcTempLobKind::BLOB);
+        uint64_t expected_offset = 1;
+        for (const auto &call : writer.writes) {
+            CHECK(call.offset == expected_offset);
+            expected_offset += call.size;
+        }
+        CHECK(expected_offset == big + 1);
+    }
+    {
+        // Array DML declares one set of bind metadata for every row of a group, so a
+        // column that needs a temporary LOB in one row is bound by locator in all of them.
+        std::vector<std::vector<OracleBind>> rows {
+            {LobContentBind(112, std::vector<uint8_t>(big, 'x'))},
+            {LobContentBind(112, std::vector<uint8_t>(3, 'y'))},
+            {LobContentBind(112, std::nullopt)},
+        };
+        CHECK(TemporaryLobScope::NeededRows(rows, 0, 3) && !TemporaryLobScope::NeededRows(rows, 1, 3));
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        scope.ConvertRows(rows);
+        CHECK(rows[0][0].oracle_type == 112 && rows[1][0].oracle_type == 112 && rows[2][0].oracle_type == 112);
+        CHECK(rows[0][0].value->size() == 40 && rows[1][0].value->size() == 40 && !rows[2][0].value);
+        CHECK(writer.kinds.size() == 2);
+        scope.Release();
+        CHECK(writer.freed.size() == 2);
+    }
+    {
+        // A write that fails still releases what exists, without throwing.
+        std::vector<OracleBind> binds {LobContentBind(112, std::vector<uint8_t>(big, 'x'))};
+        ScriptedLobWriter writer;
+        writer.fail_write_after = 2;
+        TemporaryLobScope scope(writer);
+        ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { scope.Convert(binds); });
+        scope.ReleaseQuietly();
+        CHECK(writer.freed.size() == 1);
+        // And a refused release is swallowed on that path, reported on the normal one.
+        ScriptedLobWriter refusing;
+        refusing.fail_free = true;
+        std::vector<OracleBind> more {LobContentBind(113, std::vector<uint8_t>(big, 1))};
+        TemporaryLobScope second(refusing);
+        second.Convert(more);
+        ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { second.Release(); });
+        TemporaryLobScope third(refusing);
+        std::vector<OracleBind> again {LobContentBind(113, std::vector<uint8_t>(big, 1))};
+        third.Convert(again);
+        third.ReleaseQuietly();
+    }
+    {
+        // Text that is not UTF-8 is refused rather than written.
+        std::vector<uint8_t> broken(big, 'a');
+        broken[10] = 0xFF;
+        std::vector<OracleBind> binds {LobContentBind(112, broken)};
+        ScriptedLobWriter writer;
+        TemporaryLobScope scope(writer);
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { scope.Convert(binds); });
+        scope.ReleaseQuietly();
+    }
+    std::cout << "temporary LOB scope converts, chunks and releases" << std::endl;
+}
+
+// Session attributes travel as a piggyback in front of the next call, in the
+// shape python-oracledb Thin 4.0.1 sends when `module`, `action`,
+// `client_identifier` or `clientinfo` is set (see PROVENANCE.md).
+static void TestEndToEndAttributesMatchPython() {
+    const std::vector<uint8_t> python_end_to_end_module {
+        0x11, 0x87, 0x03, 0x00, 0x00, 0x00, 0x01, 0x18, 0x00, 0x00, 0x01, 0x01,
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x6d,
+    };
+    const std::vector<uint8_t> python_end_to_end_all {
+        0x11, 0x87, 0x03, 0x00, 0x00, 0x00, 0x02, 0x01, 0x19, 0x01, 0x01, 0x03,
+        0x01, 0x01, 0x02, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x63, 0x63, 0x63, 0x02,
+        0x6d, 0x6d, 0x03, 0x61, 0x61, 0x61, 0x04, 0x69, 0x69, 0x69, 0x69,
+    };
+    const std::vector<uint8_t> python_end_to_end_client_info {
+        0x11, 0x87, 0x03, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x69, 0x6e, 0x66, 0x6f,
+    };
+    const auto without_token = [](std::vector<uint8_t> bytes) {
+        bytes.erase(bytes.begin() + 3);
+        return bytes;
+    };
+    TtcEndToEndAttributes module_only;
+    module_only.module = "m";
+    CHECK(EncodeTtcEndToEndPiggyback(3, module_only) == without_token(python_end_to_end_module));
+    TtcEndToEndAttributes everything;
+    everything.client_identifier = "ccc";
+    everything.module = "mm";
+    everything.action = "aaa";
+    everything.client_info = "iiii";
+    CHECK(EncodeTtcEndToEndPiggyback(3, everything) == without_token(python_end_to_end_all));
+    TtcEndToEndAttributes info_only;
+    info_only.client_info = "info";
+    CHECK(EncodeTtcEndToEndPiggyback(3, info_only) == without_token(python_end_to_end_client_info));
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)EncodeTtcEndToEndPiggyback(1, TtcEndToEndAttributes()); });
+    TtcEndToEndAttributes too_long;
+    too_long.action = std::string(33, 'x');
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)EncodeTtcEndToEndPiggyback(1, too_long); });
+    std::cout << "end-to-end attributes match python-oracledb's" << std::endl;
+}
+
+// An anonymous block is sent as written, less a SQL*Plus terminator, and its
+// binds are matched to its placeholders by first mention.
+static void TestAnonymousBlocks() {
+    CHECK(NormalizeOracleAnonymousBlock("BEGIN NULL; END;") == "BEGIN NULL; END;");
+    CHECK(NormalizeOracleAnonymousBlock("  -- c\n declare x number; begin x := 1; end;  \n") ==
+          "  -- c\n declare x number; begin x := 1; end;");
+    CHECK(NormalizeOracleAnonymousBlock("BEGIN\n  NULL;\nEND;\n/\n") == "BEGIN\n  NULL;\nEND;");
+    // Not blocks, or not whole ones.
+    for (const char *text : {"SELECT 1 FROM dual", "CALL p()", "BEGIN NULL; END", "BEGIN NULL; END; /", ""}) {
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)NormalizeOracleAnonymousBlock(text); });
+    }
+    OracleCallRequest request;
+    request.kind = OracleCallableKind::ANONYMOUS_BLOCK;
+    request.block = "BEGIN :b := :a || 'x'; END;";
+    OracleBind a;
+    a.name = "a";
+    a.oracle_type = 1;
+    a.value = std::vector<uint8_t> {'1'};
+    OracleBind b;
+    b.name = "b";
+    b.oracle_type = 1;
+    b.direction = BindDirection::BIND_OUT;
+    b.maximum_bytes = 100;
+    request.arguments = {a, b};
+    CHECK(BuildOracleCallBlock(request) == "BEGIN :b := :a || 'x'; END;");
+    const auto ordered = OrderOracleStatementBinds(request.block, request.arguments, OracleBindUse::CALL);
+    CHECK(ordered.size() == 2 && ordered[0].name == "b" && ordered[1].name == "a");
+    // A bind the block does not mention, or a placeholder without a bind, is refused.
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] {
+        (void)OrderOracleStatementBinds(request.block, {a}, OracleBindUse::CALL);
+    });
+    request.qualified_name = "P";
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)BuildOracleCallBlock(request); });
+    request.qualified_name.clear();
+    request.kind = OracleCallableKind::PROCEDURE;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)BuildOracleCallBlock(request); });
+    std::cout << "anonymous PL/SQL blocks are normalised and their binds ordered" << std::endl;
+}
+
+// The server reports the session state it changed in a message of its own (type
+// 23), and 23ai sends one inside a PL/SQL response, in front of its end-of-call.
+// The report below is what python-oracledb received after setting module, action,
+// client identifier and client info (see PROVENANCE.md).
+static void TestServerPiggybacksAreSkipped() {
+    const std::vector<uint8_t> python_server_piggyback {
+        0x17, 0x05, 0x01, 0x01, 0x10, 0x01, 0x04, 0x16, 0x01, 0x02, 0x02, 0x6d,
+        0x6d, 0x00, 0x01, 0xb8, 0x01, 0x03, 0x03, 0x61, 0x61, 0x61, 0x00, 0x01,
+        0xb9, 0x01, 0x04, 0x04, 0x69, 0x69, 0x69, 0x69, 0x00, 0x01, 0xba, 0x01,
+        0x03, 0x03, 0x63, 0x63, 0x63, 0x00, 0x01, 0xc6, 0x00,
+    };
+    CHECK(SkippedTtcServerPiggybackBytes(python_server_piggyback.data(), python_server_piggyback.size()) ==
+          python_server_piggyback.size());
+    // Followed by a status and the end of the call, as in the response to a ping.
+    auto message = python_server_piggyback;
+    message.insert(message.end(), {0x09, 0x01, 0x01, 0x02, 0xc6, 0x10, 0x1d});
+    CHECK(SkippedTtcServerPiggybackBytes(message.data(), message.size()) == python_server_piggyback.size());
+    const auto decoded = DecodeTtcCallResponse(message, {}, 24, 27);
+    // The status completes the call; the end-of-request marker behind it is the caller's.
+    CHECK(decoded.completed && decoded.bytes_consumed == python_server_piggyback.size() + 6);
+    // Cut short, it is a request for more; a report of a session change is not skipped.
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] {
+        (void)SkippedTtcServerPiggybackBytes(python_server_piggyback.data(), python_server_piggyback.size() - 20);
+    });
+    auto changed = python_server_piggyback;
+    changed.back() = 0x01; // flags: a length of one byte ...
+    changed.push_back(0x01); // ... holding 1, a session change
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)SkippedTtcServerPiggybackBytes(changed.data(), changed.size()); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] {
+        const std::vector<uint8_t> other {0x17, 0x01, 0x00};
+        (void)SkippedTtcServerPiggybackBytes(other.data(), other.size());
+    });
+    std::cout << "a server piggyback inside a response is skipped" << std::endl;
+}
+
+// A VECTOR is written as its image in a locator, as python-oracledb Thin does,
+// and keeps its place among the binds when the statement has short ones after it.
+static void TestVectorBindsMatchPython() {
+    // python-oracledb 4.0.1 Thin against Free 23ai, an insert of one VECTOR column, `array('f', [1.5, 2, 3])`: the bind's metadata, then the row (a locator that states the image's length, then the image)
+    const std::vector<uint8_t> python_vector_float32_bind {
+        0x00,
+    };
+
+    // python-oracledb 4.0.1 Thin against Free 23ai, the same, `array('b', [1, -2, 3])`: the bind's metadata, then the row (a locator that states the image's length, then the image)
+    const std::vector<uint8_t> python_vector_int8_bind {
+        0x03,
+    };
+
+    // python-oracledb 4.0.1 Thin against Free 23ai, the same, `SparseVector(5, [1, 3], array('f', [1.5, 2.5]))`: the bind's metadata, then the row (a locator that states the image's length, then the image)
+    const std::vector<uint8_t> python_vector_sparse_bind {
+        0x00,
+    };
+
+    // the same client's UPDATE that sets six VECTOR columns, a JSON text, the id and a rowid: the row, in which the six vectors come first, in the order the binds are declared, ahead of the short binds declared after them
+    const std::vector<uint8_t> python_vector_update_row {
+        0x07, 0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0xdb, 0x00, 0x00,
+        0x12, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xc1, 0x10, 0x00, 0x00, 0xc1, 0x00, 0x00, 0x00, 0xc0, 0xe0,
+        0x00, 0x00, 0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0xdb, 0x02,
+        0x00, 0x32, 0x02, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04,
+        0x61, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x19, 0xdb, 0x00, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x1c, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0xdb, 0x01,
+        0x00, 0x10, 0x05, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04,
+        0x61, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x15, 0xdb, 0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x01, 0x28,
+        0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0xdb, 0x00, 0x00, 0x12, 0x03, 0x00,
+        0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81,
+        0xa5, 0x6e, 0x1f, 0xc2, 0xf8, 0xf3, 0x59, 0xc0, 0x08, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x07, 0x7b, 0x22, 0x75, 0x22, 0x3a, 0x31, 0x7d, 0x02,
+        0xc1, 0x04, 0x12, 0x41, 0x41, 0x43, 0x2f, 0x56, 0x50, 0x41, 0x41, 0x59,
+        0x41, 0x41, 0x41, 0x43, 0x6e, 0x73, 0x41, 0x41, 0x43,
+    };
+
+    // python writes the 1 MiB buffer size as four bytes, a leading zero among
+    // them; this client writes the shortest form, which is the same number.
+    const auto minimal = [](std::vector<uint8_t> captured) {
+        const std::vector<uint8_t> wide {0x04, 0x00, 0x10, 0x00, 0x00};
+        const std::vector<uint8_t> narrow {0x03, 0x10, 0x00, 0x00};
+        for (size_t at = 0; at + wide.size() <= captured.size();) {
+            if (std::equal(wide.begin(), wide.end(), captured.begin() + static_cast<std::ptrdiff_t>(at))) {
+                captured.erase(captured.begin() + static_cast<std::ptrdiff_t>(at),
+                               captured.begin() + static_cast<std::ptrdiff_t>(at + wide.size()));
+                captured.insert(captured.begin() + static_cast<std::ptrdiff_t>(at), narrow.begin(), narrow.end());
+                at += narrow.size();
+            } else {
+                at++;
+            }
+        }
+        return captured;
+    };
+    const auto encode_tail = [](std::vector<OracleBind> binds, size_t tail_size) {
+        TtcExecuteBindsRequest request;
+        request.sql = "X";
+        request.binds = std::move(binds);
+        request.ttc_field_version = 24;
+        const auto encoded = EncodeTtcExecuteBindsRequest(request);
+        return std::vector<uint8_t>(encoded.end() - static_cast<std::ptrdiff_t>(tail_size), encoded.end());
+    };
+    const auto vector_bind = [](const OracleVector &vector) {
+        OracleBind bind;
+        bind.oracle_type = ORACLE_WIRE_TYPE_VECTOR;
+        bind.value = EncodeOracleVector(vector);
+        return bind;
+    };
+    OracleVector dense;
+    dense.format = ORACLE_VECTOR_FLOAT32;
+    dense.dimensions = 3;
+    dense.float32 = {1.5F, 2.0F, 3.0F};
+    auto expected = minimal(python_vector_float32_bind);
+    CHECK(encode_tail({vector_bind(dense)}, expected.size()) == expected);
+
+    OracleVector int8_vector;
+    int8_vector.format = ORACLE_VECTOR_INT8;
+    int8_vector.dimensions = 3;
+    int8_vector.int8 = {1, -2, 3};
+    expected = minimal(python_vector_int8_bind);
+    CHECK(encode_tail({vector_bind(int8_vector)}, expected.size()) == expected);
+
+    OracleVector sparse;
+    sparse.format = ORACLE_VECTOR_FLOAT32;
+    sparse.sparse = true;
+    sparse.dimensions = 5;
+    sparse.indices = {1, 3};
+    sparse.float32 = {1.5F, 2.5F};
+    expected = minimal(python_vector_sparse_bind);
+    CHECK(encode_tail({vector_bind(sparse)}, expected.size()) == expected);
+
+    // Six vectors, then the short binds declared after them: the row has the
+    // vectors first.
+    OracleVector empty_sparse;
+    empty_sparse.format = ORACLE_VECTOR_FLOAT32;
+    empty_sparse.sparse = true;
+    empty_sparse.dimensions = 6;
+    OracleVector f32;
+    f32.format = ORACLE_VECTOR_FLOAT32;
+    f32.dimensions = 3;
+    f32.float32 = {9.0F, 8.0F, 7.0F};
+    OracleVector f64_one;
+    f64_one.format = ORACLE_VECTOR_FLOAT64;
+    f64_one.dimensions = 1;
+    f64_one.float64 = {7.0};
+    OracleVector binary;
+    binary.format = ORACLE_VECTOR_BINARY;
+    binary.dimensions = 16;
+    binary.binary = {0, 0};
+    OracleVector i8;
+    i8.format = ORACLE_VECTOR_INT8;
+    i8.dimensions = 4;
+    i8.int8 = {1, 2, 3, 4};
+    OracleVector f64_two;
+    f64_two.format = ORACLE_VECTOR_FLOAT64;
+    f64_two.dimensions = 2;
+    f64_two.float64 = {1e-300, 3.0};
+    OracleBind json_text;
+    json_text.oracle_type = 1;
+    json_text.value = std::vector<uint8_t> {'{', '"', 'u', '"', ':', '1', '}'};
+    OracleBind id;
+    id.oracle_type = 2;
+    id.value = EncodeOracleNumber("3");
+    OracleBind rowid;
+    rowid.oracle_type = 1;
+    const std::string rowid_text = "AAC/VPAAYAAACnsAAC";
+    rowid.value = std::vector<uint8_t>(rowid_text.begin(), rowid_text.end());
+    CHECK(encode_tail({vector_bind(f32), vector_bind(empty_sparse), vector_bind(f64_one), vector_bind(binary), vector_bind(i8),
+                       vector_bind(f64_two), json_text, id, rowid},
+                      python_vector_update_row.size()) == python_vector_update_row);
+
+    // A vector too long for the buffer it is declared with is refused.
+    OracleBind too_long;
+    too_long.oracle_type = ORACLE_WIRE_TYPE_VECTOR;
+    too_long.value = std::vector<uint8_t>((1U << 20U) + 1, 0);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { encode_tail({too_long}, 1); });
+
+    // The encoder refuses a vector that disagrees with itself.
+    OracleVector wrong_count = dense;
+    wrong_count.dimensions = 4;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeOracleVector(wrong_count); });
+    OracleVector backwards = sparse;
+    backwards.indices = {3, 1};
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeOracleVector(backwards); });
+    OracleVector outside = sparse;
+    outside.indices = {1, 5};
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeOracleVector(outside); });
+
+    // What it writes it reads back.
+    for (const auto *original : {&dense, &int8_vector, &sparse, &binary, &f64_two}) {
+        const auto read = DecodeOracleVector(EncodeOracleVector(*original));
+        CHECK(read.format == original->format && read.dimensions == original->dimensions && read.sparse == original->sparse &&
+              read.indices == original->indices && read.float32 == original->float32 && read.float64 == original->float64 &&
+              read.int8 == original->int8 && read.binary == original->binary);
+    }
+    std::cout << "VECTOR binds match python-oracledb's" << std::endl;
+}
+
 int main() {
 
     TestUniversalIntegers();
@@ -7794,6 +9556,16 @@ int main() {
     TestTtcFetchResponse();
     TestFetchResponseDecoderResumes();
     TestOracleIntegerMatchesDecimalText();
+    TestNewTypeValues();
+    TestBooleanLocalZoneAndWrites();
+    TestJsonAndVectorImages();
+    TestRequestHeadersCarryATokenFromFieldVersion18();
+    TestTemporaryLobsMatchPython();
+    TestTemporaryLobScope();
+    TestEndToEndAttributesMatchPython();
+    TestAnonymousBlocks();
+    TestServerPiggybacksAreSkipped();
+    TestVectorBindsMatchPython();
     TestTtcIoVector();
     TestTtcRefCursorDescriptor();
     TestTtcImplicitResultSet();
@@ -7911,6 +9683,7 @@ int main() {
     TestSessionFactory();
     TestSessionPool();
     TestSsoWallet();
+    TestEasyConnectAndTnsNamesFolder();
     TestLobPrefetchMaterializer();
     TestLobPrefetchScalarBudget();
     TestLobPrefetchDecoderResumes();

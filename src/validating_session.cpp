@@ -86,6 +86,10 @@ void ValidatedOracleSession::Close() {
     }
 }
 
+OracleIoStats ValidatedOracleSession::IoStats() const {
+    return inner ? inner->IoStats() : OracleIoStats();
+}
+
 bool ValidatedOracleSession::ReadyForReuse() const {
     return inner && inner->ReadyForReuse();
 }

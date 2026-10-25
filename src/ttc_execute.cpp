@@ -106,9 +106,35 @@ void WriteExecuteTail(ByteWriter &writer, bool legacy_session, bool has_binds, u
     WriteThinOall8Extension(writer, field_version);
 }
 
+// A VECTOR is bound as its image, wrapped in a locator that states the image's
+// length, and declared with the largest buffer a vector can need — what
+// python-oracledb Thin sends (see PROVENANCE.md). Text would do for a short
+// vector, but a VARCHAR2 bind stops at 32767 bytes and a vector of a few
+// thousand floats is longer than that as text.
+constexpr uint32_t VECTOR_BIND_BYTES = 1U << 20U;
+constexpr uint64_t LOB_PREFETCH_FLAG = 0x02000000;
+
+bool IsVectorBind(const OracleBind &bind) {
+    return bind.oracle_type == ORACLE_WIRE_TYPE_VECTOR;
+}
+
+// A CLOB or BLOB bound by locator: the value is the 40-byte locator of a
+// temporary LOB that already holds the content.
+bool IsLocatorBind(const OracleBind &bind) {
+    return bind.oracle_type == 112 || bind.oracle_type == 113;
+}
+
+constexpr uint32_t LOCATOR_BIND_BYTES = 112;
+
 uint32_t BindBufferSize(const OracleBind &bind) {
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
         return 4;
+    }
+    if (IsVectorBind(bind)) {
+        return VECTOR_BIND_BYTES;
+    }
+    if (IsLocatorBind(bind)) {
+        return LOCATOR_BIND_BYTES;
     }
     if (bind.maximum_bytes != 0) {
         return bind.maximum_bytes;
@@ -127,7 +153,9 @@ bool IsCharacterType(uint16_t type) {
 }
 
 void ValidateBind(const OracleBind &bind) {
-    if (bind.oracle_type == 0 || bind.oracle_type > 255 || (bind.value && bind.value->size() > MAX_BUFFER_BYTES)) {
+    if (bind.oracle_type == 0 || bind.oracle_type > 255 || (bind.value && bind.value->size() > MAX_BUFFER_BYTES) ||
+        (IsVectorBind(bind) && bind.value && bind.value->size() > VECTOR_BIND_BYTES) ||
+        (IsLocatorBind(bind) && bind.value && bind.value->size() != 40)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC bind has invalid type or value size");
     }
     if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR && bind.direction == BindDirection::BIND_IN) {
@@ -170,6 +198,7 @@ void Validate(const TtcExecuteBindsRequest &request) {
             // row that disagrees with it would be decoded by Oracle as the type
             // the first row declared.
             if (iteration[index].oracle_type != request.binds[index].oracle_type ||
+                iteration[index].character_set_form != request.binds[index].character_set_form ||
                 iteration[index].direction != request.binds[index].direction) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED,
                                     "TTC array DML iteration disagrees with the declared bind metadata");
@@ -206,16 +235,18 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
                       bool legacy_session) {
     for (size_t index = 0; index < binds.size(); index++) {
         const auto &bind = binds[index];
-        const auto character_type = IsCharacterType(bind.oracle_type);
+        const auto character_type = IsCharacterType(bind.oracle_type) || bind.oracle_type == 112;
         writer.WriteByte(static_cast<uint8_t>(bind.oracle_type)).WriteByte(1).WriteByte(0).WriteByte(0);
         // UB8 is one universal-length field, not two UB4 placeholders. The
         // previous four-zero tail inserted two phantom fields before OID and
         // made a bound SELECT's metadata impossible for Oracle to parse.
-        writer.WriteUB4(buffer_sizes[index]).WriteUB4(0).WriteUB8(0);
+        writer.WriteUB4(buffer_sizes[index]).WriteUB4(0).WriteUB8(IsVectorBind(bind) || IsLocatorBind(bind) ? LOB_PREFETCH_FLAG : 0);
         // The empty object-id slot is a distinct UB4 (encoded as one zero
         // byte). Omitting it shifts version/charset/form by one field; Oracle
         // then reports a nonsensical collation id for character binds.
-        writer.WriteUB4(0).WriteUB2(0).WriteUB2(character_type ? 873 : 0).WriteByte(character_type ? 1 : 0).WriteUB4(0);
+        const uint8_t character_form = bind.character_set_form != 0 ? bind.character_set_form : (character_type ? 1 : 0);
+        writer.WriteUB4(0).WriteUB2(0).WriteUB2(character_type ? 873 : 0).WriteByte(character_form);
+        writer.WriteUB4(IsVectorBind(bind) ? VECTOR_BIND_BYTES : 0);
         // 12.2+ uses a separate OACCOLID after max-character-size even for
         // bind metadata. Its one-byte zero encoding keeps the following
         // ROW_DATA marker aligned with Oracle's bound OALL8 parser.
@@ -234,17 +265,66 @@ void WriteBindMetadata(ByteWriter &writer, const std::vector<OracleBind> &binds,
     }
 }
 
+// A bind whose buffer is wider than this is "long": its value is sent after
+// every other bind's in the row, though its metadata keeps its declared place.
+// Recorded from python-oracledb 4.0.1 inserting (id, clob, nclob) with the CLOB
+// at 40000 characters: the row carried id, then the NCLOB, then the CLOB.
+constexpr uint32_t LONG_BIND_BUFFER_BYTES = 32767;
+
+// The 40-byte locator that goes in front of a bound image. Only the eight bytes
+// at offset 10 vary: the image's length, big-endian.
+std::vector<uint8_t> ImageLocator(uint64_t length) {
+    std::vector<uint8_t> locator(40, 0);
+    const uint8_t prefix[10] = {0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00, 0x00, 0x00, 0x01};
+    std::copy(prefix, prefix + sizeof(prefix), locator.begin());
+    for (size_t index = 0; index < 8; index++) {
+        locator[10 + index] = static_cast<uint8_t>(length >> (8U * (7U - index)));
+    }
+    return locator;
+}
+
+// A long value's chunk length is stated in the session's own dialect, so the
+// encoding is the caller's to say: a universal integer on a modern session, a
+// single raw byte on a legacy (11.2) one. go-ora writes a long value the same
+// way it reads one, so a request and its answer agree.
+void WriteBindValue(ByteWriter &writer, const OracleBind &bind, TtcChunkEncoding chunk_encoding) {
+    if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
+        // OUT SYS_REFCURSOR has metadata but no client-side value.
+        writer.WriteByte(0);
+    } else if (IsLocatorBind(bind) && bind.value) {
+        writer.WriteUB4(static_cast<uint32_t>(bind.value->size()));
+        writer.WriteLengthPrefixed(bind.value, chunk_encoding);
+    } else if (IsVectorBind(bind) && bind.value) {
+        const auto locator = ImageLocator(bind.value->size());
+        writer.WriteUB4(static_cast<uint32_t>(locator.size()));
+        writer.WriteLengthPrefixed(locator, chunk_encoding);
+        writer.WriteLengthPrefixed(bind.value, chunk_encoding);
+    } else if (bind.value) {
+        writer.WriteLengthPrefixed(bind.value, chunk_encoding);
+    } else {
+        writer.WriteByte(0);
+    }
+}
+
+// A VECTOR bind is declared with a large buffer too, but it is a locator and
+// its value stays where it is declared: python-oracledb Thin sends an UPDATE
+// that sets six vector columns with all six values first, ahead of the short
+// binds declared after them.
+bool IsDeferredBind(const OracleBind &bind, uint32_t buffer_size) {
+    return buffer_size > LONG_BIND_BUFFER_BYTES && !IsVectorBind(bind) && !IsLocatorBind(bind);
+}
+
 void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds,
-                      TtcChunkEncoding chunk_encoding) {
+                     const std::vector<uint32_t> &buffer_sizes, TtcChunkEncoding chunk_encoding) {
     writer.WriteByte(TTC_MESSAGE_ROW_DATA);
-    for (const auto &bind : binds) {
-        if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
-            // OUT SYS_REFCURSOR has metadata but no client-side value.
-            writer.WriteByte(0);
-        } else if (bind.value) {
-            writer.WriteLengthPrefixed(bind.value, chunk_encoding);
-        } else {
-            writer.WriteByte(0);
+    for (size_t index = 0; index < binds.size(); index++) {
+        if (!IsDeferredBind(binds[index], buffer_sizes[index])) {
+            WriteBindValue(writer, binds[index], chunk_encoding);
+        }
+    }
+    for (size_t index = 0; index < binds.size(); index++) {
+        if (IsDeferredBind(binds[index], buffer_sizes[index])) {
+            WriteBindValue(writer, binds[index], chunk_encoding);
         }
     }
 }
@@ -318,14 +398,15 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     for (size_t index = 2; index < 13; index++) {
         writer.WriteUB4(index == 7 && request.is_query ? 1 : (index == 9 ? OALL8_IMPLICIT_RESULTSETS : 0));
     }
-    WriteBindMetadata(writer, request.binds, IterationBufferSizes(request), request.ttc_field_version,
+    const auto buffer_sizes = IterationBufferSizes(request);
+    WriteBindMetadata(writer, request.binds, buffer_sizes, request.ttc_field_version,
                       request.legacy_session);
     // One ROW_DATA message per iteration, in order. This is the whole of array
     // DML on the wire: the same parse, the same metadata, N rows of values.
     const auto chunk_encoding = ChunkEncodingFor(request.legacy_session);
-    WriteBindValues(writer, request.binds, chunk_encoding);
+    WriteBindValues(writer, request.binds, buffer_sizes, chunk_encoding);
     for (const auto &iteration : request.additional_iterations) {
-        WriteBindValues(writer, iteration, chunk_encoding);
+        WriteBindValues(writer, iteration, buffer_sizes, chunk_encoding);
     }
     return writer.Take();
 }

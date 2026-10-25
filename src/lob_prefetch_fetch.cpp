@@ -5,6 +5,7 @@
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
 
 #include <string>
@@ -402,6 +403,9 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
         case TTC_MESSAGE_END_OF_REQUEST:
             offset++;
             result.completed = true;
+            break;
+        case TTC_MESSAGE_SERVER_PIGGYBACK:
+            offset += SkippedTtcServerPiggybackBytes(at, remaining);
             break;
         default:
             throw ProtocolError(ProtocolErrorKind::MALFORMED,

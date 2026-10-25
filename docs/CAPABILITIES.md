@@ -3,9 +3,11 @@
 The support surface of `oracle_scanner`, stated precisely enough to plan against.
 [README.md](../README.md) is the introduction; this is the boundary.
 
-Every "works" below was run against a live Oracle — 19.3 EE, OCI Autonomous, and
-Free 23ai — and every "refused" is a refusal this extension raises by name, not
-a guess about what Oracle would do. Where the three servers differ, it says so.
+Every "works" below was run against a live Oracle, and every "refused" is a refusal
+this extension raises by name, not a guess about what Oracle would do. Up to 0.5.1 that
+meant 19.3 EE, OCI Autonomous and Free 23ai; the additions of 0.6.0 were run on 19c and
+Free 23ai, and not on Autonomous or over TCPS (see the
+[release notes](RELEASE_NOTES_0.6.0.md)). Where the servers differ, it says so.
 
 The governing rule behind most of the refusals: **anything this client cannot
 prove it will do identically to Oracle, it refuses instead of approximating.**
@@ -89,15 +91,16 @@ its columns:
 | `ZHS16GBK` | 2 bytes per character | UTF-8, 3 bytes | `数据库连接测试` |
 | `AL32UTF8` | UTF-8 | UTF-8 | — |
 
-Two limits remain, and neither depends on the database character set:
-`NCHAR`/`NVARCHAR2` are refused because their values travel as UTF-16 in the row
-(see §3), and characters outside the Basic Multilingual Plane — emoji, rare
-ideographs — are untested, since none of the character sets above can hold one.
+One limit remains, and it does not depend on the database character set: characters
+outside the Basic Multilingual Plane — emoji, rare ideographs — are untested, since none
+of the character sets above can hold one. `NCHAR` and `NVARCHAR2` are read and written
+(their values travel as UTF-16 in the row, see §3).
 
 ### Secrets
 
-A connection is a DuckDB secret. There is no connection string and no `TNS_ADMIN`
-lookup on disk.
+A connection is a DuckDB secret. The `DSN` field takes the same strings as
+python-oracledb's `dsn`. An alias is looked up in `CONFIG_DIR`, else in the
+wallet, else in the folder the `TNS_ADMIN` environment variable names.
 
 ```sql
 CREATE SECRET ora (
@@ -110,13 +113,29 @@ CREATE SECRET ora (
 | Field | Meaning |
 | --- | --- |
 | `HOST`, `PORT`, `SERVICE_NAME` | The endpoint, given directly |
-| `TNS_ALIAS` | An alias resolved from `tnsnames.ora` **inside the wallet ZIP** |
+| `DSN` | One string, read as a full `(DESCRIPTION=...)` if it starts with `(`, as an Easy Connect string if it names a host or service (`host:port/service`), and otherwise as an alias |
+| `TNS_ALIAS` | An alias resolved from `tnsnames.ora` in `CONFIG_DIR`, or else inside the `WALLET_FILE` |
+| `MODULE`, `ACTION`, `CLIENT_IDENTIFIER`, `CLIENT_INFO` | End-to-end attributes sent once as the session opens, the way python-oracledb's `module`, `action`, `client_identifier` and `clientinfo` are, so a DBA sees which DuckDB job a session belongs to. Longer than 48, 32, 64 and 64 bytes is refused |
+| `SID` | The database by SID instead of `SERVICE_NAME` (one of the two, not both); also `(CONNECT_DATA=(SID=...))` in a descriptor |
+| `CONFIG_DIR` | A folder holding `tnsnames.ora`, or that file itself, for `TNS_ALIAS` or an alias given as `DSN` |
 | `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` inline; no wallet needed |
 | `USER`, `PASSWORD` | Credentials |
 | `PROTOCOL` | `tcp` (default) or `tcps` |
-| `WALLET_FILE`, `WALLET_PASSWORD` | A cloud wallet ZIP, read in memory only |
+| `WALLET_FILE`, `WALLET_PASSWORD` | A cloud wallet ZIP, a wallet folder (`cwallet.sso` or `ewallet.pem`), or one of those two files; read in memory only |
 | `TLS_CA_FILE`, `TLS_SERVER_NAME`, `TLS_SNI_NAME`, `TLS_SERVER_CERT_DN` | TLS material and the identity to check |
 | `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts; `CONNECT_TIMEOUT` is per attempt |
+
+**Easy Connect**
+
+`[tcp://|tcps://][//]host[:port][,host[:port]...]/service[:server][/instance][?key=value&...]`,
+for example `tcps://db.example.com:2484/sales.example.com?retry_count=3`. It is
+rewritten into the equivalent descriptor and judged by the same parser, so the
+rules below apply to it unchanged. The port defaults to 1521 per host. The
+parameters read are `failover`, `load_balance`, `retry_count`, `retry_delay`,
+`transport_connect_timeout`, `connect_timeout` (whole seconds),
+`ssl_server_cert_dn`, `ssl_server_dn_match`, and the accepted-and-ignored
+`expire_time` and `sdu`. Any other parameter is refused by name. Values are not
+percent-decoded, and a service name is required.
 
 **Works**
 
@@ -142,12 +161,14 @@ CREATE SECRET ora (
 
 - `TNS_ALIAS`, `CONNECT_DESCRIPTOR` and `HOST`/`PORT`/`SERVICE_NAME` — exactly
   one of the three.
-- `TNS_ALIAS` without `WALLET_FILE`; a descriptor with an address whose
+- `DSN` beside `TNS_ALIAS`, `CONNECT_DESCRIPTOR`, `HOST`, `PORT` or `SERVICE_NAME`;
+  `CONFIG_DIR` without an alias to look up; an alias with neither `CONFIG_DIR`
+  nor `WALLET_FILE`; a descriptor with an address whose
   protocol disagrees with `PROTOCOL`; a `TRANSPORT_CONNECT_TIMEOUT` that
   disagrees with the secret's `CONNECT_TIMEOUT`.
 - Descriptor settings whose meaning this client would silently drop:
-  `DESCRIPTION_LIST`, `FAILOVER_MODE` (TAF), `SOURCE_ROUTE=ON`, `SID`,
-  `SERVER=POOLED`, `HTTPS_PROXY`, a millisecond timeout, and any key it does
+  a `DESCRIPTION_LIST` whose descriptions name different databases,
+  `FAILOVER_MODE` (TAF), `SOURCE_ROUTE=ON`, `SERVER=POOLED`, `HTTPS_PROXY`, a millisecond timeout, and any key it does
   not know. (`ENABLE`, `EXPIRE_TIME`, `SDU`, `TDU`, `SEND_BUF_SIZE`,
   `RECV_BUF_SIZE`, `TYPE_OF_SERVICE`, `USE_SNI` are accepted and ignored.)
 - A listener redirect that changes the protocol — TCPS is never sent to TCP.
@@ -158,7 +179,7 @@ CREATE SECRET ora (
 setting to turn it off, deliberately.
 
 **Not supported:** the 11g SHA-1 verifier, Native Network Encryption (ANO),
-`ewallet.p12`/`cwallet.sso` outside a cloud wallet ZIP, SEPS, IAM tokens, failover of an established session (TAF), Application
+`ewallet.p12`, SEPS, IAM tokens, failover of an established session (TAF), Application
 Continuity, FAN/ONS, automatic retry of SQL, and proxy authentication. A lost
 session fails the statement running on it; only new connections fail over.
 
@@ -186,12 +207,10 @@ And, in **all** cases:
 
 The consequences are concrete and worth stating plainly:
 
-- **Anonymous PL/SQL blocks cannot be run at all.** `BEGIN … END;` fails twice
-  over: `BEGIN` is not an accepted first keyword for either function, and the
-  `;` that PL/SQL itself requires is refused. There is no third function that
-  takes a block. `oracle_execute_composite_transaction` does send one, but a
-  block it builds itself from statements that each passed the DML gate, with
-  nothing of the caller's between them.
+- **Anonymous PL/SQL blocks have their own functions.** `BEGIN … END;` fails
+  in the query and DML functions twice over: `BEGIN` is not an accepted first
+  keyword there, and the `;` that PL/SQL itself requires is refused. `oracle_plsql`
+  and `oracle_plsql_transaction` (§7) take a block; nothing else does.
 - **DDL goes only through `oracle_execute_admin`.** The query and DML
   functions refuse `CREATE`, `DROP`, `ALTER` and `TRUNCATE`. `oracle_execute_admin`
   takes one such command, on a session of its own and never inside an explicit
@@ -211,8 +230,8 @@ SELECT * FROM oracle_call_auto('ora', 'DBMS_UTILITY.EXEC_DDL_STATEMENT',
 `DBMS_UTILITY.EXEC_DDL_STATEMENT` is an ordinary Oracle procedure taking one
 `VARCHAR2`, so it goes through the callable path (§7) and never touches the SQL
 gate. The DDL text it carries is not parsed here at all. The same trick runs
-anything expressible as a single procedure call; it does **not** give you
-anonymous blocks, because the argument is a statement, not a block.
+anything expressible as a single procedure call. For anything longer, or any
+DDL, run a block with `oracle_plsql` (§7), which can `EXECUTE IMMEDIATE` it.
 
 This is a real limitation, not a policy statement dressed up as one. It exists
 because the gate is a whitelist of shapes whose bind, describe, and fetch
@@ -252,8 +271,11 @@ homogeneous, so `[1, 'one', DATE '2026-01-02']` cannot even be constructed. A
 | Oracle type | Reads as | Notes |
 | --- | --- | --- |
 | `NUMBER(p,0)`, p ≤ 18 | `BIGINT` | |
+| `NUMBER(p,s)`, s < 0, p − s ≤ 18 | `BIGINT` | Whole numbers rounded to a power of ten, `NUMBER(10,-2)` |
 | `NUMBER(p,s)`, p ≤ 38, 1 ≤ s ≤ p | `DECIMAL(p,s)` | |
-| `NUMBER` otherwise | `VARCHAR` | Unconstrained NUMBER is exact only as text |
+| `NUMBER(p,s)`, s > p, s ≤ 38 | `DECIMAL(s,s)` | Fractions with leading zeros, `NUMBER(2,4)` holds 0.0012 |
+| `NUMBER` with no precision | `VARCHAR`, or what `oracle_unconstrained_number` says | Exact only as text; the setting trades that for `DOUBLE` or a fixed `DECIMAL` |
+| `NUMBER` otherwise | `VARCHAR` | |
 | `VARCHAR2`, `CHAR` | `VARCHAR` | Arrives as UTF-8 whatever the database character set is |
 | `DATE` | `TIMESTAMP` | An Oracle `DATE` carries a time; it is not a DuckDB `DATE` |
 | `TIMESTAMP(n)` | `TIMESTAMP`, or `TIMESTAMP_NS` when n > 6 | |
@@ -262,6 +284,17 @@ homogeneous, so `[1, 'one', DATE '2026-01-02']` cannot even be constructed. A
 | `BINARY_FLOAT`, `BINARY_DOUBLE` | `FLOAT`, `DOUBLE` | |
 | `CLOB`, `NCLOB` | `VARCHAR` | See §4 |
 | `BLOB` | `BLOB` | See §4 |
+| `NCHAR`, `NVARCHAR2` | `VARCHAR` | UTF-16 in the row, read as UTF-8; written back as UTF-16 behind the national form. A filter on one is not pushed down |
+| `INTERVAL YEAR TO MONTH` | `INTERVAL` | Whole months. A span past the 32-bit month count DuckDB keeps is refused. Written from an interval with months only |
+| `INTERVAL DAY TO SECOND` | `INTERVAL` | Days and microseconds. Oracle keeps nanoseconds; a fraction finer than a microsecond is refused, not rounded. Written from an interval without months, whose days and time have one sign |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | An instant. The session time zone is UTC (see below), so the value Oracle sends is the instant. Microseconds only: a finer fraction is refused. Written from a `TIMESTAMPTZ` |
+| `BOOLEAN` (23ai) | `BOOLEAN` | Needs a server that sends it as its own type, which 23ai does to a client advertising TTC field version 17, as this one does. Earlier servers have no such column |
+| `JSON` (21c and later; read from 23ai) | `JSON` | The OSON image the server stores, decoded to JSON text. Objects keep the order the image holds. Oracle's non-JSON scalars print as `JSON_SERIALIZE` prints them: timestamps as ISO 8601 strings, `RAW` as upper-case hex, intervals as ISO 8601 durations. Written as its text, up to 1 GiB (past 8 MiB through a temporary LOB) |
+| `VECTOR` (23ai) | `FLOAT[n]`, `DOUBLE[n]`, `TINYINT[n]`, `UTINYINT[n]`, or the same as a list | By the column's declared storage format and dimensions: `FLOAT32` is `FLOAT`, `FLOAT64` is `DOUBLE`, `INT8` is `TINYINT`, `BINARY` is the packed bytes as `UTINYINT` (dimensions ÷ 8). A fixed dimension count is an array, `*` a list. A column of any format (`VECTOR(*,*)`) is a list of `DOUBLE`, which holds every dense format but `BINARY`; a `BINARY` value in one is refused. A `SPARSE` column is `STRUCT(dimensions UINTEGER, indices UINTEGER[], "values" T[])`. Written as the image python-oracledb sends |
+| `XMLTYPE` | `VARCHAR` | Through an attached table: the document as text, selected as `XMLSERIALIZE(CONTENT col AS CLOB NO INDENT)`, so it comes back compact whatever the storage. Written through `XMLPARSE(DOCUMENT :n)`, which gives NULL for NULL and Oracle's own `ORA-31011` for a document that does not parse. A filter on one runs in DuckDB. `oracle_query` of a bare `XMLTYPE` column is still refused: select `XMLSERIALIZE(...)` yourself |
+| `ROWID`, `UROWID` | `VARCHAR` | The 18 characters Oracle itself prints (`ROWIDTOCHAR`). A logical UROWID, which an index-organized table has, is refused |
+| `LONG` | `VARCHAR` | At most 1 MiB per value |
+| `LONG RAW` | `BLOB` | At most 1 MiB per value |
 
 The third row is the one people meet in practice. A column declared plain
 `NUMBER` reads as `VARCHAR`, and on schemas generated by ETL or integration
@@ -276,20 +309,55 @@ BIGINT)` for keys, `CAST(col AS DOUBLE)` where a ratio is enough. Declaring the
 column as `NUMBER(p[,s])` in Oracle removes the need entirely, and does so for
 every client, not just this one.
 
-There is no setting that changes this mapping. One was considered and refused:
-a mode that silently narrowed unconstrained `NUMBER` would make correctness
-depend on a flag, and a reconciliation that is exact in one session and two
-cents off in another is worse than one that always asks for a cast.
+The default never changes silently. `SET oracle_unconstrained_number = 'decimal(38,9)'`
+(or `'double'`) says once, for a session, what these columns become instead; it applies
+only to a `NUMBER` with no declared precision, is read when a query is bound or a table
+is first used, rounds what does not fit (a `DECIMAL` that cannot hold a value's integer
+digits raises), and is off until you set it, so that a reconciliation is exact unless you
+chose otherwise.
+
+**The session time zone is UTC.** Every session this extension opens sets
+`TIME_ZONE='+00:00'` at login, as python-oracledb Thin sets its own client's
+offset. A `TIMESTAMP WITH LOCAL TIME ZONE` reaches the client as a wall-clock
+time with no offset, in the session's zone, so a fixed zone is what makes it an
+instant. It also means `SESSIONTIMEZONE`, `CURRENT_TIMESTAMP` and the display of
+a local-zone column in your own SQL are UTC in a session opened here. (Before
+0.6.0 the zone was a fixed `+04:00`, copied from the capture the login was
+modelled on, and nothing relied on it.)
+
+**BOOLEAN, JSON and VECTOR need a newer field version.** This client advertises
+TTC field version 24 (python-oracledb's `TNS_CCAP_FIELD_VERSION_23_4`) and uses
+whatever the server will go to, up to that. A 23ai server then sends a SQL
+`BOOLEAN` as itself (it needs 17; 13 to 16 still get `NUMBER`), tells the client
+a `VECTOR` column's dimensions and storage format in the describe (it needs 24),
+and sends JSON as an OSON image. From 18 every request header carries a token
+number after its sequence number, which this client always sets to zero. A 19c
+server reports 12 and negotiates down, so nothing changes there.
+
+**JSON and VECTOR arrive with their rows.** A query over either gets a locator
+for each value, and reading a value from its locator is a round trip of its own
+or two. After the describe the client therefore re-executes the cursor with a
+define for every column, the exchange python-oracledb makes, and asks for the
+first 64 KiB of every JSON and VECTOR value ahead of its locator. A value longer
+than that arrives cut short and the rest is read from the locator. On Free 23ai,
+reading 5,000 rows of a `VECTOR(768,FLOAT32)` and a small `JSON` column took 1.5
+and 1.4 seconds a column one value at a time and 0.3 and 0.04 with the define.
+The define is only written when every column is a type whose define is known;
+a table with a `ROWID` or `LONG` beside its JSON column is read value by value,
+as before.
+
+**A statement that writes a `JSON` column can carry text up to 1 GiB; one that
+writes a `VECTOR` carries the image.** A vector as text would stop at the 32767
+bytes of a `VARCHAR2` bind, about 2,700 `FLOAT32` elements, and embeddings of
+3,072 and 4,096 dimensions are common. Neither can be returned by
+`INSERT ... RETURNING`, which hands back a locator; that is refused by name.
 
 **Refused while binding**, before any fetch, each naming its reason:
 
 | Type | Why |
 | --- | --- |
-| `NCHAR`, `NVARCHAR2` | UTF-16 in the row itself, and not decoded |
-| `TIMESTAMP WITH LOCAL TIME ZONE` | Relative to a session time zone this client never negotiates |
-| `INTERVAL YEAR TO MONTH`, `DAY TO SECOND` | No decoder |
 | `BFILE` | No read path |
-| Object, `VARRAY`, nested table, `XMLTYPE`, `REF` | Outside this version |
+| Object, `VARRAY`, nested table, `REF` | Outside this version |
 
 A refusal happens at bind time, so a query either runs correctly or fails
 immediately — it never returns a column decoded into something wrong.
@@ -308,11 +376,36 @@ in as `''` comes back as NULL. That is Oracle's behavior, faithfully reproduced.
 
 ## 4. LOBs
 
-`CLOB`, `NCLOB`, and `BLOB` are **read**. `BFILE` is not, and no LOB can be
-**written**.
+`CLOB`, `NCLOB`, and `BLOB` are **read** and **written**. `BFILE` is neither.
+
+**Writing** sends the content as an ordinary bind, as python-oracledb Thin does:
+a `VARCHAR2` for a `CLOB` or `NCLOB` (Oracle converts to the national set
+itself) and a `RAW` for a `BLOB`. Oracle accepts such a bind past the usual
+32 767 bytes when its target is a LOB; the value goes out in chunks, and a bind
+that wide has its value sent after the short ones in the row, which is the order
+python-oracledb uses. Through an attached table that is `INSERT` and `UPDATE`
+with a `VARCHAR` or `BLOB` value; an empty value is NULL, like any empty string
+in Oracle.
+
+- **Up to 8 MiB a value is an ordinary bind; past that, a temporary LOB.** The
+  session creates one (`LOB_OP` `CREATE_TEMP`, for the session's duration),
+  writes the content into it in pieces of at most 2 MiB (a `CLOB` as UTF-16, its
+  offsets counted in UTF-16 units), binds its locator, and releases it when the
+  statement is done, on failure too. In an array `INSERT` a column that needs one
+  in any row of a group is bound by locator in every row of that group, because
+  the bind metadata is declared once. The same shapes python-oracledb Thin sends
+  (see PROVENANCE.md). A value is limited to **1 GiB**; the server's temporary
+  tablespace is the real ceiling. Checked live to 100 MiB of `CLOB` and 200 MiB
+  of `BLOB` against 19c and 23ai, content compared by hash.
+- **Memory.** A statement is built whole, so a batch of N rows holds N times its
+  LOB values at once; insert large LOBs a few rows at a time.
+- **`RETURNING` cannot cover a LOB, JSON or VECTOR column.** Oracle returns a locator
+  there, and DuckDB's `RETURNING` spans every column of the table, so a table
+  with a LOB column refuses it with a message that names the column.
+- A LOB column is not filtered remotely; a filter on one runs in DuckDB.
 
 A LOB column carries a locator in the row. Against a server that negotiates
-the 12c field version (19c, 23ai and Autonomous do), the fetch asks Oracle to
+the 12c field version or later (19c, 23ai and Autonomous all do), the fetch asks Oracle to
 send the first 4 096 characters or bytes of each LOB along with the row, in
 batches of at most 128 rows and 4 MB; a value that fits costs no LOB call at
 all, and a longer one reads only its remainder, 32 767 characters or 65 536
@@ -331,8 +424,9 @@ empty (they stay distinct, as in Oracle), a 240 000-character CLOB and a
 40 000-character NCLOB.
 
 Character LOB content arrives as AL16UTF16 whatever the database character set
-is, and is converted to UTF-8 here. That is why `NCLOB` reads while `NCHAR` and
-`NVARCHAR2` do not: their values travel in the row, not through a LOB read.
+is, and is converted to UTF-8 here. `NCHAR` and `NVARCHAR2`
+are different: their values travel in the row, as UTF-16, and are converted
+there.
 
 ---
 
@@ -345,34 +439,96 @@ SELECT * FROM o.ITEMS WHERE id > 100;
 
 The path is the **secret name**, not a connection string. One attachment exposes
 one schema: the connected user's own tables and views, resolved lazily from
-`USER_TABLES`, `USER_VIEWS`, and `USER_TAB_COLUMNS`.
+`USER_TABLES`, `USER_VIEWS`, and `USER_TAB_COLUMNS` — or, with `SCHEMA 'owner'`,
+another user's, from `ALL_TABLES`, `ALL_VIEWS`, `ALL_TAB_COLUMNS` and
+`ALL_CONSTRAINTS` filtered to that owner, with every statement qualified
+(`"OWNER"."TABLE"`). The name is checked against `ALL_USERS` at `ATTACH` (exact,
+else the single case-insensitive match; none is an error); naming the connected
+user is the same as naming nothing. Only what the connected user can see is listed.
 
 | Operation | Status |
 | --- | --- |
 | `SELECT` | Works |
 | `INSERT`, `UPDATE`, `DELETE` | Works — see §6 |
 | `INSERT … RETURNING` | Works |
-| `UPDATE … RETURNING`, `DELETE … RETURNING` | **Refused** |
+| `UPDATE … RETURNING`, `DELETE … RETURNING` | Works, one statement per row, addressed by ROWID, with `SQL%ROWCOUNT` so a row already gone is left out |
 | `CREATE TABLE`, `CREATE TABLE AS` | Refused — this extension issues no DDL |
 | `DROP TABLE` | Refused |
 | `CREATE SCHEMA`, `DROP SCHEMA` | Refused — one schema, and it is Oracle's |
-| Another user's schema | Not exposed; use `oracle_query` with a qualified name |
+| Another user's schema | `ATTACH … (SCHEMA 'owner')`, one schema per attachment |
 
 Identifiers arrive as Oracle stores them, which is upper case unless they were
-created quoted: `o.ITEMS`, not `o.items`.
+created quoted: `o.ITEMS`. A name typed in another case (`o.items`) finds the one
+object that matches ignoring case; a schema holding both `"items"` and `ITEMS` needs the
+exact spelling.
 
 ### Filter pushdown
 
-Off by default. `SET oracle_filter_pushdown = true` sends `WHERE` predicates to
-Oracle.
+On by default; `SET oracle_filter_pushdown = false` turns it off.
 
-It is opt-in because DuckDB removes a filter from the plan once it hands it to
-a scan, so the scan must then apply it *exactly*. This translator refuses
-anything whose Oracle meaning it cannot prove identical — and with pushdown on,
-a refusal is an error rather than a slower plan. Translated: `=`, `<>`, `<`,
-`<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN` (up to 1 000 values), and
-`AND`/`OR` over those, on integer, decimal, date, and timestamp columns.
-Anything else — and any `IN` list with one unprovable member — raises.
+DuckDB removes a filter from the plan once it hands it to a scan, so the scan
+must apply every one *exactly*. Each filter is translated into the Oracle
+`WHERE` clause only when its Oracle meaning is provably identical, and otherwise
+kept and evaluated by DuckDB's own expression over each fetched batch — a
+refusal costs speed, never an error. Translated: `=`, `<>`, `<`, `<=`, `>`, `>=`,
+`IS NULL`, `IS NOT NULL`, `IN` (up to 16 384 values, sent as lists of 1 000 joined by
+`OR`), and `AND`/`OR` over those, on integer, decimal, date, and timestamp columns, and
+`=`, `<>` and `IN` on `VARCHAR2` columns against a non-empty constant (equality does not
+depend on collation). Everything else is local: ordered comparisons of text, `LIKE` (Oracle's collation and blank-padded `CHAR` comparison
+depend on session settings this client does not negotiate), predicates across
+several columns, `ROWID`, an `IN` list with one unprovable member.
+
+**Join keys.** A join against a table DuckDB reads itself hands the scan the keys
+of its other side as optional filters. A filter that is an `AND` of conjuncts is
+read one conjunct at a time: an `IN` list or a range goes into the `WHERE`
+clause, a prefix-range filter (DuckDB's bitmap of the keys) is turned back into
+the key intervals it admits by asking it which ranges may hold a key — exactly,
+as `IN` lists of single keys and `BETWEEN` ranges, up to 2,048 intervals, and as
+a superset when there are more — and a bloom filter, which has no SQL form, is
+dropped. All of them are hints, so dropping or widening one never changes an
+answer. The choice of plan depends on the row count the catalog passes DuckDB,
+`USER_TABLES.NUM_ROWS`, and on each column's `NUM_DISTINCT` (the distinct count only,
+never a minimum, maximum or null count, which a stale statistic could make wrong in a
+way that drops rows); a table without statistics has neither. DuckDB builds an `IN` list
+from the other side only up to its own `dynamic_or_filter_threshold` (50 by default);
+raise it to let a larger side through. A composite key is filtered column by column.
+
+### What else Oracle does
+
+Beyond filters, six rewrites hand work to Oracle. Each is exact or it does not happen:
+the plan is left as it was, never an error, and each has a setting to turn it off (§9).
+They share two conditions: every filter on the scan must have been sent to Oracle (a
+filter DuckDB applies itself would then see rows that are already cut or grouped), and
+the keys involved must be numbers, dates or timestamps, which compare the same in both
+engines. Text keys are left out because Oracle may compare text by collation or
+blank-padded `CHAR` rules where DuckDB compares bytes.
+
+| Rewrite | Covers | Left to DuckDB |
+| --- | --- | --- |
+| Top-N | `ORDER BY … LIMIT … OFFSET` becomes `ORDER BY … NULLS FIRST/LAST FETCH FIRST limit+offset ROWS ONLY`; DuckDB's `TOP_N` stays and re-sorts | text, computed or ROWID keys; a sample; a parallel scan |
+| Aggregates | `count(*)`, `count(col)`, `sum` of exact numbers, `min`, `max`, with or without `GROUP BY`; one statement replaces the aggregate and its scan | `DISTINCT`, `FILTER`, `ORDER BY`, `GROUPING SETS`, floating-point `sum`, text group keys |
+| Joins | an inner join of two attached tables of one database, on comparisons of number, date or timestamp columns, as one statement over two inline views carrying each side's filters | outer, semi and anti joins; text keys; LOB, JSON, VECTOR, XML or ROWID columns; a third table |
+| Heavy columns | when DuckDB applies a filter itself, `CLOB`/`BLOB`/`JSON`/`VECTOR`/`XMLTYPE` columns it does not read are fetched afterwards for the surviving rows, `WHERE ROWID IN (…)` in groups of 500, `AS OF SCN` at the change number the rows were read at | views, index-organized, clustered and temporary tables; a sample; a parallel scan; a transaction that has written; no flashback |
+| JSON paths | `json_extract_string(col, '$.a.b')` / `col->>'$.a[0]'` against a plain string, as `=`, an `OR` of them, or `IS NOT NULL`, on a native `JSON` column, narrowed with `JSON_VALUE … NULL ON ERROR` / `JSON_EXISTS`. DuckDB keeps its own test, so Oracle's predicate only has to be a superset | constants that could be a JSON number, `true`, `false`, `null`, an object or an array; paths with quoted keys, wildcards or filters |
+| Samples | `TABLESAMPLE SYSTEM`/`USING SAMPLE … (system)` becomes `SAMPLE (p)` (`SAMPLE BLOCK (p)` from 20 million estimated rows), `REPEATABLE` becomes `SEED` | a sample of a view, `BERNOULLI`, a sample taken after a filter |
+
+**One moment for a whole statement.** With `oracle_consistent_read` (off by default) the
+first scan of a statement takes a change number per catalog and every scan of that
+catalog in the statement — pushed joins and aggregates, each ROWID range of a parallel
+scan, deferred columns — reads `AS OF` it. A database that gives out no change number
+fails the statement instead of reading several moments. A transaction that has written
+reads through its own session and is not pinned.
+
+**Local snapshots.** `oracle_snapshot(catalog, table, query)` runs a DuckDB query over
+the catalog's attached tables with one change number pinned, on a connection of its own,
+and writes the result with `CREATE OR REPLACE TABLE`. The catalog, change number, time and
+query are kept in the table's comment; `oracle_snapshots()` lists them and
+`oracle_snapshot_refresh(table)` runs the query again. Only the named catalog is pinned.
+
+**What a scan reports.** `EXPLAIN ANALYZE` shows, on an attached scan, the statement sent
+(for a parallel scan the first range and a count of the rest), sessions, rows returned
+before DuckDB's filters, bytes and round trips on the scan's connections, fetch and
+conversion time, columns read after the filter, and the filters applied after fetching.
 
 ---
 
@@ -399,9 +555,11 @@ Values are encoded from the **Oracle** column type, never from the DuckDB type
 alone, so nothing reaches Oracle as text for a session `NLS` setting to
 reinterpret.
 
-Writable column types: `VARCHAR2`, `CHAR`, `NUMBER`, `DATE`, `TIMESTAMP`,
-`TIMESTAMP WITH TIME ZONE`, `RAW`, `BINARY_FLOAT`, `BINARY_DOUBLE`. Everything
-else — LOBs included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
+Writable column types: `VARCHAR2`, `CHAR`, `NCHAR`, `NVARCHAR2`, `NUMBER`,
+`DATE`, `TIMESTAMP`, `TIMESTAMP WITH LOCAL TIME ZONE`, `INTERVAL YEAR TO MONTH`,
+`INTERVAL DAY TO SECOND`, `BOOLEAN`, `RAW`, `BINARY_FLOAT`, `BINARY_DOUBLE`.
+`CLOB`, `NCLOB`, `BLOB` (see §4), `JSON`, `VECTOR`. (`TIMESTAMP WITH TIME ZONE` is read but not
+written.) Everything else — `LONG` and `ROWID` included — is refused by name. `FLOAT`/`DOUBLE` into a `NUMBER`
 column is refused too: cast to `DECIMAL` or text first, because binary floats
 are not exact.
 
@@ -481,6 +639,12 @@ transaction, so their work commits and rolls back with it:
   `VARCHAR` arguments, `IN`, `OUT` or `IN OUT`, NULL included. No cursors, LOBs
   or objects. The procedure must not commit, run DDL or use an autonomous
   transaction.
+- `oracle_plsql_transaction` — an anonymous PL/SQL block on the pinned session,
+  with up to 64 binds (the same `STRUCT(name, direction, type, value)` as
+  `oracle_call_named`), `IN`, `OUT` or `IN OUT`, returning one row per `OUT`
+  bind. No cursors. The block must not commit, run DDL or use an autonomous
+  transaction. The session ends closed rather than reused afterwards, because a
+  block can change its state.
 - `oracle_transaction_status` — the outcome of the current or last transaction
   (`commit_outcome`, `connection_state`, `oracle_error_code`,
   `protocol_error_kind`), read locally without opening a session. DuckDB drops
@@ -507,16 +671,24 @@ SELECT * FROM oracle_arguments('ora', 'PKG.PROC');   -- inspect the signature
 ```
 
 **Works:** `IN`, `OUT`, and `IN OUT` arguments of `NUMBER`, `VARCHAR2`, `CHAR`,
-`DATE`, and `TIMESTAMP`; functions with a return value; `SYS_REFCURSOR` returns,
+`NCHAR`, `NVARCHAR2`, `DATE`, `TIMESTAMP`, `TIMESTAMP WITH LOCAL TIME ZONE`
+(bound as the UTC wall time), `INTERVAL YEAR TO MONTH`, `INTERVAL DAY TO SECOND`
+and `BOOLEAN` (a PL/SQL `BOOLEAN`, on a 23ai server); functions with a return value; `SYS_REFCURSOR` returns,
 read through `oracle_cursor` and released with `oracle_close_call`; names
 reached through a synonym; packaged and standalone callables.
 
-**Refused:** arguments of LOB, `NCHAR`/`NVARCHAR2`, object, record, collection,
-`REF`, `XMLTYPE`, `PL/SQL BOOLEAN`, `INTERVAL`, or `TIMESTAMP WITH [LOCAL] TIME
-ZONE` type; a name that matches more than one object; and an overload set with
+**Refused:** arguments of LOB, object, record, collection, `REF`, `XMLTYPE`,
+`JSON`, `VECTOR` or `TIMESTAMP WITH TIME ZONE` type; a name that matches more than one object; and an overload set with
 two candidates of the same arity — only the caller can say which was meant.
 
 A LOB is therefore **readable as a column but not passable as an argument.**
+
+**Anonymous blocks.** `oracle_plsql(secret, block, binds)` runs a block on a session of
+its own and commits when it succeeds, like `oracle_execute`; a block that fails is rolled
+back with the session. Binds are the same `STRUCT(name, direction, type, value)` list as
+`oracle_call_named`, up to 64, `IN`, `OUT` or `IN OUT`, one result row per `OUT` bind; no
+cursors. A block may run DDL through `EXECUTE IMMEDIATE`. `DBMS_OUTPUT` is not collected.
+`oracle_plsql_transaction` (§6) is the same on the attached transaction's pinned session.
 
 A procedure that commits internally is outside DuckDB's rollback guarantee, and
 runs in its own call scope for that reason.
@@ -524,6 +696,24 @@ runs in its own call scope for that reason.
 ---
 
 ## 8. Parallel scan
+
+**Attached tables, automatically.** By default (`oracle_parallel_scan = -1`) a scan of an
+attached table whose statistics say 500 000 rows or more reads through as many sessions
+as DuckDB has threads, up to 8; `SET oracle_parallel_scan = N` fixes the number (`0` or `1`
+is one stream). It lists the table's extents
+(`DBA_EXTENTS`, joined to `DBA_OBJECTS` for the data object), sorts them by ROWID order
+(object, file, block), cuts between extents into about 4N chunks of equal blocks, and each
+thread reads chunks as `ROWID >= lo AND ROWID < hi` (open at both ends) `AS OF SCN s`,
+where `s` was taken once with `DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER`. Oracle plans
+each as a `TABLE ACCESS BY ROWID RANGE`. Anything the plan needs and cannot get — the
+extents, the change number, a flashback read, a heap table of 2,048 blocks or more —
+means one stream, never an error, and so do a sample and a transaction that has written.
+Partitioned tables work; the cut points run across partitions. Checked on 19c and 23ai by
+`EXCEPT` both ways against the one-stream read, on a plain and a partitioned table, with
+pushed filters, a local filter, `LIMIT` and `DELETE`.
+
+**By key.** `oracle_scan_parallel` splits by ranges of a numeric key you name, and needs
+no privilege beyond the table.
 
 ```sql
 SELECT * FROM oracle_scan_parallel('ora', 'BIG_TABLE', 'ID', shards := 8);
@@ -538,6 +728,19 @@ change to the table, Oracle's ORA-01466 is reported as such.
 Requires a `NUMBER` key column with integral bounds. Rows whose key is NULL get
 their own shard, so nothing is dropped.
 
+## 8a. Vector search
+
+`oracle_vector_search(secret, table, column, query_vector, k := 10, metric := 'COSINE',
+approximate := true)` returns the table's columns and `distance` for the `k` rows nearest
+to the query vector, ranked by Oracle's `VECTOR_DISTANCE` (23ai). It orders by the
+distance alias, which Oracle plans exactly as the expression: with a vector index the
+plan is an index probe, not a scan. `k` is 1 to 100,000, `metric` one of six words
+(never text from the caller), the identifiers are quoted. The query vector is sent in
+the column's storage format, read from `VECTOR_INFO`, because Oracle refuses
+`ORA-51812` on a mismatch; a `VECTOR(*,*)` column gets `FLOAT32` or `FLOAT64` by the
+element type given. A server without `VECTOR` answers with its own error. It runs on a
+pooled session of its own, not inside an attached transaction.
+
 ---
 
 ## 9. Settings
@@ -546,7 +749,14 @@ their own shard, so nothing is dropped.
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | Sessions pooled per DuckDB connection per secret identity, for reads. `0` disables pooling. |
 | `oracle_transaction_pool_size` | `2` | Idle transaction sessions an attached catalog keeps; see §6. Read at `ATTACH`; `0` disables reuse. |
-| `oracle_filter_pushdown` | `false` | See §5. |
+| `oracle_filter_pushdown` | `true` | See §5. |
+| `oracle_consistent_read` | `false` | One change number per statement and catalog; see §5 |
+| `oracle_deferred_columns` | `true` | Read heavy columns after DuckDB's own filter; see §5 |
+| `oracle_join_pushdown` | `true` | Let Oracle join two attached tables; see §5 |
+| `oracle_aggregate_pushdown` | `true` | Let Oracle compute aggregates; see §5 |
+| `oracle_top_n_pushdown` | `true` | Let Oracle rank an `ORDER BY … LIMIT`; see §5 |
+| `oracle_parallel_scan` | `-1` | Sessions one scan of an attached table may use, reading ROWID ranges cut at extent boundaries, all at one SCN (§8). `-1`: automatic (DuckDB's thread count, up to 8, when `NUM_ROWS` says 500,000 or more, else one); `0` or `1`: one stream |
+| `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision (plain `NUMBER`, `SUM(x)`, `count(*)`) becomes: `'varchar'` (exact), `'double'`, or `'decimal(p,s)'` such as `'decimal(38,9)'`. Read when a query is bound or a table is first used; the lossy choices round what does not fit, and a DECIMAL that cannot hold a value's integer digits raises. A `DOUBLE` column then accepts `DOUBLE` on write |
 
 Pooling matters more than it looks: opening a session costs a full TNS handshake
 and authentication. Callables through a secret always open their own session;
@@ -566,10 +776,10 @@ the attached catalog's transactions reuse sessions as §6 describes.
 
 ## 11. Not supported, in one list
 
-Anonymous PL/SQL blocks · DDL except through `DBMS_UTILITY.EXEC_DDL_STATEMENT` ·
-LOB writing · `BFILE` · `NCHAR`/`NVARCHAR2` · `INTERVAL` ·
-`TIMESTAMP WITH LOCAL TIME ZONE` · object, collection, record and `XMLTYPE`
-types · `UPDATE`/`DELETE … RETURNING` · schemas other than the connected user's ·
+DDL except through `oracle_execute_admin`, `DBMS_UTILITY.EXEC_DDL_STATEMENT` or a PL/SQL block ·
+LOB values past 1 GiB · `BFILE` · a logical `UROWID` · writing `TIMESTAMP WITH TIME ZONE`,
+`LONG` and `ROWID` · object, collection and record
+types · several schemas in one attachment ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1
 verifier · SEPS · IAM · failover of an established session (TAF) ·
 Application Continuity · AQ ·

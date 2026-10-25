@@ -12,6 +12,7 @@
 #include "oracle_scanner/lob_prefetch_cursor.hpp"
 #include <cstdint>
 #include <mutex>
+#include <functional>
 #include <vector>
 
 namespace oracle_scanner {
@@ -35,6 +36,12 @@ public:
     TtcLobResponse LobOperation(const TtcLobRequest &request, uint8_t server_field_version,
                                 bool legacy_session = false);
 
+    //! Runs a LOB_OP that returns locators rather than data — creating,
+    //! writing or releasing a temporary LOB — from an already encoded request.
+    //! Returns the locator(s) the server sent back, concatenated.
+    std::vector<uint8_t> LocatorOperation(const std::vector<uint8_t> &request, size_t locator_count, bool created,
+                                          uint8_t server_field_version, bool legacy_session = false);
+
     //! Held across a request and the response that answers it. See
     //! TtcChannel::LockCall.
     std::unique_lock<std::recursive_mutex> LockCall();
@@ -55,6 +62,10 @@ public:
                                         bool legacy_session = false);
     void CompleteExecute(OracleStatementHandle handle, bool is_query, uint32_t remote_cursor_id);
     void Fetch(OracleStatementHandle handle, uint8_t sequence, uint32_t requested_rows);
+    // Re-executes the described cursor with a define for each column, so JSON
+    // and VECTOR values arrive with their rows (see ttc_define.hpp).
+    void DefineInlineLobs(OracleStatementHandle handle, uint8_t sequence, const std::vector<OracleColumn> &columns,
+                          uint32_t rows);
     void DefineLobPrefetch(OracleStatementHandle handle,uint8_t sequence,
         const std::vector<OracleColumn> &columns,uint32_t rows,uint8_t field_version,const OracleLobPrefetchLimits &limits);
     TtcFetchResponse ReceiveDecodedLobPrefetchFetchResponse(OracleStatementHandle handle,
@@ -72,6 +83,8 @@ public:
     bool Close(OracleStatementHandle handle);
 
 private:
+    void LobExchange(const std::vector<uint8_t> &request, const std::function<void(const std::vector<uint8_t> &)> &decode);
+
     TtcChannel &channel;
     OracleStatementRegistry &statements;
 };

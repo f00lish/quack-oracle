@@ -10,6 +10,9 @@
 #include <memory>
 #include <string>
 
+#include <filesystem>
+#include <system_error>
+
 namespace oracle_scanner {
 
 namespace {
@@ -41,6 +44,16 @@ bool HasZipSignature(const std::string &path) {
     return count == static_cast<std::streamsize>(signature.size()) && signature[0] == 'P' && signature[1] == 'K' &&
            ((signature[2] == 3 && signature[3] == 4) || (signature[2] == 5 && signature[3] == 6) ||
             (signature[2] == 7 && signature[3] == 8));
+}
+
+bool PathExists(const std::string &path) {
+    std::error_code error;
+    return std::filesystem::exists(std::filesystem::path(path), error) && !error;
+}
+
+bool IsDirectory(const std::string &path) {
+    std::error_code error;
+    return std::filesystem::is_directory(std::filesystem::path(path), error) && !error;
 }
 
 std::string ReadWalletFile(const std::string &path, size_t maximum_size, const char *description) {
@@ -198,6 +211,25 @@ std::string ReadWalletPemFile(const std::string &path) {
 }
 
 std::string ReadWalletIdentityPem(const std::string &path, bool have_wallet_password) {
+    if (IsDirectory(path)) {
+        // A wallet folder, as python-oracledb's wallet_location names one. The
+        // same preference as inside a ZIP: the auto-login store opens without a
+        // password, and ewallet.pem is what a password belongs to.
+        const auto sso_path = path + "/cwallet.sso";
+        const auto pem_path = path + "/ewallet.pem";
+        const bool has_sso = PathExists(sso_path);
+        const bool has_pem = PathExists(pem_path);
+        if (!has_sso && !has_pem) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                "Oracle wallet folder contains neither ewallet.pem nor cwallet.sso");
+        }
+        if (has_sso && (!have_wallet_password || !has_pem)) {
+            return SsoWalletToPem(ReadWalletFile(sso_path, MAX_WALLET_PEM_BYTES, "Oracle wallet file"));
+        }
+        auto pem = ReadWalletFile(pem_path, MAX_WALLET_PEM_BYTES, "Oracle wallet PEM");
+        ValidatePemContents(pem, "Oracle wallet PEM");
+        return pem;
+    }
     if (HasZipSignature(path)) {
         const auto contents = ReadWalletFile(path, MAX_WALLET_ARCHIVE_BYTES, "Oracle wallet archive");
         // With a password the encrypted ewallet.pem is what the caller asked
@@ -279,6 +311,23 @@ std::string ReadWalletTnsNamesArchive(const std::string &path) {
     std::string tnsnames(extracted, extracted_size);
     if (tnsnames.find('\0') != std::string::npos) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle wallet ZIP tnsnames.ora contains NUL bytes");
+    }
+    return tnsnames;
+}
+
+std::string ReadTnsNamesSource(const std::string &path) {
+    if (path.empty() || path.size() > 4096 || path.find('\0') != std::string::npos) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle tnsnames.ora path is invalid");
+    }
+    const bool is_directory = IsDirectory(path);
+    if (!is_directory && HasZipSignature(path)) {
+        return ReadWalletTnsNamesArchive(path);
+    }
+    // A folder holds tnsnames.ora; any other path is taken to be that file.
+    auto tnsnames = ReadWalletFile(is_directory ? path + "/tnsnames.ora" : path, MAX_WALLET_PEM_BYTES,
+                                   "Oracle tnsnames.ora");
+    if (tnsnames.find('\0') != std::string::npos) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle tnsnames.ora contains NUL bytes");
     }
     return tnsnames;
 }

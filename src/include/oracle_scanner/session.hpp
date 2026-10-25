@@ -46,6 +46,31 @@ struct OracleColumn {
     // decoders can know this; the default means "expect bytes", which is what
     // every column built anywhere else should be treated as.
     bool omitted_from_row_data = false;
+    // A VECTOR column's declared shape, which a server at TTC field version 24
+    // or later sends with the describe: the dimension count (0 for an unbounded
+    // `*`), the storage format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 for
+    // `*`), and flags. Zero in every column that is not a VECTOR.
+    uint32_t vector_dimensions = 0;
+    uint8_t vector_format = 0;
+    uint8_t vector_flags = 0;
+    // Set by a cursor once it has asked the server to send a LOB-like column
+    // (CLOB, BLOB, JSON, VECTOR) with its size, and for JSON and VECTOR the
+    // first bytes of its value, ahead of the locator. A row's cell for such a
+    // column is then framed differently, and this is what the row decoder
+    // reads to know which way. Never set on a describe.
+    bool inline_lob_cells = false;
+    // Set by a catalog on a column whose dictionary type is XMLTYPE. It reaches
+    // the wire as a CLOB: a scan selects XMLSERIALIZE(CONTENT col AS CLOB) and a
+    // write binds a CLOB inside XMLTYPE(:n), so the column is only ever text on
+    // this side. Never set on a describe.
+    bool xml = false;
+    // What a NUMBER with no declared precision becomes in DuckDB, chosen by the
+    // oracle_unconstrained_number setting when the columns are described: text
+    // (the default, which loses nothing), DOUBLE, or a fixed DECIMAL.
+    enum : uint8_t { UNCONSTRAINED_TEXT = 0, UNCONSTRAINED_DOUBLE = 1, UNCONSTRAINED_DECIMAL = 2 };
+    uint8_t unconstrained_number = UNCONSTRAINED_TEXT;
+    uint8_t unconstrained_precision = 0;
+    uint8_t unconstrained_scale = 0;
 };
 
 struct OracleBatch {
@@ -69,6 +94,16 @@ struct OracleBind {
     // Required for scalar OUT / IN OUT values when the input value does not
     // establish a buffer size. REF CURSOR has a fixed wire allocation.
     uint32_t maximum_bytes = 0;
+    // Oracle's csfrm for a character bind: 0 means the default (the database
+    // character set for a character type), 2 the national one, in which case
+    // the value must be UTF-16BE.
+    uint8_t character_set_form = 0;
+    // Set on a bind that stands for the content of a LOB-like target: 112 for
+    // text (a CLOB, or JSON and XML written as text), 113 for bytes. `value` is
+    // then the content itself, `oracle_type` is how a small one is bound
+    // (VARCHAR2 or RAW), and a native session sends one too large for that
+    // through a temporary LOB, binding its locator instead.
+    uint8_t lob_content = 0;
 };
 
 class OracleCursor {
@@ -89,7 +124,7 @@ struct OracleCallResult {
 // DML_COMPOSITE is not a stored callable: it is a bounded sequence of
 // validated INSERT, UPDATE and DELETE statements run as one anonymous block,
 // each followed by a server-side check of its exact row count.
-enum class OracleCallableKind { PROCEDURE, FUNCTION, DML_COMPOSITE };
+enum class OracleCallableKind { PROCEDURE, FUNCTION, DML_COMPOSITE, ANONYMOUS_BLOCK };
 
 // One statement of a DML_COMPOSITE request and the SQL%ROWCOUNT it must report.
 struct OracleDmlOperation {
@@ -105,11 +140,38 @@ struct OracleCallRequest {
     // DML_COMPOSITE only. The arguments are then the binds of every statement,
     // each name once, however many statements use it.
     std::vector<OracleDmlOperation> dml_operations;
+    // ANONYMOUS_BLOCK only: a BEGIN ... END; or DECLARE ... BEGIN ... END; block
+    // the caller wrote. The arguments are its binds, each by the name its
+    // placeholder uses; the OUT and IN OUT ones come back in the order the
+    // block first mentions them.
+    std::string block;
+};
+
+// What has crossed one session's connection so far. Cumulative, so what an
+// operation moved is the difference between two readings.
+struct OracleIoStats {
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
+    uint64_t round_trips = 0;
+
+    OracleIoStats operator-(const OracleIoStats &earlier) const {
+        return {bytes_sent - earlier.bytes_sent, bytes_received - earlier.bytes_received,
+                round_trips - earlier.round_trips};
+    }
+    OracleIoStats &operator+=(const OracleIoStats &other) {
+        bytes_sent += other.bytes_sent;
+        bytes_received += other.bytes_received;
+        round_trips += other.round_trips;
+        return *this;
+    }
 };
 
 class OracleSession {
 public:
     virtual ~OracleSession() = default;
+    virtual OracleIoStats IoStats() const {
+        return {};
+    }
     virtual std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
     virtual uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
     // One administrative DDL command on a dedicated autocommit session. This

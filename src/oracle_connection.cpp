@@ -2,10 +2,12 @@
 // the endpoint, TLS, and wallet field combinations validated before any
 // transport work.
 
+#include <cstdlib>
 #include "oracle_adapter.hpp"
 #include "oracle_io_deadline.hpp"
 
 #include "oracle_scanner/descriptor_parser.hpp"
+#include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -19,7 +21,7 @@ namespace duckdb {
 namespace {
 
 std::string RequireString(const KeyValueSecret &secret, const char *key) {
-    const auto value = secret.TryGetValue(key, true);
+    const auto value = secret.TryGetValue(key);
     if (value.IsNull() || value.ToString().empty()) {
         throw BinderException("Oracle secret requires a non-empty %s", key);
     }
@@ -62,6 +64,21 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
     config.user = RequireString(*secret, "user");
     password = RequireString(*secret, "password");
     config.connect_timeout_seconds = OptionalUInt(*secret, "connect_timeout", 10);
+    config.client_identifier = OptionalString(*secret, "client_identifier");
+    config.module = OptionalString(*secret, "module");
+    config.action = OptionalString(*secret, "action");
+    config.client_info = OptionalString(*secret, "client_info");
+    // Oracle's limits, in bytes, checked here so a long value is refused when
+    // the secret is used rather than truncated by the server.
+    const auto limited = [&](const std::string &value, size_t maximum, const char *name) {
+        if (value.size() > maximum) {
+            throw BinderException("Oracle secret %s is longer than %llu bytes", name, static_cast<uint64_t>(maximum));
+        }
+    };
+    limited(config.client_identifier, oracle_scanner::TTC_CLIENT_IDENTIFIER_MAXIMUM, "CLIENT_IDENTIFIER");
+    limited(config.module, oracle_scanner::TTC_MODULE_MAXIMUM, "MODULE");
+    limited(config.action, oracle_scanner::TTC_ACTION_MAXIMUM, "ACTION");
+    limited(config.client_info, oracle_scanner::TTC_CLIENT_INFO_MAXIMUM, "CLIENT_INFO");
     // An interrupted query stops a connect that is still working through
     // addresses and retries. Held weakly: this config outlives the statement
     // in bind data and pools, and must never keep a context alive.
@@ -84,31 +101,64 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
     const auto connect_descriptor = OptionalString(*secret, "connect_descriptor");
     const auto protocol = secret->TryGetValue("protocol");
     // Where the addresses come from: HOST/PORT/SERVICE_NAME, a TNS_ALIAS looked
-    // up in a wallet's tnsnames.ora, or a CONNECT_DESCRIPTOR given inline.
-    // Exactly one, so no setting is ever silently overridden by another.
+    // up in a tnsnames.ora, a CONNECT_DESCRIPTOR given inline, or a DSN (any of
+    // a descriptor, an Easy Connect string and an alias). Exactly one, so no
+    // setting is ever silently overridden by another.
     const bool names_host = !OptionalString(*secret, "host").empty() ||
-                            !OptionalString(*secret, "service_name").empty() || !secret->TryGetValue("port").IsNull();
+                            !OptionalString(*secret, "service_name").empty() || !OptionalString(*secret, "sid").empty() || !secret->TryGetValue("port").IsNull();
     if (!protocol.IsNull() && StringUtil::Lower(protocol.ToString()) != "tcp" &&
         StringUtil::Lower(protocol.ToString()) != "tcps") {
         throw BinderException("Oracle secret PROTOCOL must be 'tcp' or 'tcps'");
     }
-    if (!tns_alias.empty() && !connect_descriptor.empty()) {
-        throw BinderException("Oracle TNS_ALIAS and CONNECT_DESCRIPTOR cannot be combined");
+    const auto dsn = OptionalString(*secret, "dsn");
+    const auto config_dir = OptionalString(*secret, "config_dir");
+    const int sources = static_cast<int>(!tns_alias.empty()) + static_cast<int>(!connect_descriptor.empty()) +
+                        static_cast<int>(!dsn.empty());
+    if (sources > 1) {
+        if (dsn.empty()) {
+            throw BinderException("Oracle TNS_ALIAS and CONNECT_DESCRIPTOR cannot be combined");
+        }
+        throw BinderException("Oracle DSN cannot be combined with TNS_ALIAS or CONNECT_DESCRIPTOR");
     }
-    const char *descriptor_source = !tns_alias.empty() ? "TNS_ALIAS" : "CONNECT_DESCRIPTOR";
-    const bool from_descriptor = !tns_alias.empty() || !connect_descriptor.empty();
+    // A DSN is whichever of the three it looks like: a descriptor ('('), an
+    // Easy Connect string (it names a host or a service), or else an alias.
+    const bool dsn_is_descriptor = !dsn.empty() && dsn[0] == '(';
+    const bool dsn_is_easy_connect = !dsn.empty() && oracle_scanner::IsEasyConnectString(dsn);
+    const std::string alias = !tns_alias.empty()
+                                  ? tns_alias
+                                  : (!dsn.empty() && !dsn_is_descriptor && !dsn_is_easy_connect ? dsn : std::string());
+    const char *descriptor_source = !tns_alias.empty() ? "TNS_ALIAS" : (!dsn.empty() ? "DSN" : "CONNECT_DESCRIPTOR");
+    const bool from_descriptor = sources == 1;
+    if (!config_dir.empty() && alias.empty()) {
+        throw BinderException("Oracle CONFIG_DIR is only used to look up a TNS_ALIAS or an alias given as DSN");
+    }
     if (from_descriptor) {
         if (names_host) {
             throw BinderException("Oracle %s cannot be combined with HOST, PORT, or SERVICE_NAME", descriptor_source);
         }
-        if (!tns_alias.empty() && wallet_pem_file.empty()) {
-            throw BinderException("Oracle TNS_ALIAS requires WALLET_FILE pointing to a wallet ZIP");
+        // As in python-oracledb, the TNS_ADMIN environment variable is where an
+        // alias is looked up when neither CONFIG_DIR nor a wallet says otherwise.
+        const char *tns_admin_env = std::getenv("TNS_ADMIN");
+        const std::string tns_admin = tns_admin_env ? tns_admin_env : "";
+        if (!alias.empty() && wallet_pem_file.empty() && config_dir.empty() && tns_admin.empty()) {
+            throw BinderException("Oracle %s names an alias, which needs CONFIG_DIR (a folder or tnsnames.ora), "
+                                  "WALLET_FILE or the TNS_ADMIN environment variable to look it up in",
+                                  descriptor_source);
         }
         try {
-            const auto descriptor =
-                !tns_alias.empty() ? oracle_scanner::FindTnsAliasDescriptor(
-                                         oracle_scanner::ReadWalletTnsNamesArchive(wallet_pem_file), tns_alias)
-                                   : connect_descriptor;
+            std::string descriptor = connect_descriptor;
+            if (!alias.empty()) {
+                // tnsnames.ora comes from CONFIG_DIR when given, as in
+                // python-oracledb, and otherwise from the wallet.
+                descriptor = oracle_scanner::FindTnsAliasDescriptor(
+                    oracle_scanner::ReadTnsNamesSource(!config_dir.empty() ? config_dir
+                                                       : (!wallet_pem_file.empty() ? wallet_pem_file : tns_admin)),
+                    alias);
+            } else if (dsn_is_descriptor) {
+                descriptor = dsn;
+            } else if (dsn_is_easy_connect) {
+                descriptor = oracle_scanner::EasyConnectToDescriptor(dsn);
+            }
             const auto parsed = oracle_scanner::ParseConnectDescriptor(descriptor);
             config.routing.address_lists = parsed.address_lists;
             config.routing.failover = parsed.failover;
@@ -133,6 +183,7 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
                 config.connect_timeout_seconds = *parsed.transport_connect_timeout_seconds;
             }
             config.service_name = parsed.service_name;
+            config.sid = parsed.sid;
             config.instance_name = parsed.instance_name;
             config.server_type = parsed.server_type;
             config.protocol = oracle_scanner::TransportProtocol::TCP;
@@ -169,7 +220,15 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
         }
     } else {
         config.host = RequireString(*secret, "host");
-        config.service_name = RequireString(*secret, "service_name");
+        const auto sid = OptionalString(*secret, "sid");
+        if (!sid.empty() && !OptionalString(*secret, "service_name").empty()) {
+            throw BinderException("Oracle secret names both SERVICE_NAME and SID");
+        }
+        if (sid.empty()) {
+            config.service_name = RequireString(*secret, "service_name");
+        } else {
+            config.sid = sid;
+        }
         const auto port = OptionalUInt(*secret, "port", 1521);
         if (port == 0 || port > 65535) {
             throw BinderException("Oracle secret '%s' has an invalid port", secret_name);

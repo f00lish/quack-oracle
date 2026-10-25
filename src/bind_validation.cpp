@@ -1,5 +1,6 @@
 #include "oracle_scanner/bind_validation.hpp"
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/temp_lob.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -59,7 +60,20 @@ void ValidateOracleBinds(const std::vector<OracleBind> &binds, OracleBindUse use
         if (bind.maximum_bytes > MAX_BIND_VALUE_BYTES) {
             throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind output buffer exceeds supported bounds");
         }
-        if (bind.value) {
+        if (bind.value && bind.lob_content != 0) {
+            // LOB content past what an ordinary bind carries goes through a
+            // temporary LOB, so it answers to the LOB bound instead and does
+            // not count toward the statement's inline budget.
+            if (bind.value->size() > TEMP_LOB_MAXIMUM_BYTES) {
+                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle LOB value exceeds supported bounds");
+            }
+            if (bind.value->size() <= TEMP_LOB_THRESHOLD_BYTES) {
+                if (total_value_bytes > MAX_BIND_VALUE_BYTES - bind.value->size()) {
+                    throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind values exceed supported bounds");
+                }
+                total_value_bytes += bind.value->size();
+            }
+        } else if (bind.value) {
             if (bind.value->size() > MAX_BIND_VALUE_BYTES || total_value_bytes > MAX_BIND_VALUE_BYTES - bind.value->size()) {
                 throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind values exceed supported bounds");
             }

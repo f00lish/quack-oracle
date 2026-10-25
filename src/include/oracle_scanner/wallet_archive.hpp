@@ -31,4 +31,8 @@ std::string ReadWalletIdentityPem(const std::string &path, bool have_wallet_pass
 // caller explicitly requests a TNS_ALIAS.
 std::string ReadWalletTnsNamesArchive(const std::string &path);
 
+// Returns tnsnames.ora from wherever the caller points: a wallet ZIP, a folder
+// holding tnsnames.ora, or the file itself. Bounded, in memory.
+std::string ReadTnsNamesSource(const std::string &path);
+
 } // namespace oracle_scanner
